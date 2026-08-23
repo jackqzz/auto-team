@@ -121,13 +121,25 @@ export const useRuntimeStore = defineStore('runtime', () => {
       // 断线自动重连
       try { es.close() } catch (_) {}
       autoEs = null
-      if (localStorage.getItem(ADMIN_TOKEN_KEY)) setTimeout(connectAutoStream, 2000)
+      if (
+        localStorage.getItem(ADMIN_TOKEN_KEY)
+        && !(window.location.hash || '').startsWith('#/public-relogin')
+      ) {
+        setTimeout(connectAutoStream, 2000)
+      }
     })
     autoEs = es
   }
 
+  function disconnectAutoStream() {
+    if (autoEs) {
+      try { autoEs.close() } catch (_) {}
+    }
+    autoEs = null
+  }
+
   return {
     logs, autoStatus, banner, lastRunResult, dataVersion, runningSingle,
-    addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream,
+    addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream, disconnectAutoStream,
   }
 })

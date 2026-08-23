@@ -269,7 +269,6 @@ class AdminLoginReq(BaseModel):
 
 class PublicReloginSettingsReq(BaseModel):
     public_relogin_enabled: bool = False
-    workspace_whitelist: str = ""
     proxy_pool: str = ""
     use_system_proxy_pool: bool = True
     concurrency: int = Field(3, ge=1, le=20)
@@ -280,14 +279,21 @@ class PublicReloginSettingsReq(BaseModel):
     clear_admin_password: bool = Field(False, description="清空管理员密码并关闭管理端鉴权")
 
 
+class PublicReloginAccessKeyCreateReq(BaseModel):
+    name: str = Field("", max_length=80)
+    expires_in_days: Optional[int] = Field(3, description="有效天数；0 表示永久", ge=0, le=3650)
+
+
 class PublicReloginCheckReq(BaseModel):
     accounts: list[dict] = Field(default_factory=list)
+    access_key: str = ""
     proxy_pool: str = ""
     concurrency: int = Field(0, ge=0, le=20)
 
 
 class PublicReloginReq(BaseModel):
     accounts: list[dict] = Field(default_factory=list)
+    access_key: str = ""
     proxy_pool: str = ""
     concurrency: int = Field(0, ge=0, le=20)
 
@@ -324,11 +330,11 @@ def api_auth_logout(request: Request):
 
 
 def _public_relogin_proxy_pool(req_pool: str, configured_pool: str) -> list[str]:
-    values = [
+    values = list(dict.fromkeys(
         line.strip()
         for line in str(req_pool or configured_pool or "").replace(",", "\n").splitlines()
         if line.strip()
-    ]
+    ))
     return values
 
 
@@ -355,20 +361,18 @@ def _public_relogin_account_key(account: dict, index: int) -> str:
         return f"row-{index + 1}"
 
 
+def _validate_public_relogin_access_key(access_key: str) -> dict:
+    key = db.validate_public_relogin_access_key(access_key)
+    if not key:
+        raise HTTPException(403, "公开重登访问密钥无效或已过期")
+    return key
+
+
 def _public_relogin_validate(account: dict, cfg: dict) -> tuple[dict | None, dict | None]:
     try:
         normalized = public_relogin.normalized_account(account)
     except Exception as exc:
         return None, {"ok": False, "status": "invalid", "error": f"账号格式无效: {exc}"}
-    workspace_id = normalized.get("chatgpt_account_id") or ""
-    if not public_relogin.workspace_allowed(workspace_id, cfg.get("workspace_whitelist") or ""):
-        return normalized, {
-            "ok": False,
-            "status": "workspace_not_allowed",
-            "email": normalized.get("email", ""),
-            "workspace_id": workspace_id,
-            "error": "该 workspace_id 不在公开重登白名单内",
-        }
     return normalized, None
 
 
@@ -383,6 +387,7 @@ def api_get_public_relogin_settings():
             **cfg,
             "auth_enabled": bool(auth_cfg.get("admin_password_hash") or os.getenv("WEBUI_ADMIN_PASSWORD")),
             "admin_password": "",
+            "access_keys": db.list_public_relogin_access_keys(),
         },
     }
 
@@ -405,8 +410,24 @@ def api_save_public_relogin_settings(req: PublicReloginSettingsReq):
             **cfg,
             "auth_enabled": _admin_auth_enabled(),
             "admin_password": "",
+            "access_keys": db.list_public_relogin_access_keys(),
         },
     }
+
+
+@app.post("/api/settings/public-relogin/access-keys")
+def api_create_public_relogin_access_key(req: PublicReloginAccessKeyCreateReq):
+    now = time.time()
+    expires_at = 0 if int(req.expires_in_days or 0) == 0 else now + int(req.expires_in_days or 3) * 86400
+    key = db.create_public_relogin_access_key(req.name, expires_at)
+    return {"ok": True, "access_key": key, "access_keys": db.list_public_relogin_access_keys()}
+
+
+@app.delete("/api/settings/public-relogin/access-keys/{key_id}")
+def api_revoke_public_relogin_access_key(key_id: str):
+    if not db.revoke_public_relogin_access_key(key_id):
+        raise HTTPException(404, "访问密钥不存在")
+    return {"ok": True, "access_keys": db.list_public_relogin_access_keys()}
 
 
 @app.post("/api/public-relogin/check")
@@ -414,12 +435,14 @@ def api_public_relogin_check(req: PublicReloginCheckReq):
     cfg = public_relogin.get_effective_config()
     if not cfg["enabled"]:
         raise HTTPException(403, "公开 401 重登录页面未启用")
+    _validate_public_relogin_access_key(req.access_key)
     accounts = req.accounts or []
     if not accounts:
         raise HTTPException(400, "请先导入账号")
     if len(accounts) > 500:
         raise HTTPException(400, "单次最多检查 500 个账号")
     proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
+    proxy_leases = public_relogin.ProxyLeasePool(proxies)
     max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
     results: dict[str, dict] = {}
 
@@ -429,8 +452,8 @@ def api_public_relogin_check(req: PublicReloginCheckReq):
         if error:
             return key, error
         proxy = str(account.get("proxy") or "").strip()
-        if not proxy and proxies:
-            proxy = proxies[index % len(proxies)]
+        if not proxy:
+            proxy, _, _ = proxy_leases.lease()
         try:
             quota = public_relogin.fetch_quota(normalized or account, proxy=proxy, timeout=cfg["quota_timeout"])
             return key, {"ok": True, "status": "active", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "quota": quota}
@@ -454,12 +477,14 @@ def api_public_relogin_relogin(req: PublicReloginReq):
     cfg = public_relogin.get_effective_config()
     if not cfg["enabled"]:
         raise HTTPException(403, "公开 401 重登录页面未启用")
+    _validate_public_relogin_access_key(req.access_key)
     accounts = req.accounts or []
     if not accounts:
         raise HTTPException(400, "请选择要重新登录的账号")
     if len(accounts) > 200:
         raise HTTPException(400, "单次最多重登 200 个账号")
     proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
+    proxy_leases = public_relogin.ProxyLeasePool(proxies)
     max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
     results: dict[str, dict] = {}
 
@@ -468,16 +493,43 @@ def api_public_relogin_relogin(req: PublicReloginReq):
         normalized, error = _public_relogin_validate(account, cfg)
         if error:
             return key, error
-        proxy = str(account.get("proxy") or "").strip()
-        if not proxy and proxies:
-            proxy = proxies[index % len(proxies)]
+        account_proxy = str(account.get("proxy") or "").strip()
+        previous_proxy = ""
         last_error = ""
         for attempt in range(1, cfg["retry_count"] + 2):
+            if account_proxy:
+                proxy = account_proxy
+            else:
+                proxy, proxy_index, lease_count = proxy_leases.lease(previous_proxy)
+                if proxy:
+                    logger.info(
+                        "公开401重登领取代理 account=%s attempt=%s pool_index=%s leased_count=%s",
+                        normalized.get("email", ""), attempt, proxy_index + 1, lease_count,
+                    )
+
+            def switch_proxy(current_proxy: str, reason: str) -> str:
+                if account_proxy:
+                    # 显式账号专属代理不能擅自改成系统池；同一 URL 重建会话仍可让
+                    # SID/动态代理切换出口。
+                    return account_proxy
+                replacement, replacement_index, replacement_count = proxy_leases.lease(
+                    current_proxy
+                )
+                if replacement:
+                    logger.warning(
+                        "公开401重登切换代理 account=%s attempt=%s pool_index=%s "
+                        "leased_count=%s reason=%s",
+                        normalized.get("email", ""), attempt, replacement_index + 1,
+                        replacement_count, reason,
+                    )
+                return replacement
+
             try:
                 refreshed = public_relogin.relogin_account(
                     normalized or account,
                     proxy=proxy,
                     login_timeout=cfg["login_timeout"],
+                    on_proxy_switch=switch_proxy,
                 )
                 return key, {
                     "ok": True,
@@ -489,6 +541,7 @@ def api_public_relogin_relogin(req: PublicReloginReq):
                 }
             except Exception as exc:
                 last_error = str(exc)
+                previous_proxy = proxy
                 if public_relogin._looks_deactivated(last_error):
                     return key, {
                         "ok": False,
@@ -514,7 +567,12 @@ def api_public_relogin_relogin(req: PublicReloginReq):
         for future in as_completed(futures):
             key, value = future.result()
             results[key] = value
-    return {"ok": True, "results": results}
+    return {
+        "ok": True,
+        "results": results,
+        "concurrency": max_workers,
+        "proxy_pool_usage": proxy_leases.snapshot(),
+    }
 
 def _is_codex_seat(value: object) -> bool:
     normalized = str(value or "").strip().lower().replace("-", "_")

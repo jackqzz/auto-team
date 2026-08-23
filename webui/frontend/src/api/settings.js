@@ -26,3 +26,7 @@ export const testExport = (target) => http.post('/api/settings/export/test', { t
 // ──────────────── 公开 401 重登录配置 ────────────────
 export const getPublicReloginConfig = () => http.get('/api/settings/public-relogin')
 export const savePublicReloginConfig = (payload) => http.post('/api/settings/public-relogin', payload)
+export const createPublicReloginAccessKey = (payload) =>
+  http.post('/api/settings/public-relogin/access-keys', payload)
+export const revokePublicReloginAccessKey = (keyId) =>
+  http.delete(`/api/settings/public-relogin/access-keys/${encodeURIComponent(keyId)}`)

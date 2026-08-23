@@ -21,6 +21,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import secrets
 import sys
 import threading
 import time
@@ -2859,7 +2860,6 @@ def get_public_relogin_config() -> dict:
     """公开 401 重登录页面的后台配置。"""
     return {
         "enabled": get_setting("public_relogin_enabled", "0"),
-        "workspace_whitelist": get_setting("public_relogin_workspace_whitelist", ""),
         "proxy_pool": get_setting("public_relogin_proxy_pool", ""),
         "use_system_proxy_pool": get_setting("public_relogin_use_system_proxy_pool", "1"),
         "concurrency": get_setting("public_relogin_concurrency", "3"),
@@ -2873,7 +2873,6 @@ def save_public_relogin_config(data: dict) -> None:
     if "public_relogin_enabled" in data:
         set_setting("public_relogin_enabled", "1" if _setting_bool(data["public_relogin_enabled"]) else "0")
     for key_in, key_out in (
-        ("workspace_whitelist", "public_relogin_workspace_whitelist"),
         ("proxy_pool", "public_relogin_proxy_pool"),
         ("use_system_proxy_pool", "public_relogin_use_system_proxy_pool"),
         ("concurrency", "public_relogin_concurrency"),
@@ -2883,6 +2882,119 @@ def save_public_relogin_config(data: dict) -> None:
     ):
         if key_in in data:
             set_setting(key_out, _setting_text(data[key_in]))
+
+
+_PUBLIC_RELOGIN_ACCESS_KEYS_SETTING = "public_relogin_access_keys"
+
+
+def _public_relogin_key_hash(raw_key: str) -> str:
+    return hashlib.sha256(str(raw_key or "").strip().encode("utf-8")).hexdigest()
+
+
+def _load_public_relogin_access_keys() -> list[dict]:
+    raw = get_setting(_PUBLIC_RELOGIN_ACCESS_KEYS_SETTING, "[]")
+    try:
+        data = json.loads(raw or "[]")
+    except Exception:
+        data = []
+    if not isinstance(data, list):
+        return []
+    rows: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "id": str(item.get("id") or "").strip(),
+            "name": str(item.get("name") or "").strip(),
+            "prefix": str(item.get("prefix") or "").strip(),
+            "key_hash": str(item.get("key_hash") or "").strip(),
+            "created_at": float(item.get("created_at") or 0),
+            "expires_at": float(item.get("expires_at") or 0),
+            "last_used_at": float(item.get("last_used_at") or 0),
+            "revoked": bool(item.get("revoked") or False),
+        })
+    return [row for row in rows if row["id"] and row["key_hash"]]
+
+
+def _save_public_relogin_access_keys(rows: list[dict]) -> None:
+    set_setting(_PUBLIC_RELOGIN_ACCESS_KEYS_SETTING, json.dumps(rows, ensure_ascii=False, separators=(",", ":")))
+
+
+def _public_relogin_access_key_view(row: dict) -> dict:
+    now = time.time()
+    expires_at = float(row.get("expires_at") or 0)
+    revoked = bool(row.get("revoked") or False)
+    expired = bool(expires_at and expires_at <= now)
+    return {
+        "id": row.get("id") or "",
+        "name": row.get("name") or "",
+        "prefix": row.get("prefix") or "",
+        "created_at": float(row.get("created_at") or 0),
+        "expires_at": expires_at,
+        "last_used_at": float(row.get("last_used_at") or 0),
+        "revoked": revoked,
+        "expired": expired,
+        "active": (not revoked) and (not expired),
+    }
+
+
+def list_public_relogin_access_keys() -> list[dict]:
+    return [_public_relogin_access_key_view(row) for row in _load_public_relogin_access_keys()]
+
+
+def create_public_relogin_access_key(name: str = "", expires_at: float = 0) -> dict:
+    raw_key = "prk_" + secrets.token_urlsafe(32)
+    now = time.time()
+    row = {
+        "id": secrets.token_urlsafe(12),
+        "name": str(name or "").strip()[:80],
+        "prefix": raw_key[:12],
+        "key_hash": _public_relogin_key_hash(raw_key),
+        "created_at": now,
+        "expires_at": float(expires_at or 0),
+        "last_used_at": 0,
+        "revoked": False,
+    }
+    rows = _load_public_relogin_access_keys()
+    rows.insert(0, row)
+    _save_public_relogin_access_keys(rows)
+    return {**_public_relogin_access_key_view(row), "key": raw_key}
+
+
+def revoke_public_relogin_access_key(key_id: str) -> bool:
+    key_id = str(key_id or "").strip()
+    rows = _load_public_relogin_access_keys()
+    changed = False
+    for row in rows:
+        if row.get("id") == key_id:
+            row["revoked"] = True
+            changed = True
+            break
+    if changed:
+        _save_public_relogin_access_keys(rows)
+    return changed
+
+
+def validate_public_relogin_access_key(raw_key: str) -> dict | None:
+    if not str(raw_key or "").strip():
+        return None
+    key_hash = _public_relogin_key_hash(raw_key)
+    now = time.time()
+    rows = _load_public_relogin_access_keys()
+    matched: dict | None = None
+    for row in rows:
+        if row.get("key_hash") != key_hash:
+            continue
+        expires_at = float(row.get("expires_at") or 0)
+        if row.get("revoked") or (expires_at and expires_at <= now):
+            return None
+        row["last_used_at"] = now
+        matched = row
+        break
+    if matched:
+        _save_public_relogin_access_keys(rows)
+        return _public_relogin_access_key_view(matched)
+    return None
 
 
 def get_admin_auth_config() -> dict:

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
@@ -55,6 +55,11 @@ onMounted(() => {
   theme.apply()
   statsStore.startPolling()
   runtime.connectAutoStream()
+})
+
+onUnmounted(() => {
+  statsStore.stopPolling()
+  runtime.disconnectAutoStream()
 })
 </script>
 <template>

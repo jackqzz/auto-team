@@ -63,7 +63,9 @@ http.interceptors.response.use(
     const err = new Error(detail)
     err.status = error?.response?.status
     err.data = data
-    if (err.status === 401 && !window.location.hash.startsWith('#/login')) {
+    const hash = window.location.hash || ''
+    const onPublicPage = hash.startsWith('#/public-relogin')
+    if (err.status === 401 && !onPublicPage && !hash.startsWith('#/login')) {
       window.location.hash = '#/login'
     }
     return Promise.reject(err)

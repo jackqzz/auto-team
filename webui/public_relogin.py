@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from typing import Any
@@ -23,6 +24,37 @@ class PublicQuotaUnauthorized(RuntimeError):
 
 class PublicAccountDeactivated(RuntimeError):
     pass
+
+
+class ProxyLeasePool:
+    """公开重登单次请求内的代理租取计数快照。"""
+
+    def __init__(self, proxies: list[str]):
+        # 去重后再计数，否则同一 URL 重复出现会伪装成不同代理。
+        self._proxies = list(dict.fromkeys(str(p or "").strip() for p in proxies if str(p or "").strip()))
+        self._usage = [0] * len(self._proxies)
+        self._lock = threading.Lock()
+
+    def lease(self, exclude_proxy: str = "") -> tuple[str, int, int]:
+        """领取使用次数最少的代理；有其他选择时避开上一条失败代理。"""
+        with self._lock:
+            if not self._proxies:
+                return "", -1, 0
+            candidates = list(range(len(self._proxies)))
+            alternatives = [i for i in candidates if self._proxies[i] != exclude_proxy]
+            if alternatives:
+                candidates = alternatives
+            minimum = min(self._usage[i] for i in candidates)
+            index = next(i for i in candidates if self._usage[i] == minimum)
+            self._usage[index] += 1
+            return self._proxies[index], index, self._usage[index]
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [
+                {"proxy": proxy, "leased_count": self._usage[index]}
+                for index, proxy in enumerate(self._proxies)
+            ]
 
 
 class _NoOtpMailProvider(MailProvider):
@@ -125,15 +157,6 @@ def normalized_account(raw: dict) -> dict:
     }
 
 
-def workspace_allowed(workspace_id: str, whitelist_text: str) -> bool:
-    allowed = {
-        line.strip()
-        for line in str(whitelist_text or "").replace(",", "\n").splitlines()
-        if line.strip()
-    }
-    return bool(workspace_id and workspace_id in allowed)
-
-
 def _headers(token: str, account_id: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
@@ -211,7 +234,13 @@ def fetch_quota(account: dict, *, proxy: str = "", timeout: int = 30) -> dict:
     }
 
 
-def relogin_account(account: dict, *, proxy: str = "", login_timeout: int = 180) -> dict:
+def relogin_account(
+    account: dict,
+    *,
+    proxy: str = "",
+    login_timeout: int = 180,
+    on_proxy_switch=None,
+) -> dict:
     cred = normalized_account(account)
     email = cred["email"]
     password = cred["password"]
@@ -242,6 +271,7 @@ def relogin_account(account: dict, *, proxy: str = "", login_timeout: int = 180)
             "OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK": "0",
         },
         account_callback=account_callback,
+        on_proxy_switch=on_proxy_switch,
         workspace_id=workspace_id,
         personal_only=False,
     )
@@ -263,7 +293,6 @@ def get_effective_config() -> dict:
     cfg = db.get_public_relogin_config()
     return {
         "enabled": str(cfg.get("enabled") or "0") in ("1", "true", "yes", "on"),
-        "workspace_whitelist": cfg.get("workspace_whitelist") or "",
         "proxy_pool": cfg.get("proxy_pool") or "",
         "use_system_proxy_pool": str(cfg.get("use_system_proxy_pool") or "1").lower() in {"1", "true", "yes", "on"},
         "concurrency": max(1, min(20, int(cfg.get("concurrency") or 3))),

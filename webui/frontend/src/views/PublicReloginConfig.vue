@@ -1,16 +1,24 @@
 <script setup>
 import { onActivated, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { getPublicReloginConfig, savePublicReloginConfig } from '@/api/settings'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  getPublicReloginConfig,
+  savePublicReloginConfig,
+  createPublicReloginAccessKey,
+  revokePublicReloginAccessKey,
+} from '@/api/settings'
+import { copyText, fmtTime } from '@/api/request'
 import FooterToolbar from '@/components/FooterToolbar.vue'
 
 const router = useRouter()
 const saving = ref(false)
+const creatingKey = ref(false)
+const accessKeys = ref([])
+const newAccessKey = ref('')
 
 const form = reactive({
   enabled: false,
-  workspaceWhitelist: '',
   proxyPool: '',
   useSystemProxyPool: true,
   concurrency: 3,
@@ -22,11 +30,20 @@ const form = reactive({
   authEnabled: false,
 })
 
+const keyForm = reactive({
+  name: '',
+  expiresInDays: 3,
+  permanent: false,
+})
+
+function formatKeyTime(value) {
+  return value ? fmtTime(value) : '永久'
+}
+
 async function load() {
   try {
     const { config } = await getPublicReloginConfig()
     form.enabled = config.enabled === '1'
-    form.workspaceWhitelist = config.workspace_whitelist || ''
     form.proxyPool = config.proxy_pool || ''
     form.useSystemProxyPool = config.use_system_proxy_pool !== false && config.use_system_proxy_pool !== '0'
     form.concurrency = Number(config.concurrency || 3)
@@ -36,6 +53,7 @@ async function load() {
     form.adminPassword = ''
     form.clearAdminPassword = false
     form.authEnabled = !!config.auth_enabled
+    accessKeys.value = config.access_keys || []
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -46,7 +64,6 @@ async function save() {
   try {
     await savePublicReloginConfig({
       public_relogin_enabled: form.enabled,
-      workspace_whitelist: form.workspaceWhitelist.trim(),
       proxy_pool: form.proxyPool.trim(),
       use_system_proxy_pool: form.useSystemProxyPool,
       concurrency: form.concurrency,
@@ -65,6 +82,42 @@ async function save() {
   }
 }
 
+async function createKey() {
+  creatingKey.value = true
+  try {
+    const res = await createPublicReloginAccessKey({
+      name: keyForm.name.trim(),
+      expires_in_days: keyForm.permanent ? 0 : keyForm.expiresInDays,
+    })
+    accessKeys.value = res.access_keys || []
+    newAccessKey.value = res.access_key?.key || ''
+    keyForm.name = ''
+    keyForm.expiresInDays = 3
+    keyForm.permanent = false
+    if (newAccessKey.value) {
+      await copyText(newAccessKey.value)
+      ElMessage.success('访问密钥已创建并复制，请立即保存；后端不会再次显示完整密钥')
+    }
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    creatingKey.value = false
+  }
+}
+
+async function revokeKey(row) {
+  try {
+    await ElMessageBox.confirm(`确定撤销访问密钥 ${row.name || row.prefix}？撤销后无法恢复。`, '撤销访问密钥', {
+      type: 'warning',
+    })
+    const res = await revokePublicReloginAccessKey(row.id)
+    accessKeys.value = res.access_keys || []
+    ElMessage.success('已撤销')
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error(e.message || e)
+  }
+}
+
 onActivated(() => load())
 </script>
 
@@ -79,21 +132,12 @@ onActivated(() => load())
       </template>
 
       <p class="hint">
-        公开页无鉴权，导入账号只保存在用户浏览器内；检查额度和重登录时才把本批账号临时发到后端。后端只允许白名单 workspace_id。
+        公开页通过访问密钥鉴权。导入账号只保存在用户浏览器内；检查额度和重登录时才把本批账号临时发到后端。
       </p>
 
       <el-form label-position="top">
         <el-form-item>
           <el-checkbox v-model="form.enabled">启用公开 401 重登录页面</el-checkbox>
-        </el-form-item>
-
-        <el-form-item label="允许的 Workspace ID 白名单（一行一个，也支持逗号分隔）">
-          <el-input
-            v-model="form.workspaceWhitelist"
-            type="textarea"
-            :rows="5"
-            placeholder="85f86570-bf64-4c86-8506-2f36c7a87fd6"
-          />
         </el-form-item>
 
         <el-form-item>
@@ -124,6 +168,64 @@ onActivated(() => load())
             <el-input-number v-model="form.loginTimeout" :min="30" :max="900" />
           </el-form-item>
         </div>
+
+        <el-divider content-position="left">公开页访问密钥</el-divider>
+        <div class="hint" style="margin-bottom: 12px">
+          创建后只显示一次完整密钥；公开页用户输入一次后会缓存在浏览器本地。
+        </div>
+        <div class="key-create">
+          <el-input v-model="keyForm.name" placeholder="密钥备注，可空" clearable style="max-width: 220px" />
+          <span class="hint">有效天数</span>
+          <el-input-number
+            v-model="keyForm.expiresInDays"
+            :min="1"
+            :max="3650"
+            :disabled="keyForm.permanent"
+          />
+          <el-checkbox v-model="keyForm.permanent">永久有效</el-checkbox>
+          <el-button type="primary" :loading="creatingKey" @click="createKey">
+            创建访问密钥
+          </el-button>
+        </div>
+        <el-alert
+          v-if="newAccessKey"
+          type="success"
+          show-icon
+          :closable="false"
+          style="margin: 12px 0"
+        >
+          <template #title>
+            新密钥：<span class="mono">{{ newAccessKey }}</span>
+            <el-button link type="primary" @click="copyText(newAccessKey)">复制</el-button>
+          </template>
+        </el-alert>
+        <el-table :data="accessKeys" size="small" border style="margin-bottom: 12px">
+          <el-table-column label="备注" prop="name" min-width="140" />
+          <el-table-column label="前缀" prop="prefix" width="130" />
+          <el-table-column label="创建时间" width="180">
+            <template #default="{ row }">{{ formatKeyTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column label="过期时间" width="180">
+            <template #default="{ row }">{{ formatKeyTime(row.expires_at) }}</template>
+          </el-table-column>
+          <el-table-column label="上次使用" width="180">
+            <template #default="{ row }">{{ row.last_used_at ? fmtTime(row.last_used_at) : '-' }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tag v-if="row.active" type="success">可用</el-tag>
+              <el-tag v-else-if="row.expired" type="warning">已过期</el-tag>
+              <el-tag v-else type="danger">已撤销</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="100">
+            <template #default="{ row }">
+              <el-button size="small" type="danger" link :disabled="row.revoked" @click="revokeKey(row)">
+                撤销
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
 
         <el-divider content-position="left">系统管理平台鉴权</el-divider>
         <el-alert
@@ -159,5 +261,16 @@ onActivated(() => load())
   display: flex;
   gap: 16px;
   flex-wrap: wrap;
+}
+.key-create {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  word-break: break-all;
 }
 </style>

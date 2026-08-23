@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { checkPublicRelogin, runPublicRelogin } from '@/api/publicRelogin'
 import { useProxyStore } from '@/stores/proxy'
@@ -14,6 +14,8 @@ const accounts = ref([])
 const lastResults = ref({})
 const checkProgress = ref({ done: 0, total: 0 })
 const reloginProgress = ref({ done: 0, total: 0 })
+const ACCESS_KEY_CACHE = 'gpt_auto_register_public_relogin_access_key'
+const accessKey = ref('')
 
 const statusCount = computed(() => ({
   total: accounts.value.length,
@@ -24,6 +26,22 @@ const statusCount = computed(() => ({
 }))
 
 const openFile = () => fileInput.value?.click()
+
+function handleAuthError(e) {
+  if (e?.status === 403 && String(e.message || '').includes('访问密钥')) {
+    accessKey.value = ''
+    localStorage.removeItem(ACCESS_KEY_CACHE)
+  }
+}
+
+function requireAccessKey() {
+  const key = accessKey.value.trim()
+  if (!key) {
+    ElMessage.warning('请先输入公开重登访问密钥')
+    return ''
+  }
+  return key
+}
 
 const normalizeAccount = (item, idx) => {
   const credentials = item?.credentials && typeof item.credentials === 'object' ? item.credentials : item
@@ -135,6 +153,8 @@ const applyCheckResult = (item, result) => {
 
 const doCheck = async () => {
   if (!accounts.value.length) return ElMessage.warning('请先导入账号')
+  const key = requireAccessKey()
+  if (!key) return
   checking.value = true
   checkProgress.value = { done: 0, total: accounts.value.length }
   accounts.value = accounts.value.map((item) => ({
@@ -147,10 +167,16 @@ const doCheck = async () => {
     const snapshot = [...accounts.value]
     await runConcurrent(snapshot, 8, async (item) => {
       try {
-        const res = await checkPublicRelogin({ accounts: [item], concurrency: 1, proxy_pool: proxyStore.text })
+        const res = await checkPublicRelogin({
+          accounts: [item],
+          access_key: key,
+          concurrency: 1,
+          proxy_pool: proxyStore.text,
+        })
         const result = res.results?.[item.id] || Object.values(res.results || {})[0]
         applyCheckResult(item, result)
       } catch (e) {
+        handleAuthError(e)
         applyCheckResult(item, {
           ok: false,
           status: e.status === 401 ? '401' : 'error',
@@ -176,6 +202,8 @@ const doCheck = async () => {
 const doRelogin = async (onlyRevived = true) => {
   const list = accounts.value.filter((item) => item.status === '401' || (!onlyRevived && item.status !== 'deactivated'))
   if (!list.length) return ElMessage.warning('没有可重新登录的账号')
+  const key = requireAccessKey()
+  if (!key) return
   relogining.value = true
   reloginProgress.value = { done: 0, total: list.length }
   const targetIds = new Set(list.map((item) => item.id))
@@ -186,10 +214,16 @@ const doRelogin = async (onlyRevived = true) => {
       : item
   ))
   try {
-    // 每个账号单独请求，完成一个就立即刷新该行；前端并发数仍保持为 4。
-    await runConcurrent(list, 4, async (item) => {
+    // 同一次任务必须批量提交，后端才能为整批账号建立统一的代理计数快照。
+    const res = await runPublicRelogin({
+      accounts: list,
+      access_key: key,
+      // 0 表示不覆盖后台“公开重登配置”的并发数。
+      concurrency: 0,
+      proxy_pool: proxyStore.text,
+    })
+    for (const item of list) {
       try {
-        const res = await runPublicRelogin({ accounts: [item], concurrency: 1, proxy_pool: proxyStore.text })
         const result = res.results?.[item.id] || Object.values(res.results || {})[0]
         if (!result) {
           throw new Error('服务器未返回重登录结果')
@@ -212,6 +246,7 @@ const doRelogin = async (onlyRevived = true) => {
           })
         }
       } catch (e) {
+        handleAuthError(e)
         const result = {
           ok: false,
           status: e.status === 401 ? '401' : 'failed',
@@ -222,12 +257,9 @@ const doRelogin = async (onlyRevived = true) => {
         lastResults.value = { ...lastResults.value, [item.id]: result }
         updateOne(item.id, { status: result.status, error: result.error })
       } finally {
-        reloginProgress.value = {
-          ...reloginProgress.value,
-          done: reloginProgress.value.done + 1,
-        }
+        reloginProgress.value = { ...reloginProgress.value, done: reloginProgress.value.done + 1 }
       }
-    })
+    }
     ElMessage.success(`重登完成，成功 ${revived} 个`)
   } catch (e) {
     ElMessage.error(e.message)
@@ -290,6 +322,16 @@ const download = (mode) => {
   a.click()
   URL.revokeObjectURL(url)
 }
+
+watch(accessKey, (value) => {
+  const key = String(value || '').trim()
+  if (key) localStorage.setItem(ACCESS_KEY_CACHE, key)
+  else localStorage.removeItem(ACCESS_KEY_CACHE)
+})
+
+onMounted(() => {
+  accessKey.value = localStorage.getItem(ACCESS_KEY_CACHE) || ''
+})
 </script>
 
 <template>
@@ -299,6 +341,22 @@ const download = (mode) => {
         <span class="section-title" style="margin:0">公开 401 重登录</span>
       </template>
       <p class="hint">导入 sub2api / cpa JSON 后，在浏览器内完成解析、检查 401、密码 + 2FA 重登录和下载。</p>
+
+      <el-alert
+        type="info"
+        show-icon
+        :closable="false"
+        style="margin-bottom: 12px"
+        title="访问密钥会缓存在当前浏览器本地；后端只接受有效且未过期的密钥。"
+      />
+      <el-input
+        v-model="accessKey"
+        type="password"
+        show-password
+        clearable
+        placeholder="公开重登访问密钥"
+        style="max-width: 520px; margin-bottom: 12px"
+      />
 
       <div class="toolbar">
         <input ref="fileInput" type="file" accept="application/json,.json" class="hidden" @change="handleFile" />

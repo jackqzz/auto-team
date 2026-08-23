@@ -6,8 +6,10 @@ import { getStats } from '@/api/accounts'
 export const useStatsStore = defineStore('stats', () => {
   const stats = ref({ total: 0, available: 0, in_use: 0, done: 0, failed: 0 })
   let timer = null
+  let active = false
 
   async function refresh() {
+    if (!active) return
     try {
       const { stats: s } = await getStats()
       if (s) stats.value = s
@@ -18,12 +20,14 @@ export const useStatsStore = defineStore('stats', () => {
   }
 
   function startPolling(interval = 5000) {
+    active = true
     refresh()
     if (timer) clearInterval(timer)
     timer = setInterval(refresh, interval)
   }
 
   function stopPolling() {
+    active = false
     if (timer) clearInterval(timer)
     timer = null
   }
