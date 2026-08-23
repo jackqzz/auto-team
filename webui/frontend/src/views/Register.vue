@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import { startRegister, getRegistered } from '@/api/register'
+import { listAccountGroups } from '@/api/accounts'
 import { copyText } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
@@ -18,6 +19,7 @@ const { runningSingle, lastRunResult } = storeToRefs(runtime)
 
 const starting = ref(false)
 const regEmail = ref('')
+const groups = ref([])
 // 2FA 默认开（主人要求每个号都绑）。绑定不可逆，所以留开关。
 // 放在 form store（localStorage 持久化）而不是组件局部 ref —— 组件是
 // keep-alive 的，切页不丢，但刷新页面会重建，关了就白关。
@@ -25,7 +27,19 @@ const regEmail = ref('')
 // 从「邮箱列表 → 使用」跳转过来时，带上指定邮箱
 onActivated(() => {
   if (route.query.email) regEmail.value = String(route.query.email)
+  loadGroups()
 })
+
+async function loadGroups() {
+  try {
+    groups.value = (await listAccountGroups()).groups || []
+    if (
+      form.value.groupName
+      && form.value.groupName !== '__all__'
+      && !groups.value.some((g) => g.name === form.value.groupName)
+    ) form.value.groupName = ''
+  } catch (_) {}
+}
 
 async function run() {
   starting.value = true
@@ -34,11 +48,14 @@ async function run() {
   try {
     const r = await startRegister({
       email: regEmail.value.trim() || null,
+      group_name: form.value.groupName,
       proxy: proxyText(form.value),
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
+      add_phone_mode: form.value.addPhoneMode,
       want_access_token: true,
       want_session_token: true,
-      want_refresh_token: true,
+      want_refresh_token: form.value.wantOauthRt,
+      want_password: form.value.wantPassword,
       want_2fa: form.value.want2fa,
     })
     runtime.addLog(`[client] 启动注册 run_id=${r.run_id} email=${r.email}`, 'evt')
@@ -73,6 +90,16 @@ async function copyField(email, field) {
             <el-form-item label="邮箱（留空 = 自动 claim 下一个 available）">
               <el-input v-model="regEmail" placeholder="留空 = 自动选号 / 或填指定邮箱" clearable />
             </el-form-item>
+            <el-form-item v-if="!regEmail" label="执行分组">
+              <el-select v-model="form.groupName" style="width: 260px">
+                <el-option label="未分组" value="" />
+                <el-option label="全部分组" value="__all__" />
+                <el-option
+                  v-for="g in groups.filter((g) => g.name)" :key="g.name"
+                  :label="`${g.name}（可用 ${g.available}）`" :value="g.name"
+                />
+              </el-select>
+            </el-form-item>
             <el-form-item label="本次使用的单个代理（可从代理池选，或手动输入；直连留空）">
               <el-select
                 v-model="form.proxy" filterable clearable allow-create default-first-option
@@ -87,6 +114,33 @@ async function copyField(email, field) {
             </el-form-item>
             <el-form-item label="OTP 等待秒数">
               <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />
+            </el-form-item>
+            <el-form-item>
+              <div style="display: flex; align-items: center; gap: 10px">
+                <el-switch v-model="form.wantOauthRt" />
+                <span>OAuth 获取 RT</span>
+              </div>
+              <div class="hint" style="margin-top: 6px">
+                关闭后跳过最后的 Codex OAuth，不获取 refresh_token；access token 和 session token 仍会正常获取。
+              </div>
+            </el-form-item>
+            <el-form-item label="add-phone 模式">
+              <el-select v-model="form.addPhoneMode" style="width: 220px">
+                <el-option label="API / SMS 接口" value="api" />
+                <el-option label="Camoufox 浏览器模式" value="camoufox" />
+              </el-select>
+              <div class="hint" style="margin-top: 6px">
+                默认走原有接口流程；只有命中 add-phone 验证时才会生效。Linux 无桌面环境下可切到 Camoufox。
+              </div>
+            </el-form-item>
+            <el-form-item>
+              <div style="display: flex; align-items: center; gap: 10px">
+                <el-switch v-model="form.wantPassword" />
+                <span>强制创建账号密码</span>
+              </div>
+              <div class="hint" style="margin-top: 6px">
+                开启时密码创建失败或邮箱已注册会直接报错；关闭后允许回退为仅 OTP 登录。
+              </div>
             </el-form-item>
             <el-form-item>
               <div style="display: flex; align-items: center; gap: 10px">

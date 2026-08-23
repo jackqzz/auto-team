@@ -1,7 +1,11 @@
 <script setup>
 import { onActivated, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getExportConfig, saveExportConfig, testExport } from '@/api/settings'
+import {
+  getExportConfig,
+  saveExportConfig,
+  testExport,
+} from '@/api/settings'
 import FooterToolbar from '@/components/FooterToolbar.vue'
 
 const cpa = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴 CPA 管理密钥', timeout: 30 })
@@ -103,14 +107,24 @@ onActivated(() => load())
           <el-input-number v-model="sub.timeout" :min="5" :max="300" />
         </el-form-item>
         <el-button :loading="testingSub" @click="test('sub2api')">测试 SUB2API 连通性</el-button>
-
       </el-form>
+    </el-card>
+
+    <el-card shadow="never" style="max-width: 760px; margin-top: 16px">
+      <template #header>
+        <span class="section-title" style="margin: 0">公开 401 重登录页面</span>
+        <el-tag type="info" size="small" effect="plain" style="margin-left: 8px">配置已独立到系统路由</el-tag>
+      </template>
+      <p class="hint">
+        公开页无鉴权，参数请在“配置 / 公开重登配置”里维护。这里只保留入口说明。
+      </p>
     </el-card>
 
     <FooterToolbar>
       <template #left>
         CPA {{ cpa.enabled ? '已启用' : '未启用' }} · SUB2API {{ sub.enabled ? '已启用' : '未启用' }}
       </template>
+      <el-button @click="$router.push('/settings/public-relogin')">打开公开重登配置</el-button>
       <el-button type="primary" :loading="saving" @click="save">保存配置</el-button>
     </FooterToolbar>
   </div>

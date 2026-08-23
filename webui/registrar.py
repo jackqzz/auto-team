@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import base64
+import json
 import queue
 import sys
 import threading
@@ -25,6 +27,7 @@ from mail_providers import (  # noqa: E402
     create_mail_provider,
     get_provider_class,
 )
+from mail_providers.base import MailProvider  # noqa: E402
 from sms_provider import PhoneCallbackController  # noqa: E402
 
 from . import db  # noqa: E402
@@ -46,6 +49,26 @@ _current_run = threading.local()
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class _LoginOnlyMailFallback(MailProvider):
+    """原邮箱池记录已删除时仍允许先尝试密码 + TOTP 登录。"""
+    kind = "login_only"
+    display_name = "仅登录（无接码凭证）"
+    pooled = False
+    ephemeral = False
+    accepts_existing_account = True
+
+    def __init__(self, email: str):
+        self.email = email
+
+    def create_mailbox(self) -> str:
+        return self.email
+
+    def wait_for_otp(self, email_addr: str, timeout: int = 120, issued_after=None) -> str:
+        raise RuntimeError(
+            f"账号 {email_addr} 需要邮箱 OTP，但原邮箱池记录或接码凭证已不存在"
+        )
 
 
 class QueueLogHandler(logging.Handler):
@@ -115,6 +138,39 @@ _NETWORK_ERROR_PATTERNS = [
     "invalid_state",
 ]
 
+# 这些是账号本身失效的明确特征。它们与 Cloudflare/代理造成的普通 403
+# 区分开：只有响应正文出现这些措辞时，才会把账号标记为永久失效。
+_PERMANENT_INVALID_PATTERNS = (
+    "account because it has been deleted or deactivated",
+    "deleted or deactivated",
+    "account has been deleted",
+    "account has been deactivated",
+    "account_deactivated",
+    "accountdeactivated",
+    "do not have an account because",
+    "account is disabled",
+    "account disabled",
+    "account suspended",
+    "account banned",
+    "account terminated",
+    "deactivated",
+    "disabled",
+    "suspended",
+    "banned",
+    "terminated",
+    "账号已被删除",
+    "账号已停用",
+    "账号已禁用",
+    "账号已封禁",
+    "账号已永久失效",
+)
+
+
+def is_permanently_invalid_error(err: str) -> bool:
+    """判断是否为账号永久失效，而不是代理/Cloudflare 403。"""
+    text = str(err or "").lower()
+    return any(marker in text for marker in _PERMANENT_INVALID_PATTERNS)
+
 
 def classify_error(err: str, mail_source: str = "") -> str:
     """分类错误：'network'（环境/代理问题，号无辜）/ 'account'（号本身有问题）/ 'unknown'。
@@ -131,6 +187,7 @@ def classify_error(err: str, mail_source: str = "") -> str:
         "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
+        *_PERMANENT_INVALID_PATTERNS,
     ]
     if mail_source:
         try:
@@ -181,14 +238,18 @@ def _do_register(
 
     email = account["email"]
     # 提前读取，避免在 try 块前异常时 except 引用未定义
-    mail_source = db.get_setting("mail_source", "outlook")
+    login_only = bool(options.get("login_only"))
+    mail_source = (
+        (account.get("kind") or "").strip()
+        if login_only else db.get_setting("mail_source", "outlook")
+    ) or "outlook"
     # 要不要操作号池（mark_done / mark_failed / release）由 provider 声明的
     # pooled 决定。未知 kind 时保守当池化处理 —— 号池里真有这行的话
     # 至少不会漏掉状态回写，把号永远卡在 in_use。
     try:
-        is_pooled = get_provider_class(mail_source).pooled
+        is_pooled = get_provider_class(mail_source).pooled and not login_only
     except MailProviderError:
-        is_pooled = True
+        is_pooled = not login_only
 
     try:
         # 本次注册专属的配置覆盖。
@@ -201,21 +262,57 @@ def _do_register(
         # auth_flow 会误判为"已有账号"分支 → 不设 WEBUI_ALLOW_LOGIN 会 fast-fail。
         # 单号 WebUI 场景下 fast-fail 没意义（批量跑才需要"跳过被识别的号"），故强制 ON。
         env_overrides["WEBUI_ALLOW_LOGIN"] = "1"
+        if login_only:
+            # 仅登录必须先探测密码页；密码 + TOTP 不通时协议链才回退邮箱 OTP。
+            env_overrides["LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"] = "1"
         env_overrides["OTP_TIMEOUT"] = str(int(options.get("otp_timeout") or 180))
         # 用户不要 refresh_token → 直接跳过 Codex OAuth（每次都失败浪费 ~10s + 一堆告警）
         if not options.get("want_refresh_token", True):
             env_overrides["SKIP_OAUTH_TOKEN_EXCHANGE"] = "1"
             env_overrides["OAUTH_CODEX_RT_EXCHANGE"] = "0"
             env_overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
+            env_overrides["OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK"] = "0"
+            env_overrides["OAUTH_SECONDARY_AUTHORIZE_EXCHANGE"] = "0"
+            env_overrides["OAUTH_EXCHANGE_BEFORE_CALLBACK"] = "0"
+            env_overrides["OAUTH_REFRESH_ONLY"] = "0"
+            logging.getLogger("registrar").info(
+                "[oauth] 已关闭 RT 获取，跳过 Codex OAuth/token exchange"
+            )
+        add_phone_mode = str(options.get("add_phone_mode") or "api").strip().lower()
+        if add_phone_mode not in {"api", "camoufox"}:
+            add_phone_mode = "api"
+        env_overrides["OPENAI_ADD_PHONE_MODE"] = add_phone_mode
+        logging.getLogger("registrar").info(
+            "[add-phone] 模式=%s", add_phone_mode
+        )
         # PROXY 走 cfg.proxy，无需 env
 
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
 
         # ─ 邮箱来源路由 ─
-        # 原来是 if cf_temp / else outlook 的写死分支，加一种邮箱就得回来改。
-        # 现在交给注册表工厂：provider 自己从 settings + account 里取需要的字段。
-        mail = create_mail_provider(mail_source, db.get_mail_settings(), account)
+        # 注册/收码任务需要真实 mail provider；仅登录如果已经有密码/2FA，
+        # 不应再强依赖原接码 provider，否则像 icloud_relay 这类没有中转链接的
+        # 既有账号会被误导成“必须接码”。
+        if login_only and str(account.get("login_password") or "").strip():
+            mail = _LoginOnlyMailFallback(email)
+            logging.getLogger("registrar").info(
+                "[login] 已有密码，跳过接码 provider 初始化，直接走密码 + 2FA"
+            )
+        else:
+            # 现在交给注册表工厂：provider 自己从 settings + account 里取需要的字段。
+            try:
+                mail = create_mail_provider(mail_source, db.get_mail_settings(), account)
+            except Exception as e:
+                if not login_only:
+                    raise
+                logging.getLogger("registrar").warning(
+                    f"[login] 原接码 provider 无法初始化，回退到纯登录路径: {e}"
+                )
+                mail = _LoginOnlyMailFallback(email)
+        # 该开关只影响通用 OTP provider；其他邮箱保持各自原有行为。
+        if hasattr(mail, "requires_password"):
+            mail.requires_password = bool(options.get("want_password", True))
         logging.getLogger("registrar").info(
             f"[register] 邮箱来源: {mail_source} ({mail.display_name})"
         )
@@ -281,16 +378,27 @@ def _do_register(
             sms_callback=_build_sms_callback(run_id),
             env_overrides=env_overrides,
             on_password=_save_password_early,
-            on_session_ready=_bind_2fa_hook if options.get("want_2fa") else None,
+            on_session_ready=(
+                _bind_2fa_hook if options.get("want_2fa") and not login_only else None
+            ),
             account_callback=_account_callback_for_flow,
+            on_proxy_switch=options.get("_proxy_switch_callback"),
+            workspace_id=options.get("workspace_id", ""),
+            personal_only=bool(options.get("personal_only", not options.get("workspace_id"))),
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
-        logging.getLogger("registrar").info(f"[register] 开始: {email}")
+        action_label = "login" if login_only else "register"
+        logging.getLogger("registrar").info(f"[{action_label}] 开始: {email}")
 
         partial = False
         d: dict
         try:
-            result = flow.run_register(mail)
+            if login_only:
+                result = flow.run_protocol_login(
+                    mail, email, password=account.get("login_password", ""),
+                )
+            else:
+                result = flow.run_register(mail)
             d = result.to_dict()
         except RuntimeError as e:
             # 部分凭证也算成功（OTP 验证通过 + create_account 成功 → flow.result 有 token）
@@ -321,9 +429,14 @@ def _do_register(
 
         # ─ 用户选项过滤：未勾选的字段从结果里抹掉，DB 只存用户想要的
         full = d
+        # 勾选 OAuth RT 时，RT 是必需结果。不能再把“只有 access/session”当作成功，
+        # 否则后续自动推送必然失败却会显示账号成功。
+        if options.get("want_refresh_token", True) and not full.get("refresh_token"):
+            raise RuntimeError("已勾选 OAuth RT，但本次未获取到 refresh_token")
         d = {
             "email": full.get("email", ""),
             "password": full.get("password", ""),
+            "mail_kind": mail_source,
         }
         if options.get("want_access_token", True):
             d["access_token"] = full.get("access_token", "")
@@ -369,7 +482,7 @@ def _do_register(
         #   失败仅告警、绝不废掉已注册成功的号；secret 一次性下发，成功即随 d 落库+推前端。
         #   ⚠️ 入口条件**不查密码**：快路径只要 access_token。密码只是慢路径
         #      （重走 login 链）的前提，所以判断挪到回落那一步再做。
-        if options.get("want_2fa"):
+        if options.get("want_2fa") and not login_only:
             _emit_status(run_id, "phase", {"phase": "binding_2fa", "email": d.get("email")})
             try:
                 from .two_factor import bind_totp_2fa, bind_totp_2fa_inline
@@ -407,15 +520,86 @@ def _do_register(
                 logging.getLogger("registrar").warning(
                     f"[register] 2FA 绑定异常（账号仍有效）: {e}"
                 )
-        # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
-        db.save_registered(d)
+        # 空间凭证任务必须校验 AT 真正属于目标 Workspace，避免把 Personal 凭证误存。
+        target_workspace = str(options.get("workspace_id") or "").strip()
+        if target_workspace:
+            try:
+                part = str(d.get("access_token") or "").split(".")[1]
+                payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+                actual_workspace = str((payload.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id") or "")
+            except Exception:
+                actual_workspace = ""
+            if actual_workspace != target_workspace:
+                raise RuntimeError(f"空间凭证校验失败：期望 workspace={target_workspace}，实际={actual_workspace or '无法解析'}")
+            logging.getLogger("registrar").info("[workspace] 目标空间凭证校验通过 workspace_id=%s", target_workspace)
+        # Team 空间凭证与账号原有的 Personal/Free 凭证分开保存：同一账号可加入多个空间，
+        # 不能用 save_registered 覆盖原凭证。
+        if target_workspace:
+            master = db.get_workspace_master_by_external_id(target_workspace)
+            if not master:
+                raise RuntimeError(f"找不到目标空间记录 workspace={target_workspace}")
+            logger = logging.getLogger("registrar")
+            logger.info(
+                "[workspace] 准备保存空间凭证 email=%s at=%s rt=%s st=%s",
+                d.get("email", ""),
+                d.get("access_token", ""),
+                d.get("refresh_token", ""),
+                d.get("session_token", ""),
+            )
+            db.save_workspace_credential(master["id"], d)
+            logging.getLogger("registrar").info(
+                "[workspace] 空间凭证已保存并标记为已获取 email=%s workspace_db_id=%s at_len=%s rt_len=%s",
+                d.get("email", ""), master["id"],
+                len(d.get("access_token") or ""),
+                len(d.get("refresh_token") or ""),
+            )
+        else:
+            # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
+            db.save_registered(d)
         # 非池化 provider 的 email 是虚拟占位（xxx_placeholder_N@placeholder.local），
         # 号池里根本没这行，不能去 mark。判据用 provider 的 pooled，不写死 kind。
-        if is_pooled:
+        if is_pooled and not login_only:
             db.mark_done(email)
 
+        # Codex/Usage-based 成员不进入自动推送号池。Team 凭证仍然正常保存，
+        # 但自动导出只对标准席位生效；手动导出接口不受此限制。
+        skip_auto_export = False
+        if target_workspace:
+            from . import workspace_membership
+
+            try:
+                resolved_seat = workspace_membership.resolve_candidate_seat_type(
+                    master["id"],
+                    d.get("email", ""),
+                    payload=d,
+                )
+                if resolved_seat == "usage_based":
+                    skip_auto_export = True
+                    logging.getLogger("registrar").info(
+                        "[export] Codex/Usage-based 席位跳过自动推送 email=%s workspace=%s",
+                        d.get("email", ""), target_workspace,
+                    )
+                elif not resolved_seat:
+                    has_workspace_cred = bool(
+                        db.list_workspace_credentials_by_emails(
+                            master["id"], [d.get("email", "")]
+                        )
+                    )
+                    logging.getLogger("registrar").warning(
+                        "[export] 无法解析候选席位%s email=%s workspace=%s",
+                        "，但已确认存在空间凭证" if has_workspace_cred else "，将跳过自动推送",
+                        d.get("email", ""), target_workspace,
+                    )
+                    skip_auto_export = not has_workspace_cred
+            except Exception as e:
+                skip_auto_export = True
+                logging.getLogger("registrar").warning(
+                    "[export] 席位判定失败，忽略后处理并保留已获取到的空间凭证 email=%s workspace=%s err=%s",
+                    d.get("email", ""), target_workspace, e,
+                )
         # ─ 可选：导出到 CPA / SUB2API 面板（仅勾选启用时才执行） ─
-        _try_export_to_panels(run_id, d)
+        if not skip_auto_export:
+            _try_export_to_panels(run_id, d, options=options)
 
         result_summary = {
             "email": d.get("email"),
@@ -490,12 +674,16 @@ def _do_register(
         _current_run.run_id = None
 
 
-def _try_export_to_panels(run_id: str, cred: dict) -> None:
+def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = None) -> None:
     """注册完成后可选地把凭证导出到 CPA / SUB2API 面板。
 
     - 任一目标的"启用"开关关闭时,该目标跳过(不发请求);两者都未启用时整段 no-op。
     - 任何异常都不抛,只 emit 日志/状态(不影响注册主流程)。
     """
+    # 任务级开关：默认开启以保持旧行为；关闭只影响本次任务，不修改全局配置。
+    if options is not None and not bool(options.get("auto_export", True)):
+        logging.getLogger("registrar").info("[export] 本次任务已关闭自动导出，跳过")
+        return
     try:
         cfg = db.get_export_internal_config()
     except Exception as e:
@@ -505,7 +693,22 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
     cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
     sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled"))
     if not (cpa_enabled or sub2api_enabled):
+        logging.getLogger("registrar").info(
+            "[export] 本次任务未配置或未启用 CPA/SUB2API，跳过自动推送"
+        )
         return  # 用户没勾选任何目标 → 完全不执行
+
+    logging.getLogger("registrar").info(
+        f"[export] 开始自动推送 (CPA={'on' if cpa_enabled else 'off'}, "
+        f"SUB2API={'on' if sub2api_enabled else 'off'})"
+    )
+    # token 刷新也必须走本次任务代理，避免服务器出口地区被 OpenAI 拒绝。
+    task_proxy = str((options or {}).get("proxy") or "").strip()
+    if task_proxy:
+        if cpa_enabled:
+            cfg["cpa"] = {**cfg.get("cpa", {}), "proxy": task_proxy}
+        if sub2api_enabled:
+            cfg["sub2api"] = {**cfg.get("sub2api", {}), "proxy": task_proxy}
 
     from . import exporter  # 懒 import,避免未启用时强依赖
 
@@ -529,6 +732,13 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
             cpa_cfg=cfg.get("cpa") if cpa_enabled else None,
             sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
             log_fn=_log,
+            on_tokens_refreshed=lambda fresh_cred: db.update_registered_oauth_tokens(
+                fresh_cred.get("email", ""),
+                access_token=fresh_cred.get("access_token", ""),
+                refresh_token=fresh_cred.get("refresh_token", ""),
+                id_token=fresh_cred.get("id_token", ""),
+            ),
+            refresh_oauth=bool((options or {}).get("export_refresh_oauth", False)),
         )
     except Exception as e:
         _log(f"导出整体异常: {e}", "error")

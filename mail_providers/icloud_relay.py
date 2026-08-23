@@ -1,7 +1,7 @@
-"""iCloud 隐藏邮箱 + HTML 中转取件 provider。
+"""通用邮箱 + OTP 中转取件 provider。
 
 主人手上的形态：
-    邮箱      wariest-grimier.33@icloud.com    （iCloud「隐藏我的邮件」生成的别名）
+    邮箱      任意邮箱地址（兼容 iCloud 隐藏邮箱、Gmail 等）
     中转链接  https://mail.ai1998.xyz/messages/<token>/<email>
 
 中转站是第三方部署的 HTML 页面，**没有 JSON 接口**（试过 ?format=json，
@@ -654,7 +654,7 @@ def parse_relay_html(text: str) -> list[dict]:
 
 @register
 class ICloudRelayProvider(MailProvider):
-    """iCloud 隐藏邮箱（第三方 HTML 中转取件）。
+    """通用邮箱 OTP 中转取件（兼容 iCloud 隐藏邮箱）。
 
     使用方式：
         mail = ICloudRelayProvider(
@@ -664,7 +664,7 @@ class ICloudRelayProvider(MailProvider):
     """
 
     kind = "icloud_relay"
-    display_name = "iCloud 隐藏邮箱（中转）"
+    display_name = "通用 OTP 邮箱（中转链接）"
     pooled = True           # 一批号导进号池，每个号自带自己的取件链接
     ephemeral = False       # 固定地址 ⚠️ 见模块 docstring
 
@@ -672,10 +672,9 @@ class ICloudRelayProvider(MailProvider):
     # 每个号的中转链接都不一样（token 和地址都嵌在 URL 里），
     # 所以链接必须跟着号走，不能放全局配置。
     line_segments = 2
-    import_hint = "email----中转链接"
+    import_hint = "任意邮箱----OTP 中转链接"
     import_placeholder = (
-        "wariest-grimier.33@icloud.com----https://mail.example.com/messages/TOKEN/"
-        "wariest-grimier.33%40icloud.com"
+        "ferrarieddie78729@gmail.com----https://gapi.mailsapi.com/api/get-code?uid=s72603dfa6ca0a9640e"
     )
 
     # 号池型 provider 不需要全局配置 —— 凭证全在每一行导入数据里。
@@ -686,12 +685,14 @@ class ICloudRelayProvider(MailProvider):
     # OpenAI 走 passwordless_login 照样能拿 token，不该当失败处理。
     # registrar.classify_error 会读这个标志（默认 False，不影响其他 provider）。
     accepts_existing_account = True
+    # 通用 OTP 导入用于创建可长期登录的账号；不接受静默回退到无密码流程。
+    requires_password = True
 
     def __init__(self, email: str, relay_url: str, timeout: int = 20):
         email = (email or "").strip().lower()
         relay_url = (relay_url or "").strip()
         if not email:
-            raise ValueError("iCloud 邮箱地址不能为空")
+            raise ValueError("邮箱地址不能为空")
         validate_email(email)
         if not relay_url.lower().startswith(("http://", "https://")):
             raise ValueError("中转链接必须是 http(s):// 开头的完整地址")
@@ -718,6 +719,9 @@ class ICloudRelayProvider(MailProvider):
 
         # 已消费过的邮件指纹（主题+时间），避免同一封被读两遍
         self._seen: set[str] = set()
+        # 直接接码接口不提供邮件 ID 或时间戳，已用过的码单独记录。
+        self._seen_direct_codes: set[str] = set()
+        self._direct_json_mode: Optional[bool] = None
         # 起始快照只做一次 —— 见 wait_for_otp 里的说明
         self._snapshot_done = False
 
@@ -733,7 +737,7 @@ class ICloudRelayProvider(MailProvider):
         """
         if not account:
             raise MailProviderError(
-                "iCloud 中转邮箱是号池型：请先去「导入邮箱」页导入号，"
+                "通用 OTP 中转邮箱是号池型：请先去「导入邮箱」页导入号，"
                 "格式 email----中转链接",
                 fatal=False, kind=cls.kind,
             )
@@ -741,7 +745,7 @@ class ICloudRelayProvider(MailProvider):
         relay = (account.get("relay_url") or "").strip()
         if not relay:
             raise MailProviderError(
-                f"号池里的 {email} 没有中转链接 —— 可能是用旧格式导入的，"
+                f"号池里的 {email} 没有中转链接 —— "
                 f"请按 email----中转链接 重新导入",
                 fatal=True, kind=cls.kind,
             )
@@ -803,6 +807,64 @@ class ICloudRelayProvider(MailProvider):
         })
         with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
             return r.read().decode("utf-8", errors="replace")
+
+    def _fetch_direct_json_code(self) -> tuple[bool, Optional[str]]:
+        """读取 ``{code, message, data: {code}}`` 形式的直接接码接口。
+
+        返回 ``(is_direct_api, otp)``。只有最外层 ``code == 0`` 才读取
+        ``data.code``；业务错误（如 ``code == 502``）表示接口正常但暂未
+        提供验证码，调用方应继续轮询。
+        """
+        if self._direct_json_mode is False:
+            return False, None
+        req = urllib.request.Request(self.relay_url, headers={
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0",
+            "Cache-Control": "no-cache",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=self.http_timeout) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404, 410):
+                raise MailProviderError(
+                    f"OTP 中转链接无效（HTTP {e.code}）",
+                    fatal=True, kind=self.kind,
+                ) from e
+            logger.debug("[otp_relay] 直接接码接口 HTTP %s", e.code)
+            return bool(self._direct_json_mode), None
+        except Exception as e:
+            logger.debug("[otp_relay] 直接接码请求异常: %s", e)
+            return bool(self._direct_json_mode), None
+
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            self._direct_json_mode = False
+            return False, None
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        is_direct = (
+            isinstance(payload, dict)
+            and type(payload.get("code")) is int
+            and (data is None or (isinstance(data, dict) and "code" in data))
+        )
+        if not is_direct:
+            self._direct_json_mode = False
+            return False, None
+
+        self._direct_json_mode = True
+        if payload["code"] != 0:
+            logger.debug(
+                "[otp_relay] 直接接码接口暂未成功: code=%s message=%s",
+                payload["code"], payload.get("message", ""),
+            )
+            return True, None
+        otp = str(data.get("code") or "").strip() if isinstance(data, dict) else ""
+        if not re.fullmatch(r"\d{6}", otp):
+            logger.warning("[otp_relay] 直接接码接口成功响应缺少合法 6 位 data.code")
+            return True, None
+        return True, otp
 
     def _try_api(self, api_url: str, limit: int = 50) -> str:
         """朝一个候选接口要数据，返回**原始文本**（不解析）。
@@ -880,6 +942,10 @@ class ICloudRelayProvider(MailProvider):
         不管字节从哪来，解析永远只有 `parse_relay_html` 这**一个**入口
         （内部就是主人说的那两种：JSON 通用扫描 + HTML 通用扫描）。
         """
+        # 直接 JSON 接码接口没有邮件列表，wait_for_otp 走专用轮询。
+        if self._direct_json_mode is True:
+            return []
+
         # 认准过的源，直接走
         if self._source:
             if self._source == "html":
@@ -973,6 +1039,24 @@ class ICloudRelayProvider(MailProvider):
             f"(timeout={timeout}s, cutoff={cutoff})"
         )
 
+        # 直接接码接口只有当前 code，没有邮件 ID/时间，不能像邮件中转那样
+        # 建快照，否则刚发来的验证码会被误跳过；发现即返回交给 OpenAI 校验。
+        direct_api, direct_code = self._fetch_direct_json_code()
+        if direct_api:
+            if direct_code:
+                logger.info("[otp_relay] ✅ 直接接码接口返回 OTP=%s", direct_code)
+                return direct_code
+            while time.time() < deadline:
+                time.sleep(3)
+                _, direct_code = self._fetch_direct_json_code()
+                if direct_code:
+                    logger.info("[otp_relay] ✅ 直接接码接口返回 OTP=%s", direct_code)
+                    return direct_code
+            raise TimeoutError(
+                f"通用 OTP 中转超时 {timeout}s（{email_addr}）—— "
+                "接码接口未返回成功 code=0 的 data.code"
+            )
+
         # 起始快照：把开跑前页面上就有的邮件标记为已见。
         #
         # ⚠️ 只在**第一次**调用时做。auth_flow 的 resend 重试链路会拿同一个
@@ -1047,7 +1131,7 @@ class ICloudRelayProvider(MailProvider):
             time.sleep(3)
 
         raise TimeoutError(
-            f"iCloud 中转 OTP 超时 {timeout}s（{email_addr}）—— "
+            f"通用 OTP 中转超时 {timeout}s（{email_addr}）—— "
             f"确认中转站能收到这个邮箱的信"
         )
 
@@ -1063,7 +1147,7 @@ class ICloudRelayProvider(MailProvider):
         parts = [p.strip() for p in (line or "").split("----")]
         if len(parts) != 2:
             raise ValueError(
-                f"需要 2 段（email----中转链接），实际 {len(parts)} 段"
+                f"需要 2 段（邮箱----OTP 中转链接），实际 {len(parts)} 段"
             )
         email, relay = parts
         validate_email(email)
@@ -1085,6 +1169,23 @@ class ICloudRelayProvider(MailProvider):
         比等注册跑挂了再翻日志快得多。
         """
         try:
+            direct_api, direct_code = self._fetch_direct_json_code()
+            if direct_api:
+                if direct_code:
+                    return {
+                        "ok": True,
+                        "message": (
+                            f"[{self._host}] 直接接码接口连接成功，"
+                            f"当前 OTP：{direct_code}"
+                        ),
+                    }
+                return {
+                    "ok": True,
+                    "message": (
+                        f"[{self._host}] 直接接码接口连接成功，"
+                        "当前尚未返回成功 code=0 的 OTP。"
+                    ),
+                }
             msgs = self._load()
         except MailProviderError as e:
             return {"ok": False, "message": f"[{self._host}] {e}"}

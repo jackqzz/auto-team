@@ -14,6 +14,36 @@ const http = axios.create({
   timeout: 60000,
 })
 
+export const ADMIN_TOKEN_KEY = 'gpt_auto_register_admin_token'
+
+export function setAdminToken(token) {
+  const value = String(token || '')
+  if (value) {
+    localStorage.setItem(ADMIN_TOKEN_KEY, value)
+    document.cookie = `${ADMIN_TOKEN_KEY}=${encodeURIComponent(value)}; path=/; SameSite=Lax`
+  } else {
+    localStorage.removeItem(ADMIN_TOKEN_KEY)
+    document.cookie = `${ADMIN_TOKEN_KEY}=; path=/; max-age=0; SameSite=Lax`
+  }
+}
+
+function currentAdminToken() {
+  const token = localStorage.getItem(ADMIN_TOKEN_KEY)
+  if (token) {
+    document.cookie = `${ADMIN_TOKEN_KEY}=${encodeURIComponent(token)}; path=/; SameSite=Lax`
+  }
+  return token
+}
+
+http.interceptors.request.use((config) => {
+  const token = currentAdminToken()
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
 // 统一解包 + 错误提示。后端约定：
 //   - 一般错误：非 2xx，body 里有 detail 字段
 //   - 校验类错误（如导入逐行报错）：422，body 是 { message, errors: [{line, error}] }
@@ -33,6 +63,9 @@ http.interceptors.response.use(
     const err = new Error(detail)
     err.status = error?.response?.status
     err.data = data
+    if (err.status === 401 && !window.location.hash.startsWith('#/login')) {
+      window.location.hash = '#/login'
+    }
     return Promise.reject(err)
   },
 )
@@ -47,7 +80,8 @@ export default http
  * @returns {EventSource}
  */
 export function createSSE(path, handlers = {}, onError) {
-  const es = new EventSource(API_BASE + path)
+  currentAdminToken()
+  const es = new EventSource(API_BASE + path, { withCredentials: true })
   for (const [event, cb] of Object.entries(handlers)) {
     es.addEventListener(event, cb)
   }

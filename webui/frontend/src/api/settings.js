@@ -22,3 +22,7 @@ export const getSmsAllCountries = (provider = '') =>
 export const getExportConfig = () => http.get('/api/settings/export')
 export const saveExportConfig = (payload) => http.post('/api/settings/export', payload)
 export const testExport = (target) => http.post('/api/settings/export/test', { target })
+
+// ──────────────── 公开 401 重登录配置 ────────────────
+export const getPublicReloginConfig = () => http.get('/api/settings/public-relogin')
+export const savePublicReloginConfig = (payload) => http.post('/api/settings/public-relogin', payload)

@@ -20,6 +20,9 @@ export const deleteRegistered = (email) =>
 export const updateCredentials = (payload) =>
   http.post('/api/registered/update_credentials', payload)
 
+export const importSub2Api = (text, group_name = '') =>
+  http.post('/api/registered/import_sub2api', { text, group_name })
+
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
 
@@ -36,6 +39,9 @@ export const checkPlus = (emails, proxy = '') =>
 
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })
+
+export const pushRegisteredToCpa = (emails, proxy = '', workspace_id = null) =>
+  http.post('/api/registered/push_cpa', { emails, proxy, ...(workspace_id ? { workspace_id } : {}) })
 
 // ──────────────── 自动跑号 auto-loop ────────────────
 export const autoStart = (payload) => http.post('/api/auto/start', payload)

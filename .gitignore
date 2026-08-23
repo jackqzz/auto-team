@@ -14,8 +14,14 @@ webui/logs/
 run.log
 run*.log
 account_*.json
+codex-*.json
+sub2api-account*.json
+sub2api-accounts*.json
+tmp.session.json
+invites
 *.session
 *.token
+webui/data.db
 
 # Outlook 4 段格式接码号（如果主人手动放过）
 mail.txt

@@ -11,12 +11,34 @@ const defaults = {
   autoConcurrency: 1,
   autoCoolDown: 3,
   autoTargetCount: 0,
+  // 每个账号失败后的额外尝试次数；1 = 首次失败后再试一次。
+  autoAccountRetryCount: 1,
+  // 空字符串 = 未分组；__all__ = 全部分组。
+  // 单次和批量拆开保存，临时跑全池不会改变批量任务的默认未分组。
+  groupName: '',
+  autoGroupName: '',
+  autoLoginOnly: false,
+  autoLoginNoRtOnly: false,
   // 注册后自动绑 2FA。单次 / 批量都**默认 true**：每个号都要 2FA。
   // 仍然拆成两个字段（而不是共用一个）：单次页是验 bug / 试流程的测试台，
   // 共用的话在那边临时关掉，回头批量跑几百个号就全裸奔了。
   // localStorage 只记住主人上次的选择，不改变默认值：清缓存后两边都回到 true。
   want2fa: true,
   autoWant2fa: true,
+  wantPassword: true,
+  autoWantPassword: true,
+  // 是否在主注册/登录完成后继续跑独立 Codex OAuth 获取 refresh_token。
+  // 单次和批量分开保存，默认开启以保持历史行为。
+  wantOauthRt: true,
+  autoWantOauthRt: true,
+  // add-phone 阶段的手机号验证模式：
+  // api = 走原有 HTTP/SMS 接口路径
+  // camoufox = 走浏览器驱动路径
+  addPhoneMode: 'api',
+  autoAddPhoneMode: 'api',
+  // 本次自动任务完成后是否推送到已启用的 CPA / SUB2API。
+  autoExport: true,
+  autoExportRefreshOauth: false,
 }
 
 // el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个

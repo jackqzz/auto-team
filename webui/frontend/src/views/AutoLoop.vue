@@ -1,9 +1,10 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, onActivated, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import { autoStart, autoPause, autoResume, autoStop } from '@/api/register'
+import { listAccountGroups } from '@/api/accounts'
 import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
@@ -31,19 +32,41 @@ const stateType = computed(() => ({
 }[st.value] || 'info'))
 
 const workers = computed(() => Array.isArray(autoStatus.value.workers) ? autoStatus.value.workers : [])
+const groups = ref([])
+
+async function loadGroups() {
+  try {
+    groups.value = (await listAccountGroups()).groups || []
+    if (
+      form.value.autoGroupName
+      && form.value.autoGroupName !== '__all__'
+      && !groups.value.some((g) => g.name === form.value.autoGroupName)
+    ) form.value.autoGroupName = ''
+  } catch (_) {}
+}
+
+onActivated(loadGroups)
 
 async function start() {
   try {
-    await autoStart({
-      proxy: proxyText(form.value),
-      proxy_pool: proxyStore.text,
-      concurrency: parseInt(form.value.autoConcurrency, 10) || 1,
-      otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
-      want_access_token: true,
+      await autoStart({
+        proxy: proxyText(form.value),
+        proxy_pool: proxyStore.text,
+        concurrency: parseInt(form.value.autoConcurrency, 10) || 1,
+        otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
+        want_access_token: true,
       want_session_token: true,
-      want_refresh_token: true,
+      want_refresh_token: form.value.autoWantOauthRt,
+      add_phone_mode: form.value.autoAddPhoneMode,
+      want_password: form.value.autoWantPassword,
+      login_only: form.value.autoLoginOnly,
+      login_no_rt_only: form.value.autoLoginNoRtOnly,
+      group_name: form.value.autoGroupName,
       cool_down_seconds: parseFloat(form.value.autoCoolDown) || 0,
       target_count: parseInt(form.value.autoTargetCount, 10) || 0,
+        account_retry_count: parseInt(form.value.autoAccountRetryCount, 10) || 0,
+        auto_export: form.value.autoExport,
+        export_refresh_oauth: form.value.autoExportRefreshOauth,
       // 批量默认绑 2FA（后端默认是 false，这个字段以前压根没传，
       // 所以批量跑出来的号一个都没 2FA）。留开关是因为绑定不可逆。
       want_2fa: form.value.autoWant2fa,
@@ -60,24 +83,60 @@ async function call(fn, name) {
 <template>
   <div class="page">
     <el-card shadow="never" style="margin-bottom: 16px">
-      <template #header><span class="section-title" style="margin: 0">全自动批量注册</span></template>
+      <template #header>
+        <span class="section-title" style="margin: 0">
+          {{ form.autoLoginOnly ? '批量仅登录' : '全自动批量注册' }}
+        </span>
+      </template>
+
+      <el-form-item label="任务模式">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoLoginOnly" />
+          <span>仅登录</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          开启后只投送所选分组内已有注册结果的账号；优先使用密码和 2FA，服务端要求时再使用邮箱 OTP 和 2FA。
+        </div>
+      </el-form-item>
+      <el-form-item v-if="form.autoLoginOnly" label="过滤条件">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoLoginNoRtOnly" />
+          <span>仅执行无 RT 账号</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          开启后仅从注册结果里挑选 refresh_token 为空的账号执行，仅影响“仅登录”任务。
+        </div>
+      </el-form-item>
 
       <el-space wrap :size="16" style="margin-bottom: 12px">
         <el-form-item label="并发" style="margin: 0">
           <el-input-number v-model="form.autoConcurrency" :min="1" :max="20" />
         </el-form-item>
+        <el-form-item label="执行数量限制(0=不限)" style="margin: 0">
+          <el-input-number v-model="form.autoTargetCount" :min="0" :max="100000" />
+        </el-form-item>
         <el-form-item label="冷却(秒)" style="margin: 0">
           <el-input-number v-model="form.autoCoolDown" :min="0" :max="120" />
-        </el-form-item>
-        <el-form-item label="目标数(0=不限)" style="margin: 0">
-          <el-input-number v-model="form.autoTargetCount" :min="0" :max="100000" />
         </el-form-item>
         <el-form-item label="OTP 等待(秒)" style="margin: 0">
           <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />
         </el-form-item>
+        <el-form-item label="账号失败重试" style="margin: 0">
+          <el-input-number v-model="form.autoAccountRetryCount" :min="0" :max="10" />
+        </el-form-item>
+        <el-form-item label="执行分组" style="margin: 0">
+          <el-select v-model="form.autoGroupName" style="width: 180px">
+            <el-option label="未分组" value="" />
+            <el-option label="全部分组" value="__all__" />
+            <el-option
+              v-for="g in groups.filter((g) => g.name)" :key="g.name"
+              :label="`${g.name}（${form.autoLoginOnly ? `可登录 ${g.active_registered_total ?? g.registered_total}` : `可用 ${g.available}`}）`" :value="g.name"
+            />
+          </el-select>
+        </el-form-item>
       </el-space>
 
-      <el-form-item label="2FA">
+      <el-form-item v-if="!form.autoLoginOnly" label="2FA">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
           <el-switch v-model="form.autoWant2fa" />
           <span>每个号注册成功后自动绑定 2FA（TOTP）</span>
@@ -90,20 +149,70 @@ async function call(fn, name) {
         </div>
       </el-form-item>
 
+      <el-form-item label="OAuth RT">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoWantOauthRt" />
+          <span>任务完成后获取 refresh_token</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          关闭后跳过最后的 Codex OAuth，可缩短每个任务耗时；access token 和 session token 不受影响。
+        </div>
+      </el-form-item>
+      <el-form-item label="add-phone 模式">
+        <el-select v-model="form.autoAddPhoneMode" style="width: 220px">
+          <el-option label="API / SMS 接口" value="api" />
+          <el-option label="Camoufox 浏览器模式" value="camoufox" />
+        </el-select>
+        <div class="hint" style="margin-top: 6px">
+          仅在任务命中 add-phone 验证分支时使用；默认走接口模式。Linux 无桌面环境可改为 Camoufox。
+        </div>
+      </el-form-item>
+
+      <el-form-item v-if="!form.autoLoginOnly" label="密码">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoWantPassword" />
+          <span>强制创建账号密码</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          开启时密码创建失败或邮箱已注册会跳过该任务；关闭后允许无密码 OTP 账号。
+        </div>
+      </el-form-item>
+
+      <el-form-item label="自动推送号池">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoExport" />
+          <span>任务成功后自动推送到已启用的 CPA / SUB2API</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          关闭只跳过本次任务，不会修改“自动导出”里的全局配置；注册和仅登录模式都生效。
+        </div>
+      </el-form-item>
+      <el-form-item v-if="form.autoExport" label="推送前刷新 OAuth">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoExportRefreshOauth" />
+          <span>推送前使用 RT 换取新的 Codex access token</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          默认关闭，直接使用现有 access token；开启后可能受 OpenAI 出口地区限制影响。
+        </div>
+      </el-form-item>
+
       <el-form-item label="代理池">
         <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
           <el-tag :type="proxyCount ? 'success' : 'info'" effect="light">
             当前 {{ proxyCount }} 个代理
           </el-tag>
           <span class="hint">
-            {{ proxyCount ? '各 worker 按顺序轮流取用' : '为空：所有 worker 用「单次注册」页填的单代理' }}
+            {{ proxyCount ? '每个任务优先取使用次数最少的代理' : '为空：所有任务用「单次注册」页填的单代理' }}
           </span>
           <el-button size="small" @click="router.push('/proxy')">管理代理池</el-button>
         </div>
       </el-form-item>
 
       <el-space wrap style="margin-top: 8px">
-        <el-button type="primary" :disabled="!canStart" @click="start">开始</el-button>
+        <el-button type="primary" :disabled="!canStart" @click="start">
+          {{ form.autoLoginOnly ? '开始登录' : '开始' }}
+        </el-button>
         <el-button :disabled="!canPause" @click="call(autoPause, '暂停')">暂停</el-button>
         <el-button :disabled="!canResume" @click="call(autoResume, '恢复')">恢复</el-button>
         <el-button type="danger" :disabled="!canStop" @click="call(autoStop, '停止')">停止</el-button>

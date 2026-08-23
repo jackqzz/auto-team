@@ -5,7 +5,8 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listAccounts, deleteAccount, bulkDeleteAccounts, resetFailed,
-  resetAccount, bulkResetAccounts, releaseStale,
+  resetAccount, bulkResetAccounts, releaseStale, setAccountsGroup,
+  createAccountGroup, renameAccountGroup, deleteAccountGroup,
 } from '@/api/accounts'
 import { getMailProviders } from '@/api/settings'
 import { useStatsStore } from '@/stores/stats'
@@ -23,12 +24,15 @@ const total = ref(0)
 const page = ref(1)
 const statusFilter = ref('')
 const kindFilter = ref('')
+const groupFilter = ref('__all__')
 const bulkStatus = ref('')
 const selected = ref([])
 const loading = ref(false)
 // 号池现在可以混放多种邮箱，这两个用来显示「来源」列和按来源过滤
 const providers = ref([])
 const byKind = ref({})
+const groups = ref([])
+const groupManagerVisible = ref(false)
 
 const STATUS_TYPE = { available: 'success', in_use: 'warning', done: 'primary', failed: 'danger' }
 
@@ -55,15 +59,17 @@ async function load(resetPage) {
   if (resetPage) page.value = 1
   loading.value = true
   try {
-    const { items, total: t, by_kind } = await listAccounts({
+    const { items, total: t, by_kind, groups: groupItems } = await listAccounts({
       status: statusFilter.value,
       kind: kindFilter.value,
+      group_name: groupFilter.value,
       limit: PAGE_SIZE,
       offset: (page.value - 1) * PAGE_SIZE,
     })
     rows.value = items
     total.value = t
     byKind.value = by_kind || {}
+    groups.value = groupItems || []
   } catch (e) {
     ElMessage.error(e.message)
   } finally {
@@ -100,6 +106,56 @@ async function deleteSelected() {
   if (!(await confirm(`确定删除选中的 ${emails.length} 个号？(不可恢复)`))) return
   try { const r = await bulkDeleteAccounts({ emails }); ElMessage.success(`已删除 ${r.deleted} 个`); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
+}
+async function moveSelectedToGroup(groupName) {
+  if (groupName === '__manage__') {
+    groupManagerVisible.value = true
+    return
+  }
+  if (groupName === '__ungrouped__') groupName = ''
+  const emails = selected.value.map((r) => r.email)
+  if (!emails.length) return
+  try {
+    const r = await setAccountsGroup(emails, groupName)
+    ElMessage.success(`已更新 ${r.updated} 个邮箱的分组`)
+    afterMutate()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function addGroup() {
+  try {
+    const { value } = await ElMessageBox.prompt('分组可先为空，之后再移动账号进去。', '新增分组', {
+      inputPlaceholder: '例如：8月采购', confirmButtonText: '新增', cancelButtonText: '取消',
+      inputValidator: (v) => String(v || '').trim().length > 0 || '分组名称不能为空',
+    })
+    await createAccountGroup(value.trim())
+    ElMessage.success('分组已新增')
+    afterMutate()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  }
+}
+async function renameGroup(group) {
+  try {
+    const { value } = await ElMessageBox.prompt('账号会保留在改名后的分组。', '重命名分组', {
+      inputValue: group.name, confirmButtonText: '保存', cancelButtonText: '取消',
+      inputValidator: (v) => String(v || '').trim().length > 0 || '分组名称不能为空',
+    })
+    const r = await renameAccountGroup(group.name, value.trim())
+    if (groupFilter.value === group.name) groupFilter.value = value.trim()
+    ElMessage.success(`分组已改名，移动 ${r.moved} 个账号`)
+    afterMutate()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  }
+}
+async function removeGroup(group) {
+  if (!(await confirm(`删除分组“${group.name}”？其中 ${group.total} 个账号会保留并归入未分组。`, '删除分组'))) return
+  try {
+    const r = await deleteAccountGroup(group.name)
+    if (groupFilter.value === group.name) groupFilter.value = ''
+    ElMessage.success(`已删除分组，${r.ungrouped} 个账号归入未分组`)
+    afterMutate()
+  } catch (e) { ElMessage.error(e.message) }
 }
 async function bulkDeleteByStatus() {
   if (!bulkStatus.value) { ElMessage.warning('请先选择要删除的状态'); return }
@@ -159,6 +215,14 @@ loadProviders()
             :label="`${o.label} (${o.count})`" :value="o.kind"
           />
         </el-select>
+        <el-select v-model="groupFilter" style="width: 170px" @change="load(true)">
+          <el-option label="全部分组" value="__all__" />
+          <el-option label="未分组" value="" />
+          <el-option
+            v-for="g in groups.filter((g) => g.name)" :key="g.name"
+            :label="`${g.name} (${g.total})`" :value="g.name"
+          />
+        </el-select>
         <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
         <el-button @click="resetFailedAll">重试 failed</el-button>
         <el-button @click="releaseStaleAll">释放卡死号</el-button>
@@ -171,6 +235,23 @@ loadProviders()
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
           删除选中 ({{ selected.length }})
         </el-button>
+        <el-dropdown trigger="click" :disabled="!selected.length" @command="moveSelectedToGroup">
+          <el-button plain :disabled="!selected.length">
+            移动分组 ({{ selected.length }})<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="__ungrouped__">移动到未分组</el-dropdown-item>
+              <el-dropdown-item v-for="g in groups" :key="g.name" :command="g.name">
+                移动到 {{ g.name }}
+              </el-dropdown-item>
+              <el-dropdown-item divided command="__manage__">
+                管理分组
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <el-button plain @click="groupManagerVisible = true">编辑分组</el-button>
         <el-select v-model="bulkStatus" placeholder="— 按状态批量删 —" style="width: 180px">
           <el-option label="删全部 failed" value="failed" />
           <el-option label="删全部 done" value="done" />
@@ -189,6 +270,12 @@ loadProviders()
       >
         <el-table-column type="selection" width="44" />
         <el-table-column prop="email" label="邮箱" min-width="220" show-overflow-tooltip />
+        <el-table-column label="分组" width="130" show-overflow-tooltip>
+          <template #default="{ row }">
+            <el-tag v-if="row.group_name" size="small">{{ row.group_name }}</el-tag>
+            <span v-else class="hint">未分组</span>
+          </template>
+        </el-table-column>
         <el-table-column v-if="kindOptions.length > 1" label="来源" width="130">
           <template #default="{ row }">
             <el-tag size="small" type="info">{{ kindLabel(row.kind) }}</el-tag>
@@ -222,5 +309,23 @@ loadProviders()
         />
       </div>
     </el-card>
+
+    <el-dialog v-model="groupManagerVisible" title="编辑分组" width="min(620px, 92vw)" top="10vh">
+      <div style="display: flex; justify-content: flex-end; margin-bottom: 12px">
+        <el-button type="primary" @click="addGroup">新增分组</el-button>
+      </div>
+      <el-table :data="groups" size="small" border>
+        <el-table-column prop="name" label="分组名称" min-width="220" />
+        <el-table-column prop="total" label="账号数" width="100" />
+        <el-table-column prop="available" label="可用" width="100" />
+        <el-table-column label="操作" width="160">
+          <template #default="{ row }">
+            <el-button size="small" text type="primary" @click="renameGroup(row)">改名</el-button>
+            <el-button size="small" text type="danger" @click="removeGroup(row)">删除</el-button>
+          </template>
+        </el-table-column>
+        <template #empty><el-empty description="还没有自定义分组" :image-size="54" /></template>
+      </el-table>
+    </el-dialog>
   </div>
 </template>

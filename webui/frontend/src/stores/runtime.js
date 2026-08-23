@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { createSSE } from '@/api/request'
+import { ADMIN_TOKEN_KEY, createSSE } from '@/api/request'
 import { useStatsStore } from './stats'
 
 let _logId = 0
@@ -102,7 +102,10 @@ export const useRuntimeStore = defineStore('runtime', () => {
         try {
           const d = JSON.parse(e.data)
           const tag = d.ok ? '[成功]' : (d.category === 'network' ? '[网络错误，号已 release]' : '[失败]')
-          addLog(`[auto] ${tag} ${d.email} 完成`, d.ok ? 'ok' : 'err')
+          // 失败任务同样会触发 run_finished，但不能写成“完成”，避免把网络错误
+          // 误解为账号已成功处理；这里的“结束”表示该账号本次尝试已退出。
+          const suffix = d.ok ? '完成' : '结束（本次不重试）'
+          addLog(`[auto] ${tag} ${d.email} ${suffix}`, d.ok ? 'ok' : 'err')
           useStatsStore().refresh()
           bumpData()
         } catch (_) {}
@@ -118,7 +121,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
       // 断线自动重连
       try { es.close() } catch (_) {}
       autoEs = null
-      setTimeout(connectAutoStream, 2000)
+      if (localStorage.getItem(ADMIN_TOKEN_KEY)) setTimeout(connectAutoStream, 2000)
     })
     autoEs = es
   }

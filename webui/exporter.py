@@ -130,7 +130,7 @@ def _import_cffi_mime():
 # ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
 
 
-def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -> dict:
+def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT, proxy: str = "") -> dict:
     """用 Codex refresh_token 换一组新的 access_token / id_token / refresh_token(滚动)。
 
     参考 any-auto-register/platforms/chatgpt/token_refresh.py 风格。
@@ -157,11 +157,13 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
         "Referer": "https://auth.openai.com/",
     }
 
+    proxy_text = str(proxy or "").strip()
+    proxies = {"http": proxy_text, "https": proxy_text} if proxy_text else None
     resp = cffi.post(
         OPENAI_TOKEN_ENDPOINT,
         headers=headers,
         data=body,
-        proxies=None,
+        proxies=proxies,
         verify=False,
         timeout=timeout,
         impersonate="chrome110",
@@ -653,7 +655,9 @@ def test_sub2api(cfg: dict) -> dict:
 def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
-                  log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+                  log_fn: Optional[Callable[[str, str], None]] = None,
+                  on_tokens_refreshed: Optional[Callable[[dict], None]] = None,
+                  refresh_oauth: bool = False) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
@@ -673,23 +677,40 @@ def run_exports(cred: dict, *,
     if not (cpa_on or sub2_on):
         return out
 
-    # ─ 关键：先用 refresh_token 换 Codex 风格 access_token ─
-    try:
+    # 可选：用 refresh_token 换 Codex 风格 access_token。默认不刷新，
+    # 直接使用注册结果中已有的 access_token，避免额外请求和地区限制。
+    if refresh_oauth:
+      try:
         log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
-        fresh = refresh_codex_token(cred.get("refresh_token", ""))
+        refresh_cfg = cpa_cfg or sub2api_cfg or {}
+        refresh_timeout = (
+            refresh_cfg.get("cpa_timeout")
+            or refresh_cfg.get("sub2api_timeout")
+            or DEFAULT_TIMEOUT
+        )
+        fresh = refresh_codex_token(
+            cred.get("refresh_token", ""),
+            timeout=int(refresh_timeout),
+            proxy=str(refresh_cfg.get("proxy") or ""),
+        )
         cred = {
             **cred,
             "access_token":  fresh["access_token"],
             "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
             "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
         }
+        if on_tokens_refreshed is not None:
+            try:
+                on_tokens_refreshed(cred)
+            except Exception as e:
+                log(f"[exporter] 新 OAuth token 回写失败（继续上传）: {e}", "warn")
         log(
             f"[exporter] ✅ Codex token 刷新成功 "
             f"(access_token len={len(fresh['access_token'])} "
             f"id_token len={len(fresh.get('id_token') or '')})",
             "ok",
         )
-    except Exception as e:
+      except Exception as e:
         log(f"[exporter] ❌ Codex token 刷新失败，无法导出: {e}", "error")
         if cpa_on:
             out["any_attempted"] = True
@@ -698,6 +719,8 @@ def run_exports(cred: dict, *,
             out["any_attempted"] = True
             out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
         return out
+    else:
+        log("[exporter] 已关闭 OAuth 刷新，直接使用现有 access_token", "info")
 
     if cpa_on:
         out["any_attempted"] = True
@@ -716,3 +739,28 @@ def run_exports(cred: dict, *,
             out["sub2api"] = {"ok": False, "error": str(e)}
 
     return out
+
+
+def push_many_to_cpa(
+    rows: list[dict], cpa_cfg: dict,
+    on_tokens_refreshed: Optional[Callable[[dict], None]] = None,
+    proxy: str = "",
+) -> list[dict]:
+    """批量推送 CPA；每个账号独立执行，单条失败不终止后续账号。"""
+    results = []
+    cfg = dict(cpa_cfg or {})
+    cfg["enabled"] = True
+    if proxy:
+        cfg["proxy"] = proxy
+    for cred in rows:
+        email = str(cred.get("email") or "").strip().lower()
+        try:
+            exported = run_exports(
+                cred, cpa_cfg=cfg, sub2api_cfg=None,
+                on_tokens_refreshed=on_tokens_refreshed,
+            )
+            result = exported.get("cpa") or {"ok": False, "error": "CPA 未执行"}
+            results.append({"email": email, **result})
+        except Exception as e:
+            results.append({"email": email, "ok": False, "error": str(e)})
+    return results

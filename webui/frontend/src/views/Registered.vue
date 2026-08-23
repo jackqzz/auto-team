@@ -6,11 +6,18 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
+  importSub2Api, pushRegisteredToCpa,
+  autoStart,
 } from '@/api/register'
+import {
+  setAccountsGroup, createAccountGroup, renameAccountGroup, deleteAccountGroup,
+} from '@/api/accounts'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
+import { listWorkspaceMasters } from '@/api/workspaces'
+import { assignCandidates } from '@/api/workspaceCandidates'
 import StatusDot from '@/components/StatusDot.vue'
 
 const { form } = storeToRefs(useFormStore())
@@ -23,15 +30,22 @@ const runtime = useRuntimeStore()
 // store 实例上取 —— storeToRefs 只转 state/getter，把 action 解构出来会丢 this。
 const { dataVersion } = storeToRefs(runtime)
 
-const PAGE_SIZE = 20
+const pageSize = ref(20)
 const rows = ref([])
 const total = ref(0)
 const page = ref(1)
 const filter = ref('all')
+const groupFilter = ref('__all__')
+const groups = ref([])
+const groupManagerVisible = ref(false)
 const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
+const importingSub2Api = ref(false)
+const sub2apiInput = ref(null)
+const pushingCpa = ref(false)
+const relogging = ref(false)
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
@@ -47,13 +61,41 @@ async function load(resetPage) {
   if (resetPage) page.value = 1
   loading.value = true
   try {
-    const { items, total: t } = await listRegistered({
-      limit: PAGE_SIZE, offset: (page.value - 1) * PAGE_SIZE, filter: filter.value,
+    const { items, total: t, groups: groupItems } = await listRegistered({
+      limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filter.value,
+      group_name: groupFilter.value,
     })
     rows.value = items
     total.value = t
+    groups.value = groupItems || []
   } catch (e) { ElMessage.error(e.message) }
   finally { loading.value = false }
+}
+
+async function selectAllFiltered() {
+  try {
+    const r = await listRegistered({ limit: 100000, offset: 0, filter: filter.value, group_name: groupFilter.value })
+    selected.value = (r.items || []).filter((row) => row.account_status !== 'permanently_invalid')
+    ElMessage.success(`已全选当前筛选条件下的 ${selected.value.length} 个账号`)
+  } catch (e) { ElMessage.error('全选失败: ' + e.message) }
+}
+
+const workspaceDialog = ref(false)
+const workspaceOptions = ref([])
+const workspaceTarget = ref(null)
+async function openWorkspaceAssign() {
+  if (!selected.value.length) return
+  try { const r = await listWorkspaceMasters({ limit: 200, offset: 0 }); workspaceOptions.value = r.items || []; workspaceTarget.value = null; workspaceDialog.value = true }
+  catch (e) { ElMessage.error('加载母号空间失败: ' + e.message) }
+}
+async function assignSelectedWorkspace() {
+  if (!workspaceTarget.value) return ElMessage.warning('请选择母号空间')
+  const invalid = selected.value.filter((row) => row.account_status === 'permanently_invalid')
+  if (invalid.length) return ElMessage.warning('已永久失效账号不能划分到母号空间')
+  try {
+    const r = await assignCandidates(workspaceTarget.value, selected.value.map(x => x.email))
+    ElMessage.success(`已划分 ${r.added} 个候选人到母号空间`); workspaceDialog.value = false
+  } catch (e) { ElMessage.error('划分失败: ' + e.message) }
 }
 
 function collectEmails(mode) {
@@ -123,6 +165,68 @@ async function deleteAll() {
   if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
   try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); load() }
   catch (e) { ElMessage.error(e.message) }
+}
+
+async function afterGroupMutate() {
+  await load()
+  runtime.bumpData()
+}
+
+async function moveSelectedToGroup(groupName) {
+  if (groupName === '__manage__') {
+    groupManagerVisible.value = true
+    return
+  }
+  if (groupName === '__ungrouped__') groupName = ''
+  const emails = selected.value.map((r) => r.email)
+  if (!emails.length) return
+  try {
+    const r = await setAccountsGroup(emails, groupName)
+    ElMessage.success(`已移动 ${r.updated} 条注册结果`)
+    await afterGroupMutate()
+  } catch (e) { ElMessage.error(e.message) }
+}
+
+async function addGroup() {
+  try {
+    const { value } = await ElMessageBox.prompt('分组可先为空，之后再移动账号进去。', '新增分组', {
+      inputPlaceholder: '例如：8月采购', confirmButtonText: '新增', cancelButtonText: '取消',
+      inputValidator: (v) => String(v || '').trim().length > 0 || '分组名称不能为空',
+    })
+    await createAccountGroup(value.trim())
+    ElMessage.success('分组已新增')
+    await afterGroupMutate()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  }
+}
+
+async function renameGroup(group) {
+  try {
+    const { value } = await ElMessageBox.prompt('邮箱列表和注册结果会同步改名。', '重命名分组', {
+      inputValue: group.name, confirmButtonText: '保存', cancelButtonText: '取消',
+      inputValidator: (v) => String(v || '').trim().length > 0 || '分组名称不能为空',
+    })
+    const next = value.trim()
+    const r = await renameAccountGroup(group.name, next)
+    if (groupFilter.value === group.name) groupFilter.value = next
+    ElMessage.success(`分组已改名，同步 ${r.moved} 个账号`)
+    await afterGroupMutate()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  }
+}
+
+async function removeGroup(group) {
+  if (!(await confirm(
+    `删除分组“${group.name}”？\n邮箱列表 ${group.total} 个、注册结果 ${group.registered_total} 个账号会保留并归入未分组。`,
+  ))) return
+  try {
+    const r = await deleteAccountGroup(group.name)
+    if (groupFilter.value === group.name) groupFilter.value = ''
+    ElMessage.success(`已删除分组，${r.ungrouped} 个账号归入未分组`)
+    await afterGroupMutate()
+  } catch (e) { ElMessage.error(e.message) }
 }
 
 // ──────────── 批量导出 ────────────
@@ -289,6 +393,7 @@ function copyAllJson() {
 // （registrar 的 account_callback 走 db.get_registered，不区分数据来源）。
 const editVisible = ref(false)
 const editSaving = ref(false)
+const editPasswordOnly = ref(false)
 const editEmail = ref('')
 const editPassword = ref('')
 const editSecret = ref('')
@@ -297,8 +402,19 @@ const editOrigPassword = ref('')
 const editOrigSecret = ref('')
 
 function openEdit(row) {
+  editPasswordOnly.value = false
   editEmail.value = row.email
   editPassword.value = row.password || ''
+  editSecret.value = row.totp_secret || ''
+  editOrigPassword.value = row.password || ''
+  editOrigSecret.value = row.totp_secret || ''
+  editVisible.value = true
+}
+
+function openPasswordEntry(row) {
+  editPasswordOnly.value = true
+  editEmail.value = row.email
+  editPassword.value = ''
   editSecret.value = row.totp_secret || ''
   editOrigPassword.value = row.password || ''
   editOrigSecret.value = row.totp_secret || ''
@@ -309,9 +425,13 @@ async function saveEdit() {
   const pw = editPassword.value
   const sec = editSecret.value.trim()
   const payload = { email: editEmail.value }
+  if (editPasswordOnly.value && !pw.trim()) {
+    ElMessage.warning('请输入已经在网页版创建的密码')
+    return
+  }
   // 只把真正改动过的字段传给后端 —— 没动的字段不传，后端就不会碰它
   if (pw !== editOrigPassword.value) payload.password = pw
-  if (sec !== editOrigSecret.value) payload.totp_secret = sec
+  if (!editPasswordOnly.value && sec !== editOrigSecret.value) payload.totp_secret = sec
   if (payload.password === undefined && payload.totp_secret === undefined) {
     ElMessage.info('没有改动')
     editVisible.value = false
@@ -342,7 +462,92 @@ async function saveEdit() {
   } finally { editSaving.value = false }
 }
 
+function chooseSub2ApiFile() { sub2apiInput.value?.click() }
+async function onSub2ApiFile(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file) return
+  importingSub2Api.value = true
+  try {
+    const text = await file.text()
+    const result = await importSub2Api(text, groupFilter.value === '__all__' ? '' : groupFilter.value)
+    ElMessage.success(`已导入 ${result.imported} 个 Sub2API 已注册账号`)
+    await load(true)
+  } catch (e) {
+    const detail = e.response?.data?.detail
+    ElMessage.error(typeof detail === 'string' ? detail : (detail?.message || e.message))
+  } finally { importingSub2Api.value = false }
+}
+
+async function pushSelectedToCpa() {
+  const emails = selected.value.map((row) => row.email).filter(Boolean)
+  if (!emails.length) return
+  try {
+    await ElMessageBox.confirm(
+      `将选中的 ${emails.length} 个账号转换为 CPA 格式并上传到已配置的 CPA 号池。\n` +
+      '上传前会优先使用 refresh_token 刷新 Codex access_token；没有 RT 的账号会失败。继续？',
+      '推送到 CPA 号池',
+      { type: 'warning', confirmButtonText: '开始推送', cancelButtonText: '取消', customClass: 'confirm-multiline' },
+    )
+  } catch { return }
+  pushingCpa.value = true
+  try {
+    const result = await pushRegisteredToCpa(emails, proxyText(form.value))
+    const failed = (result.results || []).filter((item) => !item.ok)
+    if (failed.length) {
+      const detail = failed.slice(0, 3).map((item) => `${item.email}: ${item.error || '失败'}`).join('；')
+      ElMessage.warning(`CPA 推送完成：成功 ${result.succeeded}，失败 ${result.failed}。${detail}`)
+    } else {
+      ElMessage.success(`CPA 推送成功：${result.succeeded} 个账号`)
+    }
+  } catch (e) {
+    ElMessage.error('CPA 推送失败: ' + (e.response?.data?.detail || e.message))
+  } finally { pushingCpa.value = false }
+}
+
+async function reloginSelected() {
+  const emails = selected.value.map((row) => row.email).filter(Boolean)
+  if (!emails.length) return
+  try {
+    await ElMessageBox.confirm(
+      `将选中的 ${emails.length} 个已注册账号投入重登录。\n` +
+      '每个账号只尝试一次，遇到网络或其他错误将直接结束该账号，不会重试。继续？',
+      '重登录选中账号',
+      { type: 'warning', confirmButtonText: '开始重登录', cancelButtonText: '取消', customClass: 'confirm-multiline' },
+    )
+  } catch { return }
+  relogging.value = true
+  try {
+    await autoStart({
+      login_only: true,
+      login_emails: emails,
+      personal_only: true,
+      group_name: '__all__',
+      concurrency: 1,
+      proxy: proxyText(form.value),
+      proxy_pool: proxyList.value.join('\n'),
+      otp_timeout: 180,
+      want_access_token: true,
+      want_session_token: true,
+      want_refresh_token: true,
+      want_password: false,
+      want_2fa: false,
+      allow_existing_login: true,
+      cool_down_seconds: 0,
+      account_retry_count: 1,
+      auto_export: true,
+      export_refresh_oauth: false,
+      target_count: 0,
+    })
+    ElMessage.success(`已开始重登录 ${emails.length} 个账号，可在自动任务页查看进度`)
+  } catch (e) {
+    ElMessage.error('启动重登录失败: ' + (e.response?.data?.detail || e.message))
+  } finally { relogging.value = false }
+}
+
 watch(page, () => load())
+watch(pageSize, () => { page.value = 1; selected.value = []; load() })
+watch([filter, groupFilter], () => { selected.value = [] })
 watch(dataVersion, () => load())
 onActivated(() => load())
 </script>
@@ -353,6 +558,9 @@ onActivated(() => load())
 
       <el-space wrap style="margin-bottom: 12px">
         <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
+        <el-button type="primary" plain @click="selectAllFiltered">全选当前筛选</el-button>
+        <input ref="sub2apiInput" type="file" accept=".json,application/json" hidden @change="onSub2ApiFile" />
+        <el-button :loading="importingSub2Api" @click="chooseSub2ApiFile">导入 Sub2API 账号</el-button>
         <el-select v-model="filter" style="width: 130px" @change="load(true)">
           <el-option label="全部" value="all" />
           <el-option label="有 RT" value="has_rt" />
@@ -362,6 +570,14 @@ onActivated(() => load())
           <el-option label="可领Plus" value="plus" />
           <el-option label="已封号" value="banned" />
           <el-option label="凭证失效" value="token_invalid" />
+        </el-select>
+        <el-select v-model="groupFilter" style="width: 170px" @change="load(true)">
+          <el-option label="全部分组" value="__all__" />
+          <el-option label="未分组" value="" />
+          <el-option
+            v-for="g in groups" :key="g.name"
+            :label="`${g.name} (${g.registered_total})`" :value="g.name"
+          />
         </el-select>
         <el-select
           v-model="form.proxy" filterable clearable allow-create default-first-option
@@ -392,6 +608,36 @@ onActivated(() => load())
           </template>
         </el-dropdown>
         <el-divider direction="vertical" />
+        <el-dropdown trigger="click" :disabled="!selected.length" @command="moveSelectedToGroup">
+          <el-button plain :disabled="!selected.length">
+            移动分组 ({{ selected.length }})<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="__ungrouped__">移动到未分组</el-dropdown-item>
+              <el-dropdown-item v-for="g in groups" :key="g.name" :command="g.name">
+                移动到 {{ g.name }}
+              </el-dropdown-item>
+              <el-dropdown-item divided command="__manage__">管理分组</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <el-button plain @click="groupManagerVisible = true">编辑分组</el-button>
+        <el-button plain type="warning" :disabled="!selected.length" @click="openWorkspaceAssign">
+          划分到母号空间 ({{ selected.length }})
+        </el-button>
+        <el-button
+          type="success" plain :loading="pushingCpa" :disabled="!selected.length"
+          @click="pushSelectedToCpa"
+        >
+          推送 CPA ({{ selected.length }})
+        </el-button>
+        <el-button
+          type="primary" plain :loading="relogging" :disabled="!selected.length"
+          @click="reloginSelected"
+        >
+          重登录 ({{ selected.length }})
+        </el-button>
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
           删除选中 ({{ selected.length }})
         </el-button>
@@ -405,8 +651,20 @@ onActivated(() => load())
         v-loading="loading" :data="rows" size="small" stripe
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="44" />
+        <el-table-column type="selection" width="44" :selectable="(row) => row.account_status !== 'permanently_invalid'" />
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
+        <el-table-column label="分组" width="130" show-overflow-tooltip>
+          <template #default="{ row }">
+            <el-tag v-if="row.group_name" size="small">{{ row.group_name }}</el-tag>
+            <span v-else class="hint">未分组</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="账号状态" width="130">
+          <template #default="{ row }">
+            <el-tag v-if="row.account_status === 'permanently_invalid'" type="danger">已永久失效</el-tag>
+            <span v-else class="hint">正常</span>
+          </template>
+        </el-table-column>
         <!-- 密码直接明文列出：随机 16 位，是登录账号的必需品，
              藏进「查看凭证」弹窗每次都要多点两下。列表接口本来就在返回它。
              图标放在文字**后面**：放前面会把值整体右推 27px（见 .cell-copy 注释）。 -->
@@ -469,10 +727,14 @@ onActivated(() => load())
         <el-table-column label="时间" width="160">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
-            <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
+            <el-button
+              v-if="!row.password" size="small" text type="primary"
+              @click="openPasswordEntry(row)"
+            >录入密码</el-button>
+            <el-button v-else size="small" text type="warning" @click="openEdit(row)">编辑凭证</el-button>
             <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
           </template>
         </el-table-column>
@@ -482,10 +744,18 @@ onActivated(() => load())
       </el-table>
       <div style="display: flex; justify-content: center; margin-top: 14px">
         <el-pagination
-          v-model:current-page="page" :page-size="PAGE_SIZE" :total="total"
-          layout="prev, pager, next, total" background
+          v-model:current-page="page" v-model:page-size="pageSize" :page-sizes="[20, 50, 100, 500, 1000]"
+          :total="total" layout="sizes, prev, pager, next, total" background
         />
       </div>
+
+      <el-dialog v-model="workspaceDialog" title="划分到母号空间" width="520px">
+        <div class="hint" style="margin-bottom: 12px">这里只建立系统内候选关系，不会调用邀请或申请加入接口；同一账号可以划分到多个母号空间。</div>
+        <el-select v-model="workspaceTarget" filterable placeholder="选择母号空间" style="width: 100%">
+          <el-option v-for="item in workspaceOptions" :key="item.id" :value="item.id" :label="`${item.account} · ${item.workspace_id || '无 Workspace ID'}`" />
+        </el-select>
+        <template #footer><el-button @click="workspaceDialog = false">取消</el-button><el-button type="primary" @click="assignSelectedWorkspace">确认划分</el-button></template>
+      </el-dialog>
 
       <el-dialog v-model="exportVisible" width="720px" top="8vh">
         <template #header>
@@ -537,20 +807,30 @@ onActivated(() => load())
       </el-dialog>
 
       <!-- 手动编辑凭证：把外部已知的密码/2FA 补进来，或修正记录错误 -->
-      <el-dialog v-model="editVisible" title="编辑凭证" width="560px" top="10vh">
+      <el-dialog
+        v-model="editVisible" :title="editPasswordOnly ? '录入账号密码' : '编辑凭证'"
+        width="560px" top="10vh"
+      >
         <el-alert
-          type="warning" :closable="false" show-icon style="margin-bottom: 16px"
-          title="仅修改本地记录，不会同步到 OpenAI"
-          description="这里改密码不等于改了账号密码。填入的值会被登录流程直接使用。"
+          :type="editPasswordOnly ? 'info' : 'warning'" :closable="false" show-icon
+          style="margin-bottom: 16px"
+          :title="editPasswordOnly ? '补录已经在网页版创建好的密码' : '仅修改本地记录，不会同步到 OpenAI'"
+          :description="editPasswordOnly
+            ? '保存后，仅登录会优先使用这个密码和 2FA；不会修改 OpenAI 网页版密码。'
+            : '这里改密码不等于改了账号密码。填入的值会被登录流程直接使用。'"
         />
         <el-form label-position="top">
           <el-form-item label="邮箱">
             <el-input :model-value="editEmail" class="mono" disabled />
           </el-form-item>
           <el-form-item label="密码">
-            <el-input v-model="editPassword" class="mono" placeholder="留空表示该号无密码" />
+            <el-input
+              v-model="editPassword" class="mono" type="password" show-password
+              :placeholder="editPasswordOnly ? '请输入网页版已经创建好的密码' : '留空表示该号无密码'"
+              @keyup.enter="saveEdit"
+            />
           </el-form-item>
-          <el-form-item label="2FA Secret">
+          <el-form-item v-if="!editPasswordOnly" label="2FA Secret">
             <el-input
               v-model="editSecret" class="mono"
               placeholder="base32，支持带空格/小写/otpauth:// 链接，会自动规范化"
@@ -562,8 +842,28 @@ onActivated(() => load())
         </el-form>
         <template #footer>
           <el-button @click="editVisible = false">取消</el-button>
-          <el-button type="primary" :loading="editSaving" @click="saveEdit">保存</el-button>
+          <el-button type="primary" :loading="editSaving" @click="saveEdit">
+            {{ editPasswordOnly ? '保存密码' : '保存' }}
+          </el-button>
         </template>
+      </el-dialog>
+
+      <el-dialog v-model="groupManagerVisible" title="编辑分组" width="min(660px, 92vw)" top="10vh">
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 12px">
+          <el-button type="primary" @click="addGroup">新增分组</el-button>
+        </div>
+        <el-table :data="groups" size="small" border>
+          <el-table-column prop="name" label="分组名称" min-width="190" />
+          <el-table-column prop="total" label="邮箱列表" width="100" />
+          <el-table-column prop="registered_total" label="注册结果" width="100" />
+          <el-table-column label="操作" width="160">
+            <template #default="{ row }">
+              <el-button size="small" text type="primary" @click="renameGroup(row)">改名</el-button>
+              <el-button size="small" text type="danger" @click="removeGroup(row)">删除</el-button>
+            </template>
+          </el-table-column>
+          <template #empty><el-empty description="还没有自定义分组" :image-size="54" /></template>
+        </el-table>
       </el-dialog>
     </el-card>
   </div>

@@ -6,6 +6,18 @@ NProgress.configure({ showSpinner: false, trickleSpeed: 120, minimum: 0.15 })
 // hash 路由：不依赖后端做 SPA 回退，FastAPI / 未来 Gin 都零配置可用。
 const routes = [
   {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/Login.vue'),
+    meta: { public: true, title: '管理员登录' },
+  },
+  {
+    path: '/public-relogin',
+    name: 'public-relogin',
+    component: () => import('@/views/PublicRelogin.vue'),
+    meta: { public: true, showInMenu: true, title: '公开重登', icon: 'Refresh', group: '工具' },
+  },
+  {
     path: '/',
     name: 'dashboard',
     component: () => import('@/views/Dashboard.vue'),
@@ -54,6 +66,18 @@ const routes = [
     meta: { title: '运行记录', icon: 'Document', group: '数据' },
   },
   {
+    path: '/workspaces',
+    name: 'workspaces',
+    component: () => import('@/views/Workspaces.vue'),
+    meta: { title: '空间管理', icon: 'OfficeBuilding', group: '空间' },
+  },
+  {
+    path: '/workspace-candidates',
+    name: 'workspace-candidates',
+    component: () => import('@/views/CandidateManagement.vue'),
+    meta: { title: '候选管理', icon: 'User', group: '空间' },
+  },
+  {
     path: '/settings/mail',
     name: 'mail',
     component: () => import('@/views/MailConfig.vue'),
@@ -70,6 +94,12 @@ const routes = [
     name: 'export',
     component: () => import('@/views/ExportConfig.vue'),
     meta: { title: '自动导出', icon: 'Share', group: '配置' },
+  },
+  {
+    path: '/settings/public-relogin',
+    name: 'public-relogin-config',
+    component: () => import('@/views/PublicReloginConfig.vue'),
+    meta: { title: '公开重登配置', icon: 'Refresh', group: '配置' },
   },
 ]
 

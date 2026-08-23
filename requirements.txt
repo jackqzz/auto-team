@@ -4,6 +4,9 @@
 curl-cffi>=0.7.0
 requests>=2.31.0
 
+# Camoufox 浏览器（含 GeoIP 数据）
+camoufox[geoip]>=0.2.0
+
 # WebUI（可选；只跑 register_outlook.py 命令行不需要）
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0

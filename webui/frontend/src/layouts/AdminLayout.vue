@@ -17,10 +17,11 @@ const { banner } = storeToRefs(runtime)
 const collapse = ref(false)
 const adDismissed = ref(false)
 
-const GROUP_ORDER = ['概览', '注册', '数据', '配置']
+const GROUP_ORDER = ['概览', '注册', '数据', '空间', '配置', '工具']
 const groups = computed(() => {
   const map = {}
   for (const r of router.getRoutes()) {
+    if (r.meta?.public && !r.meta?.showInMenu) continue
     if (!r.meta?.title) continue
     const g = r.meta.group || '其他'
     ;(map[g] ||= []).push(r)
@@ -33,7 +34,7 @@ const crumb = computed(() => [route.meta.group, route.meta.title].filter(Boolean
 
 const menuOptions = computed(() =>
   router.getRoutes()
-    .filter((r) => r.meta?.title)
+    .filter((r) => r.meta?.title && (!r.meta?.public || r.meta?.showInMenu))
     .map((r) => ({ value: r.path, label: `${r.meta.group} / ${r.meta.title}` })),
 )
 const search = ref('')
@@ -120,17 +121,6 @@ onMounted(() => {
       </el-header>
 
       <el-main class="content">
-        <div v-if="!adDismissed" class="ad-banner">
-          <div class="ad-content">
-            <el-icon :size="16" style="color: #e6a23c; flex-shrink: 0"><Bell /></el-icon>
-            <span>交流QQ群：<b>259844673</b></span>
-            <span class="ad-sep">|</span>
-            <span>推荐服务器：<a href="http://www.ransuyun.com" target="_blank" rel="noopener">燃速云</a></span>
-          </div>
-          <el-button text size="small" class="ad-close" @click="adDismissed = true">
-            <el-icon :size="14"><Close /></el-icon>
-          </el-button>
-        </div>
         <el-alert
           v-if="banner" :title="banner" type="error" show-icon
           class="circuit-banner" @close="runtime.dismissBanner"
@@ -233,4 +223,3 @@ onMounted(() => {
   .pills, .search-box, .avatar-name { display: none; }
 }
 </style>
-

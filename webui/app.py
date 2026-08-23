@@ -9,11 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
+import os
+import re
+import queue
+import secrets
 import sys
 import time
 import uuid
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -26,7 +34,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from . import db, export_formats, registrar  # noqa: E402
-from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from . import workspace_membership  # noqa: E402
+from . import public_relogin  # noqa: E402
+from .auto_loop import (  # noqa: E402
+    CONTROLLER as AUTO_LOOP,
+    LOGIN_CONTROLLER,
+    all_login_controllers,
+    login_controller_for,
+)
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
 from mail_providers import (  # noqa: E402
     ImportValidationError,
@@ -52,9 +67,118 @@ logging.basicConfig(
 )
 logger = logging.getLogger("webui")
 
+_TASK_LOG_LOCK = threading.Lock()
+_TASK_LOG_SEQ = 0
+_TASK_LOGS: deque[dict] = deque(maxlen=3000)
+_TASK_LOGGER_NAMES = {"webui", "workspace_membership", "auto_loop", "registrar"}
+_WORKSPACE_DB_ID_RE = re.compile(r"\bworkspace_db_id=(\d+)\b")
+_WORKSPACE_ID_RE = re.compile(r"\bworkspace_id=([0-9a-fA-F-]{8,})\b")
+_WORKSPACE_ALIAS_RE = re.compile(r"\bworkspace=(\d+)\b")
+
+
+def _push_task_log(record: logging.LogRecord) -> None:
+    global _TASK_LOG_SEQ
+    if record.name not in _TASK_LOGGER_NAMES:
+        return
+    try:
+        text = record.getMessage()
+    except Exception:
+        text = str(record.msg)
+    if not any(token in text for token in ("workspace_db_id=", "workspace_id=", "workspace=", "候选", "席位", "额度查询", "垃圾箱", "申请加入", "邀请", "校验")):
+        return
+    entry = {
+        "id": 0,
+        "ts": time.time(),
+        "logger": record.name,
+        "level": record.levelname,
+        "text": text,
+        "workspace_db_id": None,
+        "workspace_external_id": None,
+    }
+    m = _WORKSPACE_DB_ID_RE.search(text) or _WORKSPACE_ALIAS_RE.search(text)
+    if m:
+        try:
+            entry["workspace_db_id"] = int(m.group(1))
+        except Exception:
+            pass
+    m = _WORKSPACE_ID_RE.search(text)
+    if m:
+        entry["workspace_external_id"] = m.group(1)
+    with _TASK_LOG_LOCK:
+        _TASK_LOG_SEQ += 1
+        entry["id"] = _TASK_LOG_SEQ
+        _TASK_LOGS.append(entry)
+
+
+class _TaskLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _push_task_log(record)
+        except Exception:
+            pass
+
+
+_task_log_handler = _TaskLogHandler()
+for _logger_name in _TASK_LOGGER_NAMES:
+    logging.getLogger(_logger_name).addHandler(_task_log_handler)
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+
+_INVITE_STATUS_RECHECK_DELAY_SECONDS = 5
+_ADMIN_SESSIONS: dict[str, float] = {}
+_ADMIN_SESSION_TTL_SECONDS = 24 * 3600
+
+
+def _admin_password_hash() -> str:
+    env_password = str(os.getenv("WEBUI_ADMIN_PASSWORD", "") or "").strip()
+    if env_password:
+        return hashlib.sha256(env_password.encode("utf-8")).hexdigest()
+    return str(db.get_admin_auth_config().get("admin_password_hash") or "").strip()
+
+
+def _admin_auth_enabled() -> bool:
+    return bool(_admin_password_hash())
+
+
+def _issue_admin_token() -> str:
+    token = secrets.token_urlsafe(32)
+    _ADMIN_SESSIONS[token] = time.time() + _ADMIN_SESSION_TTL_SECONDS
+    return token
+
+
+def _cleanup_admin_sessions() -> None:
+    now = time.time()
+    expired = [token for token, expires_at in _ADMIN_SESSIONS.items() if expires_at <= now]
+    for token in expired:
+        _ADMIN_SESSIONS.pop(token, None)
+
+
+def _current_admin_token(request: Request) -> str:
+    auth = str(request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    header_token = str(request.headers.get("x-admin-token") or "").strip()
+    if header_token:
+        return header_token
+    return str(request.cookies.get("gpt_auto_register_admin_token") or "").strip()
+
+
+def _is_public_api_path(path: str) -> bool:
+    return path.startswith("/api/auth") or path.startswith("/api/public-relogin")
+
+
+@app.middleware("http")
+async def _admin_auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and not _is_public_api_path(path) and _admin_auth_enabled():
+        _cleanup_admin_sessions()
+        token = _current_admin_token(request)
+        if not token or _ADMIN_SESSIONS.get(token, 0) <= time.time():
+            return JSONResponse({"detail": "需要管理员登录"}, status_code=401)
+        _ADMIN_SESSIONS[token] = time.time() + _ADMIN_SESSION_TTL_SECONDS
+    return await call_next(request)
 
 
 # ──────────────────────── Pydantic 模型 ────────────────────────
@@ -67,15 +191,906 @@ class ImportReq(BaseModel):
         description="邮箱来源（outlook / ...）。留空则按段数猜，"
                     "但 Outlook 和 Gmail 都是 4 段，猜不出来，建议前端必填",
     )
+    group_name: Optional[str] = Field(
+        None,
+        description="导入到指定分组；空字符串=未分组，未提供=保留已有账号原分组",
+        max_length=64,
+    )
+
+
+class Sub2APIImportReq(BaseModel):
+    text: str = Field(..., description="Sub2API JSON 文件内容")
+    group_name: str = Field("", description="导入账号分组")
+
+
+class WorkspaceSessionImportReq(BaseModel):
+    text: str = Field(..., description="母号 Session；支持 account----session、纯 session 或 JSON")
+    proxy: str = Field("", description="本批母号的专属代理；每行/JSON 内代理可覆盖")
+
+
+class WorkspaceProxyReq(BaseModel):
+    proxy: str = Field(..., description="母号专属代理")
+
+
+class WorkspaceBulkDeleteReq(BaseModel):
+    ids: list[int] = Field(..., min_length=1, description="要删除的母号记录 ID")
+
+
+class WorkspaceCandidatesReq(BaseModel):
+    workspace_id: int
+    emails: list[str] = Field(default_factory=list)
+    proxy: str = ""
+    proxy_pool: str = ""
+    seat_type: str = "default"
+    tag_status: str = ""
+    auto_push: bool = False
+    relogin_on_401: bool = False
+    concurrency: int = Field(1, ge=1, le=20)
+    otp_timeout: int = Field(180, ge=10, le=600)
+    account_retry_count: int = Field(1, ge=1, le=5)
+    cool_down_seconds: int = Field(0, ge=0, le=3600)
+    trash_enabled: bool = True
+    trash_invalid_enabled: bool = True
+    trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
+
+
+class WorkspaceCandidateInviteStatusReq(BaseModel):
+    workspace_id: int
+    emails: list[str] = Field(default_factory=list)
+    join_status: str = Field(..., description="not_invited / pending_invite / joined")
+
+
+class WorkspaceQuotaScheduleReq(BaseModel):
+    workspace_id: int
+    interval_minutes: int = Field(30, ge=5, le=1440)
+    relogin_on_401: bool = False
+    proxy_pool: str = ""
+    auto_push: bool = False
+    concurrency: int = Field(1, ge=1, le=20)
+    otp_timeout: int = Field(180, ge=10, le=600)
+    account_retry_count: int = Field(1, ge=1, le=5)
+    cool_down_seconds: int = Field(0, ge=0, le=3600)
+    trash_enabled: bool = True
+    trash_invalid_enabled: bool = True
+    trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
+    seat_protect_enabled: bool = False
+    seat_protect_threshold: int = Field(8, ge=1, le=1000)
+    seat_protect_refresh_time: str = Field("00:00", description="席位保护阈值刷新时间（HH:MM，CST）")
+    auto_standard_seat_enabled: bool = False
+
+
+class WorkspaceAutoSeatReq(BaseModel):
+    workspace_id: int
+
+
+class AdminLoginReq(BaseModel):
+    password: str = Field(..., min_length=1)
+
+
+class PublicReloginSettingsReq(BaseModel):
+    public_relogin_enabled: bool = False
+    workspace_whitelist: str = ""
+    proxy_pool: str = ""
+    concurrency: int = Field(3, ge=1, le=20)
+    retry_count: int = Field(2, ge=0, le=5)
+    quota_timeout: int = Field(30, ge=5, le=120)
+    login_timeout: int = Field(180, ge=30, le=900)
+    admin_password: str = Field("", description="留空不修改；传入新值则启用/更新管理端鉴权")
+    clear_admin_password: bool = Field(False, description="清空管理员密码并关闭管理端鉴权")
+
+
+class PublicReloginCheckReq(BaseModel):
+    accounts: list[dict] = Field(default_factory=list)
+    proxy_pool: str = ""
+    concurrency: int = Field(0, ge=0, le=20)
+
+
+class PublicReloginReq(BaseModel):
+    accounts: list[dict] = Field(default_factory=list)
+    proxy_pool: str = ""
+    concurrency: int = Field(0, ge=0, le=20)
+
+
+_quota_schedulers = {}
+_seat_auto_schedulers_lock = threading.Lock()
+_seat_auto_schedulers: dict[int, tuple[threading.Event, threading.Thread, float]] = {}
+
+
+@app.get("/api/auth/status")
+def api_auth_status(request: Request):
+    token = _current_admin_token(request)
+    authenticated = (not _admin_auth_enabled()) or (_ADMIN_SESSIONS.get(token, 0) > time.time())
+    return {"ok": True, "enabled": _admin_auth_enabled(), "authenticated": authenticated}
+
+
+@app.post("/api/auth/login")
+def api_auth_login(req: AdminLoginReq):
+    expected = _admin_password_hash()
+    if not expected:
+        return {"ok": True, "token": _issue_admin_token(), "auth_disabled": True}
+    actual = hashlib.sha256(str(req.password or "").encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(actual, expected):
+        raise HTTPException(401, "管理员密码错误")
+    return {"ok": True, "token": _issue_admin_token()}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request):
+    token = _current_admin_token(request)
+    if token:
+        _ADMIN_SESSIONS.pop(token, None)
+    return {"ok": True}
+
+
+def _public_relogin_proxy_pool(req_pool: str, configured_pool: str) -> list[str]:
+    values = [
+        line.strip()
+        for line in str(req_pool or configured_pool or "").replace(",", "\n").splitlines()
+        if line.strip()
+    ]
+    return values
+
+
+def _public_relogin_account_key(account: dict, index: int) -> str:
+    if str(account.get("id") or "").strip():
+        return str(account.get("id")).strip()
+    try:
+        normalized = public_relogin.normalized_account(account)
+        return normalized.get("email") or f"row-{index + 1}"
+    except Exception:
+        return f"row-{index + 1}"
+
+
+def _public_relogin_validate(account: dict, cfg: dict) -> tuple[dict | None, dict | None]:
+    try:
+        normalized = public_relogin.normalized_account(account)
+    except Exception as exc:
+        return None, {"ok": False, "status": "invalid", "error": f"账号格式无效: {exc}"}
+    workspace_id = normalized.get("chatgpt_account_id") or ""
+    if not public_relogin.workspace_allowed(workspace_id, cfg.get("workspace_whitelist") or ""):
+        return normalized, {
+            "ok": False,
+            "status": "workspace_not_allowed",
+            "email": normalized.get("email", ""),
+            "workspace_id": workspace_id,
+            "error": "该 workspace_id 不在公开重登白名单内",
+        }
+    return normalized, None
+
+
+@app.get("/api/settings/public-relogin")
+def api_get_public_relogin_settings():
+    cfg = db.get_public_relogin_config()
+    auth_cfg = db.get_admin_auth_config()
+    return {
+        "ok": True,
+        "config": {
+            **cfg,
+            "auth_enabled": bool(auth_cfg.get("admin_password_hash") or os.getenv("WEBUI_ADMIN_PASSWORD")),
+            "admin_password": "",
+        },
+    }
+
+
+@app.post("/api/settings/public-relogin")
+def api_save_public_relogin_settings(req: PublicReloginSettingsReq):
+    payload = req.model_dump()
+    db.save_public_relogin_config(payload)
+    if req.clear_admin_password:
+        db.save_admin_auth_config({"admin_password": ""})
+        _ADMIN_SESSIONS.clear()
+    elif req.admin_password.strip():
+        db.save_admin_auth_config({"admin_password": req.admin_password.strip()})
+        _ADMIN_SESSIONS.clear()
+    cfg = db.get_public_relogin_config()
+    return {
+        "ok": True,
+        "config": {
+            **cfg,
+            "auth_enabled": _admin_auth_enabled(),
+            "admin_password": "",
+        },
+    }
+
+
+@app.post("/api/public-relogin/check")
+def api_public_relogin_check(req: PublicReloginCheckReq):
+    cfg = public_relogin.get_effective_config()
+    if not cfg["enabled"]:
+        raise HTTPException(403, "公开 401 重登录页面未启用")
+    accounts = req.accounts or []
+    if not accounts:
+        raise HTTPException(400, "请先导入账号")
+    if len(accounts) > 500:
+        raise HTTPException(400, "单次最多检查 500 个账号")
+    proxies = _public_relogin_proxy_pool(req.proxy_pool, cfg["proxy_pool"])
+    max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
+    results: dict[str, dict] = {}
+
+    def check_one(index: int, account: dict) -> tuple[str, dict]:
+        key = _public_relogin_account_key(account, index)
+        normalized, error = _public_relogin_validate(account, cfg)
+        if error:
+            return key, error
+        proxy = str(account.get("proxy") or "").strip()
+        if not proxy and proxies:
+            proxy = proxies[index % len(proxies)]
+        try:
+            quota = public_relogin.fetch_quota(normalized or account, proxy=proxy, timeout=cfg["quota_timeout"])
+            return key, {"ok": True, "status": "active", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "quota": quota}
+        except public_relogin.PublicQuotaUnauthorized as exc:
+            return key, {"ok": False, "status": "401", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
+        except public_relogin.PublicAccountDeactivated as exc:
+            return key, {"ok": False, "status": "deactivated", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
+        except Exception as exc:
+            return key, {"ok": False, "status": "error", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)[:500]}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(check_one, idx, account) for idx, account in enumerate(accounts)]
+        for future in as_completed(futures):
+            key, value = future.result()
+            results[key] = value
+    return {"ok": True, "results": results}
+
+
+@app.post("/api/public-relogin/relogin")
+def api_public_relogin_relogin(req: PublicReloginReq):
+    cfg = public_relogin.get_effective_config()
+    if not cfg["enabled"]:
+        raise HTTPException(403, "公开 401 重登录页面未启用")
+    accounts = req.accounts or []
+    if not accounts:
+        raise HTTPException(400, "请选择要重新登录的账号")
+    if len(accounts) > 200:
+        raise HTTPException(400, "单次最多重登 200 个账号")
+    proxies = _public_relogin_proxy_pool(req.proxy_pool, cfg["proxy_pool"])
+    max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
+    results: dict[str, dict] = {}
+
+    def relogin_one(index: int, account: dict) -> tuple[str, dict]:
+        key = _public_relogin_account_key(account, index)
+        normalized, error = _public_relogin_validate(account, cfg)
+        if error:
+            return key, error
+        proxy = str(account.get("proxy") or "").strip()
+        if not proxy and proxies:
+            proxy = proxies[index % len(proxies)]
+        last_error = ""
+        for attempt in range(1, cfg["retry_count"] + 2):
+            try:
+                refreshed = public_relogin.relogin_account(
+                    normalized or account,
+                    proxy=proxy,
+                    login_timeout=cfg["login_timeout"],
+                )
+                return key, {
+                    "ok": True,
+                    "status": "revived",
+                    "attempt": attempt,
+                    "email": refreshed.get("email", ""),
+                    "workspace_id": refreshed.get("chatgpt_account_id", ""),
+                    "account": refreshed,
+                }
+            except Exception as exc:
+                last_error = str(exc)
+                if public_relogin._looks_deactivated(last_error):
+                    return key, {
+                        "ok": False,
+                        "status": "deactivated",
+                        "attempt": attempt,
+                        "email": normalized.get("email", ""),
+                        "workspace_id": normalized.get("chatgpt_account_id", ""),
+                        "error": last_error[:500],
+                    }
+                if attempt <= cfg["retry_count"]:
+                    time.sleep(2)
+        return key, {
+            "ok": False,
+            "status": "failed",
+            "attempt": cfg["retry_count"] + 1,
+            "email": normalized.get("email", ""),
+            "workspace_id": normalized.get("chatgpt_account_id", ""),
+            "error": last_error[:500],
+        }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(relogin_one, idx, account) for idx, account in enumerate(accounts)]
+        for future in as_completed(futures):
+            key, value = future.result()
+            results[key] = value
+    return {"ok": True, "results": results}
+
+def _is_codex_seat(value: object) -> bool:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return normalized in {"usage_based", "usagebased", "codex", "codex席位"}
+
+def _workspace_settings_snapshot(workspace_id: int, overrides: dict | None = None) -> dict:
+    cfg = dict(db.get_workspace_settings(workspace_id))
+    if overrides:
+        cfg.update({k: v for k, v in overrides.items() if k != "workspace_id"})
+    return cfg
+
+def _is_zero_quota_payload(payload: dict) -> bool:
+    if not isinstance(payload, dict) or payload.get("error_code"):
+        return False
+    credits = payload.get("credits_balance")
+    try:
+        if credits is not None and float(credits) <= 0:
+            return True
+    except Exception:
+        pass
+    for key in ("primary", "secondary"):
+        window = payload.get(key) or {}
+        used = window.get("used_percent")
+        try:
+            if used is not None and float(used) >= 100:
+                return True
+        except Exception:
+            pass
+    return False
+
+def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, auto_export: bool = False) -> dict:
+    master = db.get_workspace_master(workspace_id)
+    if not master or not master.get("workspace_id"):
+        raise HTTPException(400, "母号缺少 Workspace ID")
+    proxy_pool = str(settings.get("proxy_pool") or "").strip()
+    if not proxy_pool:
+        raise HTTPException(400, "全局代理池为空")
+    return {
+        "login_only": True,
+        "login_emails": [str(email).strip().lower()],
+        "group_name": "__all__",
+        "workspace_id": master.get("workspace_id", ""),
+        "workspace_db_id": workspace_id,
+        "proxy_pool": proxy_pool,
+        "proxy": "",
+        "concurrency": int(settings.get("concurrency", 1) or 1),
+        "otp_timeout": int(settings.get("otp_timeout", 180) or 180),
+        "want_access_token": True,
+        "want_session_token": True,
+        "want_refresh_token": True,
+        "want_password": False,
+        "want_2fa": False,
+        "allow_existing_login": True,
+        "cool_down_seconds": int(settings.get("cool_down_seconds", 0) or 0),
+        "account_retry_count": int(settings.get("account_retry_count", 1) or 1),
+        "auto_export": bool(auto_export or settings.get("auto_push")),
+        "export_refresh_oauth": False,
+        "target_count": 0,
+    }
+
+def _wait_for_login_completion(workspace_id: int, email: str, timeout: int = 1800) -> bool:
+    controller = login_controller_for(workspace_db_id=workspace_id, workspace_id=(db.get_workspace_master(workspace_id) or {}).get("workspace_id", ""))
+    deadline = time.time() + max(30, int(timeout))
+    key = str(email or "").strip().lower()
+    while time.time() < deadline:
+        try:
+            with controller._lock:  # noqa: SLF001 - 仅限内部等待逻辑
+                pending = any((row.get("email") or "").strip().lower() == key for row in controller._login_queue)
+                running = any((info.get("email") or "").strip().lower() == key for info in controller._worker_status.values())
+        except Exception:
+            pending = running = False
+        if not pending and not running:
+            return True
+        time.sleep(1)
+    return False
+
+def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relogin_on_401: bool, proxy_pool: str, auto_push: bool, concurrency: int, otp_timeout: int, account_retry_count: int, cool_down_seconds: int):
+    while not stop.is_set():
+        settings = _workspace_settings_snapshot(workspace_id)
+        trash_delay = _candidate_trash_delay_seconds(workspace_id, settings)
+        candidates = [
+            row for row in db.list_workspace_candidate_options(workspace_id)
+            if (
+                row.get("has_workspace_access_token")
+                and row.get("account_status") != "permanently_invalid"
+                and not _is_codex_seat(row.get("seat_type"))
+            )
+        ]
+        configured_concurrency = settings.get("concurrency", concurrency)
+        worker_count = min(
+            max(1, int(configured_concurrency or 1)),
+            20,
+            max(1, len(candidates)),
+        )
+        cursor = 0
+        cursor_lock = threading.Lock()
+        quota_logger = logging.getLogger("workspace_membership")
+        quota_logger.info(
+            "定时额度查询批次开始 workspace=%s count=%s concurrency=%s",
+            workspace_id,
+            len(candidates),
+            worker_count,
+        )
+
+        def process_row(row: dict) -> None:
+            email = row.get("email") or ""
+            try:
+                quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+            except workspace_membership.QuotaUnauthorized:
+                quota_logger.warning(
+                    "定时额度查询 401 workspace=%s email=%s",
+                    workspace_id,
+                    email,
+                    exc_info=True,
+                )
+                if relogin_on_401 and proxy_pool:
+                    try:
+                        if _wait_and_relogin_for_candidate(
+                            workspace_id,
+                            email,
+                            settings,
+                            auto_export=auto_push,
+                        ):
+                            quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+                        else:
+                            return
+                    except Exception:
+                        quota_logger.warning(
+                            "定时额度 401 重登录后复查失败 workspace=%s email=%s",
+                            workspace_id,
+                            email,
+                            exc_info=True,
+                        )
+                        return
+                else:
+                    return
+            except Exception:
+                quota_logger.warning(
+                    "定时额度查询失败 workspace=%s email=%s",
+                    workspace_id,
+                    email,
+                    exc_info=True,
+                )
+                return
+            if _is_zero_quota_payload(quota) and _candidate_trash_enabled(workspace_id, settings):
+                _schedule_candidate_trash(
+                    workspace_id,
+                    email,
+                    reason="quota_zero",
+                    delay_seconds=trash_delay,
+                )
+
+        def rolling_worker() -> None:
+            nonlocal cursor
+            while not stop.is_set():
+                with cursor_lock:
+                    if cursor >= len(candidates):
+                        return
+                    row = candidates[cursor]
+                    cursor += 1
+                process_row(row)
+
+        if candidates:
+            # 只创建固定数量的 worker；每个 worker 完成当前账号后才领取下一个。
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(rolling_worker) for _ in range(worker_count)]
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception:
+                        quota_logger.exception("定时额度查询 worker 异常 workspace=%s", workspace_id)
+        stop.wait(interval * 60)
+
+
+def _refresh_workspace_seat_info(workspace_id: int, retries: int = 3, delay_seconds: int = 5) -> dict | None:
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            return workspace_membership.sync_seat_info(workspace_id)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning(
+                "席位信息刷新失败 workspace_db_id=%s attempt=%s/%s",
+                workspace_id,
+                attempt + 1,
+                retries,
+                exc_info=True,
+            )
+            if attempt >= retries - 1:
+                break
+            time.sleep(max(1, int(delay_seconds)))
+    logger.error("席位信息刷新放弃 workspace_db_id=%s last_error=%s", workspace_id, last_error)
+    return None
+
+
+def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 200) -> int:
+    """补齐当前空间里席位信息未知的候选人。
+
+    这里的“未知”指本地没有有效 seat_type / seat_label / member_id 记录，
+    但候选人已经处于 joined 且未入箱状态。刷新后会回写到候选表，供后续
+    自动补标准席位、额度查询和导出直接复用。
+    """
+    try:
+        rows = db.list_workspace_candidate_options(
+            workspace_id,
+            account_status="active",
+            join_status="joined",
+            trash_status="active",
+        )
+    except Exception:
+        logger.exception("未知席位候选列表加载失败 workspace_db_id=%s", workspace_id)
+        return 0
+
+    pending: list[dict] = []
+    for row in rows:
+        seat = workspace_membership._canonical_candidate_seat_type(
+            row.get("seat_type") or row.get("seat_label") or "",
+        )
+        gpt_seat = str(row.get("gpt_seat") or "").strip()
+        codex_seat = str(row.get("codex_seat") or "").strip()
+        member_id = str(row.get("member_id") or "").strip()
+        if seat in {"default", "usage_based"} and (gpt_seat or codex_seat) and member_id:
+            continue
+        pending.append(row)
+        if len(pending) >= max(1, int(limit)):
+            break
+
+    if not pending:
+        return 0
+
+    refreshed = 0
+    for start in range(0, len(pending), 20):
+        batch = pending[start : start + 20]
+        emails = [str(row.get("email") or "").strip().lower() for row in batch if str(row.get("email") or "").strip()]
+        if not emails:
+            continue
+        try:
+            snapshot = workspace_membership.fetch_candidate_seats(workspace_id, emails)
+        except Exception:
+            logger.exception("未知席位候选刷新失败 workspace_db_id=%s emails=%s", workspace_id, emails[:10])
+            continue
+        for email in emails:
+            info = snapshot.get(email) or {}
+            if not info:
+                continue
+            db.update_workspace_candidate_seats(
+                workspace_id,
+                email,
+                info.get("codex_seat", ""),
+                info.get("gpt_seat", ""),
+            )
+            db.update_workspace_candidate_member(
+                workspace_id,
+                email,
+                info.get("member_id", ""),
+                info.get("raw_seat_type", ""),
+            )
+            refreshed += 1
+
+    if refreshed:
+        logger.info(
+            "未知席位候选信息已刷新 workspace_db_id=%s refreshed=%s",
+            workspace_id,
+            refreshed,
+        )
+    return refreshed
+
+
+def _workspace_auto_standard_candidates(workspace_id: int, seen: set[str] | None = None) -> list[dict]:
+    seen = seen or set()
+    rows = db.list_workspace_candidate_options(
+        workspace_id,
+        account_status="active",
+        join_status="joined",
+        seat_type="usage_based",
+        trash_status="active",
+    )
+    out = []
+    for row in rows:
+        email = str(row.get("email") or "").strip().lower()
+        if not email or email in seen:
+            continue
+        if str(row.get("workspace_join_status") or "") != "joined":
+            continue
+        if str(row.get("account_status") or "") == "permanently_invalid":
+            continue
+        if str(row.get("trash_status") or "active") == "trashed":
+            continue
+        if not _is_codex_seat(row.get("seat_label") or row.get("seat_type")):
+            continue
+        out.append(row)
+    return out
+
+
+def _switch_candidate_to_default_and_verify(workspace_id: int, candidate: dict, settings: dict) -> dict:
+    email = str(candidate.get("email") or "").strip().lower()
+    if not email:
+        return {"ok": False, "error": "email 不能为空"}
+    row = db.get_workspace_candidate(workspace_id, email) or dict(candidate)
+    if str(row.get("workspace_join_status") or "") != "joined":
+        return {"ok": False, "error": "候选人尚未加入当前空间"}
+
+    current_seat = workspace_membership.resolve_candidate_seat_type(
+        workspace_id,
+        email,
+    )
+    if current_seat == "default":
+        return {"ok": True, "skipped": True, "reason": "already_target_seat"}
+
+    fresh = workspace_membership.fetch_candidate_seats(workspace_id, [email]).get(email, {})
+    if not current_seat:
+        current_seat = workspace_membership._canonical_candidate_seat_type(
+            fresh.get("raw_seat_type") or fresh.get("seat_type") or fresh.get("seat_label")
+        )
+    if current_seat and current_seat not in {"default", "usage_based"}:
+        return {"ok": False, "error": f"当前席位不是可切换目标：{current_seat}"}
+    member_id = str(fresh.get("member_id") or row.get("member_id") or "").strip()
+    if not member_id:
+        return {"ok": False, "error": "未获取到成员 member_id，请先校验候选状态"}
+
+    reserved = False
+    if settings.get("seat_protect_enabled"):
+        reservation = db.reserve_workspace_seat_protect_quota(workspace_id, 1)
+        if not reservation.get("allowed", False):
+            return {
+                "ok": False,
+                "error": (
+                    "席位保护已生效：本周期标准席位切换已达 "
+                    f"{int(reservation.get('threshold') or settings.get('seat_protect_threshold') or 8)} 个，"
+                    f"下次刷新时间 {reservation.get('refresh_time') or settings.get('seat_protect_refresh_time') or '00:00'}"
+                ),
+                "blocked_by_protect": True,
+            }
+        reserved = bool(reservation.get("enabled"))
+
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            workspace_membership.update_member_seat_type(workspace_id, member_id, "default")
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning(
+                "自动标准席位切换请求失败 workspace_db_id=%s email=%s attempt=%s/3",
+                workspace_id,
+                email,
+                attempt + 1,
+                exc_info=True,
+            )
+        try:
+            refreshed = workspace_membership.fetch_candidate_seats(workspace_id, [email]).get(email, {})
+        except Exception as exc:  # noqa: BLE001
+            refreshed = {}
+            last_error = exc
+            logger.warning(
+                "自动标准席位复查失败 workspace_db_id=%s email=%s attempt=%s/3",
+                workspace_id,
+                email,
+                attempt + 1,
+                exc_info=True,
+            )
+        seat = workspace_membership._canonical_candidate_seat_type(
+            refreshed.get("raw_seat_type") or refreshed.get("seat_type") or refreshed.get("seat_label")
+        )
+        if seat == "default":
+            db.update_workspace_candidate_seats(
+                workspace_id,
+                email,
+                refreshed.get("codex_seat", ""),
+                refreshed.get("gpt_seat", ""),
+            )
+            db.update_workspace_candidate_member(
+                workspace_id,
+                email,
+                refreshed.get("member_id", member_id),
+                "default",
+            )
+            return {"ok": True, "email": email, "member_id": member_id, "seat": refreshed, "reserved": reserved}
+        if attempt < 2:
+            time.sleep(5)
+
+    if reserved:
+        try:
+            db.release_workspace_seat_protect_quota(workspace_id, 1)
+        except Exception:
+            logger.exception("自动标准席位保护配额回滚失败 workspace_db_id=%s email=%s", workspace_id, email)
+    return {"ok": False, "email": email, "member_id": member_id, "error": f"席位切换失败: {last_error or '复查未通过'}"}
+
+
+def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], settings: dict) -> dict:
+    emails = [str(e).strip().lower() for e in emails if str(e).strip()]
+    if not emails:
+        return {"ok": True, "eligible": 0, "skipped": 0, "skipped_emails": []}
+    master = db.get_workspace_master(workspace_id)
+    if not master or not master.get("workspace_id"):
+        raise RuntimeError("母号缺少 Workspace ID")
+    proxy_pool = str(settings.get("proxy_pool") or "").strip()
+    if not proxy_pool:
+        raise RuntimeError("全局代理池为空")
+    result = login_controller_for(
+        workspace_db_id=workspace_id,
+        workspace_id=master["workspace_id"],
+    ).start({
+        "login_only": True,
+        "login_emails": emails,
+        "group_name": "__all__",
+        "workspace_id": master["workspace_id"],
+        "workspace_db_id": workspace_id,
+        "proxy_pool": proxy_pool,
+        "proxy": "",
+        "concurrency": int(settings.get("concurrency", 1) or 1),
+        "otp_timeout": int(settings.get("otp_timeout", 180) or 180),
+        "want_access_token": True,
+        "want_session_token": True,
+        "want_refresh_token": True,
+        "want_password": False,
+        "want_2fa": False,
+        "allow_existing_login": True,
+        "cool_down_seconds": int(settings.get("cool_down_seconds", 0) or 0),
+        "account_retry_count": int(settings.get("account_retry_count", 1) or 1),
+        "auto_export": bool(settings.get("auto_push")),
+        "export_refresh_oauth": False,
+        "target_count": 0,
+    })
+    if not result.get("ok") and "已经在跑了" not in str(result.get("error") or ""):
+        raise RuntimeError(result.get("error") or "空间凭证任务启动失败")
+    return result
+
+
+def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
+    logger.info("自动标准席位任务启动 workspace_db_id=%s", workspace_id)
+    try:
+        while not stop.is_set():
+            settings = _workspace_settings_snapshot(workspace_id)
+            if not settings.get("auto_standard_seat_enabled"):
+                logger.info("自动标准席位任务已关闭 workspace_db_id=%s", workspace_id)
+                return
+            seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
+            if not seat_info:
+                stop.wait(5 * 60)
+                continue
+            try:
+                db.update_workspace_seat_info(workspace_id, **seat_info)
+            except Exception:
+                logger.exception("自动标准席位刷新写回母号失败 workspace_db_id=%s", workspace_id)
+            _refresh_workspace_unknown_candidate_seats(workspace_id)
+            entitled = int(seat_info.get("seats_entitled") or 0)
+            current_default = int(seat_info.get("seats_default") or 0)
+            if entitled <= 0 or current_default >= entitled:
+                stop.wait(5 * 60)
+                continue
+
+            switched: list[str] = []
+            attempted: set[str] = set()
+            while not stop.is_set():
+                settings = _workspace_settings_snapshot(workspace_id)
+                seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
+                if not seat_info:
+                    break
+                try:
+                    db.update_workspace_seat_info(workspace_id, **seat_info)
+                except Exception:
+                    logger.exception("自动标准席位刷新写回母号失败 workspace_db_id=%s", workspace_id)
+                _refresh_workspace_unknown_candidate_seats(workspace_id)
+                entitled = int(seat_info.get("seats_entitled") or 0)
+                current_default = int(seat_info.get("seats_default") or 0)
+                deficit = max(0, entitled - current_default)
+                if deficit <= 0:
+                    break
+                candidates = _workspace_auto_standard_candidates(workspace_id, attempted)
+                if not candidates:
+                    logger.info(
+                        "自动标准席位任务候选不足 workspace_db_id=%s deficit=%s",
+                        workspace_id,
+                        deficit,
+                    )
+                    break
+                candidate = candidates[0]
+                email = str(candidate.get("email") or "").strip().lower()
+                attempted.add(email)
+                result = _switch_candidate_to_default_and_verify(workspace_id, candidate, settings)
+                if result.get("ok") and not result.get("skipped"):
+                    switched.append(email)
+                    logger.info(
+                        "自动标准席位切换成功 workspace_db_id=%s email=%s",
+                        workspace_id,
+                        email,
+                    )
+                elif result.get("skipped"):
+                    logger.info(
+                        "自动标准席位候选已是目标席位 workspace_db_id=%s email=%s",
+                        workspace_id,
+                        email,
+                    )
+                else:
+                    logger.warning(
+                        "自动标准席位切换失败 workspace_db_id=%s email=%s error=%s",
+                        workspace_id,
+                        email,
+                        result.get("error"),
+                    )
+                if stop.is_set():
+                    break
+                stop.wait(5)
+
+            if switched:
+                try:
+                    _enqueue_workspace_credentials(workspace_id, switched, _workspace_settings_snapshot(workspace_id))
+                except Exception:
+                    logger.exception("自动标准席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, switched)
+            stop.wait(5 * 60)
+    finally:
+        with _seat_auto_schedulers_lock:
+            current = _seat_auto_schedulers.get(workspace_id)
+            if current and current[0] is stop:
+                _seat_auto_schedulers.pop(workspace_id, None)
+        logger.info("自动标准席位任务结束 workspace_db_id=%s", workspace_id)
+
+
+_trash_sweeper_stop = threading.Event()
+_trash_sweeper_thread: threading.Thread | None = None
+
+
+def _trash_sweeper_worker():
+    while not _trash_sweeper_stop.is_set():
+        try:
+            for row in db.list_workspace_candidate_trash_due():
+                if _trash_sweeper_stop.is_set():
+                    break
+                workspace_id = int(row.get("workspace_master_id") or 0)
+                if not workspace_id:
+                    continue
+                settings = _workspace_settings_snapshot(workspace_id)
+                try:
+                    _process_scheduled_trash_due(row, settings)
+                except Exception:
+                    logger.exception(
+                        "垃圾箱到期处理失败 workspace_db_id=%s email=%s",
+                        workspace_id,
+                        row.get("email", ""),
+                    )
+        except Exception:
+            logger.exception("垃圾箱调度轮询失败")
+        _trash_sweeper_stop.wait(30)
+
+
+@app.on_event("startup")
+def _start_background_sweeper():
+    global _trash_sweeper_thread
+    if _trash_sweeper_thread and _trash_sweeper_thread.is_alive():
+        return
+    _trash_sweeper_stop.clear()
+    _trash_sweeper_thread = threading.Thread(target=_trash_sweeper_worker, daemon=True, name="trash-sweeper")
+    _trash_sweeper_thread.start()
+    try:
+        for row in db.list_workspace_masters(limit=200, offset=0):
+            workspace_id = int(row.get("id") or 0)
+            if not workspace_id:
+                continue
+            settings = db.get_workspace_settings(workspace_id)
+            if settings.get("auto_standard_seat_enabled"):
+                with _seat_auto_schedulers_lock:
+                    if workspace_id in _seat_auto_schedulers:
+                        continue
+                    stop = threading.Event()
+                    thread = threading.Thread(
+                        target=_auto_standard_seat_worker,
+                        args=(workspace_id, stop),
+                        daemon=True,
+                        name=f"seat-auto-{workspace_id}",
+                    )
+                    next_at = time.time() + 5 * 60
+                    _seat_auto_schedulers[workspace_id] = (stop, thread, next_at)
+                    thread.start()
+    except Exception:
+        logger.exception("启动时恢复自动标准席位任务失败")
+
+
+@app.on_event("shutdown")
+def _stop_background_sweeper():
+    _trash_sweeper_stop.set()
 
 
 class RegisterReq(BaseModel):
     email: Optional[str] = Field(None, description="留空 = 自动 claim 下一个 available")
+    group_name: str = Field("", description="邮箱分组；空=未分组，__all__=全部")
     want_access_token: bool = True
     want_session_token: bool = True
     want_refresh_token: bool = True
+    want_password: bool = True  # 通用 OTP 是否强制创建可长期登录的密码
     proxy: str = ""
     otp_timeout: int = 10
+    add_phone_mode: str = Field("api", description="add-phone 验证模式：api / camoufox")
     allow_existing_login: bool = True
     # 注册成功后自动绑定 TOTP 2FA。前端两个页面都**默认开**（主人要求每个号都绑）。
     # 这里的 default 保持 False —— 它只在「调用方没传这个字段」时生效，是给旧前端
@@ -101,7 +1116,7 @@ def api_import(req: ImportReq):
         {"ok": false, "message": "...", "errors": [{"line": 3, "error": "..."}]}
     """
     try:
-        result = db.import_accounts(req.text, kind=req.kind)
+        result = db.import_accounts(req.text, kind=req.kind, group_name=req.group_name)
     except ImportValidationError as e:
         return JSONResponse(
             status_code=422,
@@ -109,19 +1124,807 @@ def api_import(req: ImportReq):
         )
     except MailProviderError as e:
         raise HTTPException(400, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True, **result, "stats": db.stats()}
 
 
+@app.post("/api/registered/import_sub2api")
+def api_import_sub2api(req: Sub2APIImportReq):
+    try:
+        payload = json.loads(req.text)
+        result = db.import_sub2api_registered(payload, group_name=req.group_name)
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, f"JSON 解析失败: {e}")
+    except ValueError as e:
+        try:
+            detail = json.loads(str(e))
+        except Exception:
+            detail = str(e)
+        raise HTTPException(400, detail)
+    return {"ok": True, **result}
+
+
+# ──────────────────────── Team 工作空间母号 ────────────────────────
+
+
+@app.post("/api/workspaces/import")
+def api_import_workspace_sessions(req: WorkspaceSessionImportReq):
+    try:
+        result = db.import_workspace_sessions(req.text, proxy=req.proxy)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, **result}
+
+
+@app.get("/api/workspaces")
+def api_workspace_masters(limit: int = 20, offset: int = 0):
+    return {
+        "ok": True,
+        "items": db.list_workspace_masters(limit=limit, offset=offset),
+        "total": db.count_workspace_masters(),
+    }
+
+
+@app.post("/api/workspaces/bulk_delete")
+def api_bulk_delete_workspace_masters(req: WorkspaceBulkDeleteReq):
+    return {"ok": True, "deleted": db.delete_workspace_masters(req.ids)}
+
+
+@app.get("/api/workspaces/{workspace_id}")
+def api_workspace_master(workspace_id: int):
+    row = db.get_workspace_master(workspace_id)
+    if not row:
+        raise HTTPException(404, "母号不存在")
+    return {"ok": True, "data": row}
+
+
+@app.delete("/api/workspaces/{workspace_id}")
+def api_delete_workspace_master(workspace_id: int):
+    if not db.delete_workspace_master(workspace_id):
+        raise HTTPException(404, "母号不存在")
+    return {"ok": True}
+
+
+@app.post("/api/workspaces/{workspace_id}/proxy")
+def api_update_workspace_proxy(workspace_id: int, req: WorkspaceProxyReq):
+    try:
+        ok = db.update_workspace_proxy(workspace_id, req.proxy)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, "母号不存在")
+    return {"ok": True}
+
+
+def _workspace_candidate_index(workspace_id: int) -> dict[str, dict]:
+    return {
+        str(row.get("email") or "").strip().lower(): row
+        for row in db.list_workspace_candidate_options(workspace_id)
+    }
+
+
+def _candidate_trash_enabled(workspace_id: int, settings: dict | None = None) -> bool:
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    return bool(cfg.get("trash_enabled", True))
+
+
+def _candidate_trash_invalid_enabled(workspace_id: int, settings: dict | None = None) -> bool:
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    return bool(cfg.get("trash_invalid_enabled", True))
+
+
+def _candidate_trash_delay_seconds(workspace_id: int, settings: dict | None = None) -> int:
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    return int(cfg.get("trash_zero_delay_minutes", 60) or 60) * 60
+
+
+def _schedule_candidate_trash(workspace_id: int, email: str, *, reason: str = "quota_zero", delay_seconds: int | None = None) -> bool:
+    row = db.get_workspace_candidate(workspace_id, email)
+    if not row:
+        return False
+    trash_status = str(row.get("trash_status") or "active")
+    if trash_status == "trashed":
+        return False
+    if trash_status == "scheduled" and float(row.get("trash_due_at") or 0) > 0:
+        # 已经排过一次入箱就不要再延后，避免每次额度刷新都把到期时间重置。
+        return True
+    now = time.time()
+    due_at = now + max(60, int(delay_seconds or 60 * 60))
+    return db.update_workspace_candidate_trash(
+        workspace_id,
+        email,
+        status="scheduled",
+        due_at=due_at,
+        reason=reason,
+    )
+
+
+def _clear_candidate_trash_timer(workspace_id: int, email: str) -> bool:
+    row = db.get_workspace_candidate(workspace_id, email)
+    if not row or str(row.get("trash_status") or "active") == "active":
+        return False
+    return db.update_workspace_candidate_trash(workspace_id, email, status="active", due_at=0, reason="")
+
+
+def _apply_candidate_trash(workspace_id: int, email: str, reason: str = "quota_zero") -> dict:
+    try:
+        return workspace_membership.trash_workspace_candidate(workspace_id, email, reason=reason)
+    except Exception:
+        logger.exception("候选人入垃圾箱失败 workspace_db_id=%s email=%s", workspace_id, email)
+        raise
+
+
+def _wait_and_relogin_for_candidate(workspace_id: int, email: str, settings: dict, *, auto_export: bool = False) -> bool:
+    try:
+        started = login_controller_for(
+            workspace_db_id=workspace_id,
+            workspace_id=(db.get_workspace_master(workspace_id) or {}).get("workspace_id", ""),
+        ).start(_workspace_login_options(workspace_id, email, settings, auto_export=auto_export))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("候选人 401 重登录启动失败 workspace_db_id=%s email=%s", workspace_id, email)
+        raise RuntimeError(f"重新登录失败: {exc}") from exc
+    if not started.get("ok") and "已经在跑了" not in str(started.get("error") or ""):
+        raise RuntimeError(started.get("error") or "重新登录未启动")
+    timeout = int(settings.get("otp_timeout", 180) or 180) + 900
+    _wait_for_login_completion(workspace_id, email, timeout=timeout)
+    account = db.get_registered(email)
+    if account and account.get("account_status") == "permanently_invalid":
+        if _candidate_trash_invalid_enabled(workspace_id, settings):
+            try:
+                workspace_membership.trash_workspace_candidates_by_email(email, reason="login_403")
+            except Exception:
+                logger.exception("账号失效后垃圾箱处理失败 workspace_db_id=%s email=%s", workspace_id, email)
+        return False
+    return True
+
+
+def _process_scheduled_trash_due(row: dict, settings: dict) -> None:
+    workspace_id = int(row.get("workspace_master_id") or 0)
+    email = str(row.get("email") or "").strip().lower()
+    if not workspace_id or not email:
+        return
+    if not _candidate_trash_enabled(workspace_id, settings):
+        _clear_candidate_trash_timer(workspace_id, email)
+        return
+    try:
+        quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+    except workspace_membership.QuotaUnauthorized:
+        try:
+            if _wait_and_relogin_for_candidate(workspace_id, email, settings, auto_export=bool(settings.get("auto_push"))):
+                quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+            else:
+                if not _candidate_trash_invalid_enabled(workspace_id, settings):
+                    _clear_candidate_trash_timer(workspace_id, email)
+                return
+        except Exception:
+            logger.exception("垃圾箱到期复查 401 后重试失败 workspace_db_id=%s email=%s", workspace_id, email)
+            db.update_workspace_candidate_trash(
+                workspace_id,
+                email,
+                status="scheduled",
+                due_at=time.time() + 10 * 60,
+                reason="quota_401_retry",
+            )
+            return
+    except Exception:
+        logger.exception("垃圾箱到期额度复查失败 workspace_db_id=%s email=%s", workspace_id, email)
+        db.update_workspace_candidate_trash(
+            workspace_id,
+            email,
+            status="scheduled",
+            due_at=time.time() + 10 * 60,
+            reason="quota_retry",
+        )
+        return
+    if _is_zero_quota_payload(quota):
+        _apply_candidate_trash(workspace_id, email, reason="quota_zero")
+    else:
+        _clear_candidate_trash_timer(workspace_id, email)
+
+
+@app.post("/api/workspace-candidates/trash")
+def api_trash_workspace_candidates(req: WorkspaceCandidatesReq):
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    indexed = _workspace_candidate_index(req.workspace_id)
+    emails = [email.lower() for email in req.emails if email.lower() in indexed]
+    if not emails:
+        raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    results = []
+    for email in emails:
+        try:
+            results.append({
+                "email": email,
+                "ok": True,
+                "result": workspace_membership.trash_workspace_candidate(
+                    req.workspace_id,
+                    email,
+                    reason="manual_trash",
+                ),
+            })
+        except Exception as exc:
+            logger.exception("候选垃圾箱处理失败 workspace_db_id=%s email=%s", req.workspace_id, email)
+            results.append({"email": email, "ok": False, "error": str(exc)})
+    return {
+        "ok": not any(not item.get("ok") for item in results),
+        "results": results,
+        "trashed": sum(1 for item in results if item.get("ok")),
+        "failed": sum(1 for item in results if not item.get("ok")),
+    }
+
+
+@app.get("/api/workspace-candidates/options")
+def api_workspace_candidate_options(
+    workspace_id: int,
+    limit: int = 100,
+    offset: int = 0,
+    account_status: str = "",
+    join_status: str = "",
+    credential_status: str = "",
+    seat_type: str = "",
+    trash_status: str = "",
+    tag_status: str = "",
+):
+    limit = max(1, min(1000, int(limit or 100)))
+    offset = max(0, int(offset or 0))
+    items = db.list_workspace_candidate_options(
+        workspace_id, limit=limit, offset=offset,
+        account_status=account_status, join_status=join_status,
+        credential_status=credential_status, seat_type=seat_type,
+        trash_status=trash_status, tag_status=tag_status,
+    )
+    total = db.count_workspace_candidate_options(
+        workspace_id, account_status=account_status, join_status=join_status,
+        credential_status=credential_status, seat_type=seat_type,
+        trash_status=trash_status, tag_status=tag_status,
+    )
+    return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/workspace-candidates")
+def api_workspace_candidates(workspace_id: int):
+    rows = db.list_workspace_candidates(workspace_id)
+    # 访问令牌只用于服务端真实操作，绝不返回浏览器。
+    for row in rows:
+        row.pop("access_token", None); row.pop("session_token", None); row.pop("refresh_token", None); row.pop("password", None)
+    return {"ok": True, "items": rows}
+
+
+def _reject_permanently_invalid(emails: list[str]) -> None:
+    blocked = db.list_registered_invalid_emails(emails)
+    if blocked:
+        raise HTTPException(409, "账号已永久失效，不能执行该任务：" + ", ".join(sorted(blocked)))
+
+
+def _reject_trashed_candidates(workspace_id: int, emails: list[str]) -> None:
+    indexed = _workspace_candidate_index(workspace_id)
+    blocked = [
+        email.lower()
+        for email in emails
+        if indexed.get(email.lower(), {}).get("trash_status") == "trashed"
+    ]
+    if blocked:
+        raise HTTPException(409, "垃圾箱中的候选人不能执行该任务：" + ", ".join(sorted(set(blocked))))
+
+
+@app.post("/api/workspace-candidates/assign")
+def api_assign_workspace_candidates(req: WorkspaceCandidatesReq):
+    return {"ok": True, "added": db.assign_workspace_candidates(req.workspace_id, req.emails)}
+
+
+@app.post("/api/workspace-candidates/remove")
+def api_remove_workspace_candidates(req: WorkspaceCandidatesReq):
+    return {"ok": True, "removed": db.remove_workspace_candidates(req.workspace_id, req.emails)}
+
+
+@app.post("/api/workspace-candidates/tag-status")
+def api_update_workspace_candidate_tag_status(req: WorkspaceCandidatesReq):
+    tag_status = str(getattr(req, "tag_status", "") or "").strip().lower()
+    if tag_status not in {"active", "outbound"}:
+        raise HTTPException(400, "tag_status 只能是 active / outbound")
+    return {"ok": True, "changed": db.update_workspace_candidate_tag_status(req.workspace_id, req.emails, tag_status)}
+
+
+@app.post("/api/workspace-candidates/invite")
+def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
+    if not req.emails: raise HTTPException(400, "请选择候选人")
+    _reject_permanently_invalid(req.emails)
+    _reject_trashed_candidates(req.workspace_id, req.emails)
+    assigned = {r["email"] for r in db.list_workspace_candidates(req.workspace_id)}
+    if any(email.lower() not in assigned for email in req.emails):
+        raise HTTPException(400, "只能邀请已划分到当前母号空间的候选人")
+    if req.seat_type not in {"default", "usage_based"}:
+        raise HTTPException(400, "席位类型只能是标准席位或 Usage-based")
+    invite_error = ""
+    try:
+        result = workspace_membership.invite_candidates(req.workspace_id, req.emails, seat_type=req.seat_type)
+    except Exception as e:
+        invite_error = str(e)
+        logger.exception("候选管理母号邀请失败 workspace_db_id=%s count=%s，将继续校验邀请状态", req.workspace_id, len(req.emails))
+    if _INVITE_STATUS_RECHECK_DELAY_SECONDS > 0:
+        logger.info(
+            "候选管理母号邀请结束后等待复查 workspace_db_id=%s delay_seconds=%s count=%s",
+            req.workspace_id,
+            _INVITE_STATUS_RECHECK_DELAY_SECONDS,
+            len(req.emails),
+        )
+        time.sleep(_INVITE_STATUS_RECHECK_DELAY_SECONDS)
+    try:
+        states = workspace_membership.check_candidate_membership(req.workspace_id, req.emails)
+    except Exception:
+        logger.exception("候选邀请后状态校验失败 workspace_db_id=%s", req.workspace_id)
+        states = {email.lower(): "pending_invite" for email in req.emails}
+    for email in req.emails:
+        db.update_workspace_candidate_status(req.workspace_id, email, states.get(email.lower(), "not_invited"))
+    final_ok = not any(value == "not_invited" for value in states.values())
+    return {"ok": final_ok, "result": result if not invite_error else None, "states": states, "invite_error": invite_error}
+
+
+@app.post("/api/workspace-candidates/request-join")
+def api_request_workspace_join(req: WorkspaceCandidatesReq):
+    if not req.emails: raise HTTPException(400, "请选择候选人")
+    _reject_permanently_invalid(req.emails)
+    _reject_trashed_candidates(req.workspace_id, req.emails)
+    if req.seat_type not in {"default", "usage_based"}:
+        raise HTTPException(400, "席位类型只能是标准席位或 Usage-based")
+    rows = db.list_workspace_candidates(req.workspace_id)
+    indexed = {r["email"]: r for r in rows}; results = []
+    pool_values = [line.strip() for line in req.proxy_pool.splitlines() if line.strip()]
+    def run_one(item):
+        index, email = item
+        candidate = indexed.get(email.lower())
+        if not candidate:
+            return {"email": email, "ok": False, "error": "尚未划分到该母号空间"}
+        try:
+            proxy_value = req.proxy
+            if not proxy_value and pool_values:
+                # 单次候选任务按全局池顺序分摊；自动任务的计数快照仍由 auto_loop 管理。
+                proxy_value = pool_values[index % len(pool_values)]
+            workspace_membership.request_join(req.workspace_id, candidate, proxy_value, seat_type=req.seat_type)
+            db.update_workspace_candidate_status(req.workspace_id, email, "join_requested")
+            return {"email": email, "ok": True}
+        except Exception as e:
+            logger.exception("候选管理子号申请失败 workspace_db_id=%s email=%s", req.workspace_id, email)
+            return {"email": email, "ok": False, "error": str(e)}
+    with ThreadPoolExecutor(max_workers=max(1, min(req.concurrency, len(req.emails)))) as pool:
+        futures = [pool.submit(run_one, item) for item in enumerate(req.emails)]
+        results = [f.result() for f in futures]
+    return {"ok": True, "results": results, "succeeded": sum(1 for r in results if r["ok"]), "failed": sum(1 for r in results if not r["ok"])}
+
+
+@app.post("/api/workspace-candidates/check")
+def api_check_workspace_candidates(req: WorkspaceCandidatesReq):
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    _reject_permanently_invalid(req.emails)
+    assigned = {r["email"] for r in db.list_workspace_candidates(req.workspace_id)}
+    emails = [email.lower() for email in req.emails if email.lower() in assigned]
+    if not emails:
+        raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    try:
+        states = workspace_membership.check_candidate_membership(req.workspace_id, emails)
+    except Exception as e:
+        logger.exception("候选状态校验失败 workspace_db_id=%s", req.workspace_id)
+        raise HTTPException(400, str(e))
+    for email, status in states.items():
+        db.update_workspace_candidate_status(req.workspace_id, email, status)
+    try:
+        seats = workspace_membership.fetch_candidate_seats(req.workspace_id, emails)
+        for email, info in seats.items():
+            db.update_workspace_candidate_seats(req.workspace_id, email, info.get("codex_seat", ""), info.get("gpt_seat", ""))
+            db.update_workspace_candidate_member(req.workspace_id, email, info.get("member_id", ""), info.get("raw_seat_type", ""))
+    except Exception: logger.exception("候选席位查询失败 workspace_db_id=%s", req.workspace_id)
+    return {"ok": True, "states": states}
+
+
+@app.post("/api/workspace-candidates/invite-status")
+def api_update_workspace_candidate_invite_status(req: WorkspaceCandidateInviteStatusReq):
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    normalized = str(req.join_status or "").strip()
+    if normalized not in {"not_invited", "pending_invite", "joined"}:
+        raise HTTPException(400, "邀请状态只能是 not_invited / pending_invite / joined")
+    try:
+        changed = db.update_workspace_candidate_join_statuses(req.workspace_id, req.emails, normalized)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "changed": changed, "join_status": normalized}
+
+
+@app.post("/api/workspace-candidates/seat")
+def api_update_candidate_seat(req: WorkspaceCandidatesReq):
+    if not req.emails: raise HTTPException(400, "请选择候选人")
+    if req.seat_type not in {"default", "usage_based"}: raise HTTPException(400, "席位类型无效")
+    indexed = {r["email"]: r for r in db.list_workspace_candidate_options(req.workspace_id)}; results = []
+    def canonical_seat(value: object) -> str:
+        # 历史数据可能保存过 usage-based / usagebased，统一后再比较。
+        value = str(value or "").strip().lower().replace("-", "_")
+        if value in {"usage_based", "usagebased", "codex席位"}:
+            return "usage_based"
+        if value in {"default", "standard", "standard_seat", "gpt席位", "标准席位"}:
+            return "default"
+        return value
+    settings = db.get_workspace_settings(req.workspace_id)
+    for email in req.emails:
+        key = email.lower(); row = indexed.get(key)
+        reserved = False
+        try:
+            if not row: raise RuntimeError("候选人不属于当前空间")
+            if row.get("workspace_join_status") != "joined":
+                raise RuntimeError("候选人尚未加入当前空间")
+            current_seat = canonical_seat(row.get("seat_label") or row.get("seat_type"))
+            if req.seat_type == "default" or current_seat not in {"default", "usage_based"}:
+                fresh = workspace_membership.fetch_candidate_seats(req.workspace_id, [email]).get(key, {})
+                if not row.get("member_id"):
+                    row["member_id"] = fresh.get("member_id", "")
+                current_seat = canonical_seat(
+                    fresh.get("raw_seat_type")
+                    or fresh.get("seat_type")
+                    or fresh.get("gpt_seat")
+                    or fresh.get("codex_seat")
+                )
+            if current_seat == req.seat_type:
+                results.append({
+                    "email": key,
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "already_target_seat",
+                    "seat_type": req.seat_type,
+                })
+                continue
+            if not row.get("member_id"):
+                fresh = workspace_membership.fetch_candidate_seats(req.workspace_id, [email]).get(key, {})
+                row["member_id"] = fresh.get("member_id", "")
+            if not row.get("member_id"): raise RuntimeError("未获取到成员 member_id，请先校验候选状态")
+            if req.seat_type == "default" and current_seat == "usage_based":
+                reservation = db.reserve_workspace_seat_protect_quota(req.workspace_id, 1)
+                if not reservation.get("allowed", False):
+                    raise RuntimeError(
+                        "席位保护已生效：本周期标准席位切换已达 "
+                        f"{int(reservation.get('threshold') or settings.get('seat_protect_threshold') or 8)} 个，"
+                        f"下次刷新时间 {reservation.get('refresh_time') or settings.get('seat_protect_refresh_time') or '00:00'}"
+                    )
+                reserved = bool(reservation.get("enabled"))
+            result = workspace_membership.update_member_seat_type(req.workspace_id, row["member_id"], req.seat_type)
+            db.update_workspace_candidate_member(req.workspace_id, email, row["member_id"], req.seat_type)
+            results.append({"email": key, "ok": True, "skipped": False, "result": result})
+        except Exception as e:
+            if reserved:
+                try:
+                    db.release_workspace_seat_protect_quota(req.workspace_id, 1)
+                except Exception:
+                    logger.exception("席位保护配额回滚失败 workspace_db_id=%s email=%s", req.workspace_id, key)
+            results.append({"email": key, "ok": False, "error": str(e)})
+    skipped = sum(1 for x in results if x.get("skipped"))
+    failed = sum(1 for x in results if not x.get("ok"))
+    return {
+        "ok": failed == 0,
+        "results": results,
+        "changed": len(results) - skipped - failed,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+@app.post("/api/workspace-candidates/quota")
+def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
+    if not req.emails: raise HTTPException(400, "请选择候选人")
+    _reject_trashed_candidates(req.workspace_id, req.emails)
+    settings = _workspace_settings_snapshot(req.workspace_id, req.model_dump())
+    options = {
+        r["email"] for r in db.list_workspace_candidate_options(req.workspace_id)
+        if r.get("has_workspace_access_token")
+        and r.get("account_status") != "permanently_invalid"
+        and not _is_codex_seat(r.get("seat_label") or r.get("seat_type"))
+    }
+    invalid_emails = db.list_registered_invalid_emails(req.emails)
+    results = {}
+    logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(req.proxy_pool.strip()))
+    trash_delay = _candidate_trash_delay_seconds(req.workspace_id, settings)
+    for email in req.emails:
+        key = email.lower()
+        if key not in options:
+            if key in invalid_emails:
+                results[key] = {"ok": False, "error": "账号已永久失效"}
+            continue
+        quota = None
+        try:
+            quota = workspace_membership.fetch_candidate_quota(req.workspace_id, email)
+            results[key] = {"ok": True, "quota": quota}
+        except Exception as e:
+            results[key] = {"ok": False, "error": str(e)}
+            is_401 = isinstance(e, workspace_membership.QuotaUnauthorized) or "HTTP 401" in str(e) or "401" in str(e)
+            if req.relogin_on_401 and is_401:
+                if not req.proxy_pool:
+                    results[key]["relogin_error"] = "全局代理池为空，无法重新登录"
+                    continue
+                try:
+                    relogin_ok = _wait_and_relogin_for_candidate(
+                        req.workspace_id,
+                        key,
+                        settings,
+                        auto_export=bool(req.auto_push or settings.get("auto_push")),
+                    )
+                    if not relogin_ok:
+                        results[key]["relogin_error"] = "账号已永久失效"
+                        if _candidate_trash_invalid_enabled(req.workspace_id, settings):
+                            results[key]["trashed"] = True
+                        continue
+                    quota = workspace_membership.fetch_candidate_quota(req.workspace_id, key)
+                    results[key] = {"ok": True, "quota": quota, "relogin_started": True}
+                except Exception as relogin_exc:
+                    results[key]["relogin_error"] = str(relogin_exc)
+                    continue
+            else:
+                continue
+        if quota is not None and _is_zero_quota_payload(quota) and _candidate_trash_enabled(req.workspace_id, settings):
+            scheduled = _schedule_candidate_trash(
+                req.workspace_id,
+                key,
+                reason="quota_zero",
+                delay_seconds=trash_delay,
+            )
+            if scheduled:
+                results[key]["trash_scheduled"] = True
+                candidate_row = db.get_workspace_candidate(req.workspace_id, key) or {}
+                results[key]["trash_due_at"] = candidate_row.get("trash_due_at", 0)
+        elif quota is not None:
+            _clear_candidate_trash_timer(req.workspace_id, key)
+    return {"ok": True, "results": results}
+
+@app.post("/api/workspace-candidates/quota-schedule/start")
+def api_start_quota_schedule(req: WorkspaceQuotaScheduleReq):
+    old = _quota_schedulers.pop(req.workspace_id, None)
+    if old: old[0].set()
+    stop = threading.Event(); thread = threading.Thread(target=_quota_worker, args=(req.workspace_id, req.interval_minutes, stop, req.relogin_on_401, req.proxy_pool, req.auto_push, req.concurrency, req.otp_timeout, req.account_retry_count, req.cool_down_seconds), daemon=True)
+    next_at = time.time() + req.interval_minutes * 60
+    _quota_schedulers[req.workspace_id] = (stop, thread, req.interval_minutes, req.relogin_on_401, next_at); thread.start()
+    db.update_workspace_settings(req.workspace_id, {**req.model_dump(), "quota_enabled": True})
+    return {"ok": True, "running": True, "interval_minutes": req.interval_minutes, "relogin_on_401": req.relogin_on_401, "next_at": next_at}
+
+@app.post("/api/workspace-candidates/quota-schedule/stop")
+def api_stop_quota_schedule(req: WorkspaceQuotaScheduleReq):
+    item = _quota_schedulers.pop(req.workspace_id, None)
+    if item: item[0].set()
+    db.update_workspace_settings(req.workspace_id, {"quota_enabled": False})
+    return {"ok": True, "running": False}
+
+@app.get("/api/workspace-candidates/quota-schedule")
+def api_quota_schedule_status(workspace_id: int):
+    item = _quota_schedulers.get(workspace_id)
+    cfg = db.get_workspace_settings(workspace_id)
+    if not item and cfg.get("quota_enabled"):
+        stop = threading.Event(); args = (workspace_id, int(cfg.get("interval_minutes",30)), stop, bool(cfg.get("relogin_on_401")), str(cfg.get("proxy_pool", "")), bool(cfg.get("auto_push")), int(cfg.get("concurrency",1)), int(cfg.get("otp_timeout",180)), int(cfg.get("account_retry_count",1)), int(cfg.get("cool_down_seconds",0)))
+        thread = threading.Thread(target=_quota_worker, args=args, daemon=True); next_at = time.time() + args[1] * 60
+        item = (stop, thread, args[1], args[3], next_at); _quota_schedulers[workspace_id] = item; thread.start()
+    return {"ok": True, "running": bool(item and item[1].is_alive()), "interval_minutes": item[2] if item else int(cfg.get("interval_minutes",30)), "relogin_on_401": item[3] if item else bool(cfg.get("relogin_on_401")), "next_at": item[4] if item else 0, "settings": cfg}
+
+
+@app.post("/api/workspace-candidates/auto-standard-seat/start")
+def api_start_auto_standard_seat(req: WorkspaceAutoSeatReq):
+    settings = db.get_workspace_settings(req.workspace_id)
+    with _seat_auto_schedulers_lock:
+        old = _seat_auto_schedulers.pop(req.workspace_id, None)
+    if old:
+        old[0].set()
+    db.update_workspace_settings(req.workspace_id, {"auto_standard_seat_enabled": True})
+    stop = threading.Event()
+    thread = threading.Thread(target=_auto_standard_seat_worker, args=(req.workspace_id, stop), daemon=True)
+    next_at = time.time() + 5 * 60
+    with _seat_auto_schedulers_lock:
+        _seat_auto_schedulers[req.workspace_id] = (stop, thread, next_at)
+    thread.start()
+    return {"ok": True, "running": True, "settings": {**settings, "auto_standard_seat_enabled": True}, "next_at": next_at}
+
+
+@app.post("/api/workspace-candidates/auto-standard-seat/stop")
+def api_stop_auto_standard_seat(req: WorkspaceAutoSeatReq):
+    with _seat_auto_schedulers_lock:
+        item = _seat_auto_schedulers.pop(req.workspace_id, None)
+    if item:
+        item[0].set()
+    db.update_workspace_settings(req.workspace_id, {"auto_standard_seat_enabled": False})
+    return {"ok": True, "running": False}
+
+
+@app.get("/api/workspace-candidates/auto-standard-seat")
+def api_auto_standard_seat_status(workspace_id: int):
+    cfg = db.get_workspace_settings(workspace_id)
+    with _seat_auto_schedulers_lock:
+        item = _seat_auto_schedulers.get(workspace_id)
+        if not item and cfg.get("auto_standard_seat_enabled"):
+            stop = threading.Event()
+            thread = threading.Thread(target=_auto_standard_seat_worker, args=(workspace_id, stop), daemon=True)
+            next_at = time.time() + 5 * 60
+            item = (stop, thread, next_at)
+            _seat_auto_schedulers[workspace_id] = item
+            thread.start()
+    return {
+        "ok": True,
+        "running": bool(item and item[1].is_alive()),
+        "next_at": item[2] if item else 0,
+        "settings": cfg,
+    }
+
+
+@app.get("/api/workspace-candidates/task-logs")
+def api_workspace_candidate_task_logs(workspace_id: int, limit: int = 120):
+    master = db.get_workspace_master(workspace_id) or {}
+    external_id = str(master.get("workspace_id") or "").strip()
+    limit = max(1, min(int(limit or 120), 500))
+    with _TASK_LOG_LOCK:
+        rows = list(_TASK_LOGS)
+    out = []
+    for item in reversed(rows):
+        db_id = item.get("workspace_db_id")
+        ext_id = item.get("workspace_external_id")
+        if db_id != workspace_id and (not external_id or ext_id != external_id):
+            continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    out.reverse()
+    return {"ok": True, "items": out, "workspace_external_id": external_id, "count": len(out)}
+
+
+@app.post("/api/workspace-candidates/settings")
+def api_save_workspace_candidate_settings(req: WorkspaceQuotaScheduleReq):
+    db.update_workspace_settings(req.workspace_id, req.model_dump())
+    return {"ok": True}
+
+
+@app.post("/api/workspace-candidates/credentials")
+def api_workspace_credentials(req: WorkspaceCandidatesReq):
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    _reject_trashed_candidates(req.workspace_id, req.emails)
+    master = db.get_workspace_master(req.workspace_id)
+    if not master or not master.get("workspace_id"):
+        raise HTTPException(400, "母号缺少 Workspace ID")
+    invalid = db.list_registered_invalid_emails(req.emails)
+    active_emails = [email for email in req.emails if email.lower() not in invalid]
+    for email in invalid:
+        db.update_workspace_candidate_status(req.workspace_id, email, "permanently_invalid")
+    if not active_emails:
+        return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(invalid), "skipped_emails": sorted(invalid)}
+    eligible = []
+    skipped = sorted(invalid)
+    candidate_rows = {
+        str(row.get("email") or "").strip().lower(): row
+        for row in (db.get_workspace_candidate(req.workspace_id, email) for email in active_emails)
+        if row
+    }
+    trusted_eligible = []
+    need_check = []
+    for email in active_emails:
+        current_status = str(
+            (candidate_rows.get(email) or {}).get("workspace_join_status") or ""
+        ).strip()
+        if current_status in {"pending_invite", "joined"}:
+            trusted_eligible.append(email)
+        else:
+            need_check.append(email)
+    if need_check:
+        states = workspace_membership.check_candidate_membership(req.workspace_id, need_check)
+        for email, status in states.items():
+            db.update_workspace_candidate_status(req.workspace_id, email, status)
+            if status == "pending_request":
+                workspace_membership.approve_candidate_request(req.workspace_id, email, req.seat_type)
+                db.update_workspace_candidate_status(req.workspace_id, email, "approved")
+                # 审批刚完成，尚未确认已进入空间，本轮不登录，避免拿到 Personal 凭证。
+                skipped.append(email)
+            elif status in {"joined", "pending_invite"}:
+                # 待接受邀请的成员也可以直接进入空间登录流程；登录时上游会
+                # 自动接受邀请并返回目标 Team 凭证。
+                eligible.append(email)
+            else:
+                # not_invited / pending_request / 其他状态都不能获取空间凭证。
+                skipped.append(email)
+    eligible = trusted_eligible + eligible
+    proxy_pool = req.proxy_pool
+    if not proxy_pool:
+        raise HTTPException(400, "全局代理池为空")
+    if not eligible:
+        return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(skipped), "skipped_emails": skipped}
+    result = login_controller_for(workspace_db_id=req.workspace_id, workspace_id=master["workspace_id"]).start({
+        "login_only": True, "login_emails": eligible, "group_name": "__all__",
+        "workspace_id": master["workspace_id"], "workspace_db_id": req.workspace_id, "proxy_pool": proxy_pool,
+        "proxy": "", "concurrency": req.concurrency, "otp_timeout": req.otp_timeout,
+        "want_access_token": True, "want_session_token": True, "want_refresh_token": True,
+        "want_password": False, "want_2fa": False, "allow_existing_login": True,
+        "cool_down_seconds": req.cool_down_seconds, "account_retry_count": req.account_retry_count, "auto_export": req.auto_push,
+        "export_refresh_oauth": False, "target_count": 0,
+    })
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "空间凭证任务启动失败"))
+    return {"ok": True, "run": result, "workspace_id": master["workspace_id"], "eligible": len(eligible), "skipped": len(skipped), "skipped_emails": skipped}
+
+
+@app.post("/api/workspaces/{workspace_id}/sync")
+def api_sync_workspace(workspace_id: int):
+    try: values = workspace_membership.sync_seat_info(workspace_id)
+    except Exception as e: raise HTTPException(400, str(e))
+    db.update_workspace_seat_info(workspace_id, **values)
+    _refresh_workspace_unknown_candidate_seats(workspace_id)
+    return {"ok": True, "data": values}
+
+
 @app.get("/api/accounts")
-def api_accounts(status: str = "", limit: int = 50, offset: int = 0, kind: str = ""):
-    items = db.list_accounts(status=status, limit=limit, offset=offset, kind=kind)
-    total = db.count_accounts(status=status, kind=kind)
+def api_accounts(
+    status: str = "", limit: int = 50, offset: int = 0, kind: str = "",
+    group_name: Optional[str] = None,
+):
+    try:
+        items = db.list_accounts(
+            status=status, limit=limit, offset=offset, kind=kind, group_name=group_name,
+        )
+        total = db.count_accounts(status=status, kind=kind, group_name=group_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {
         "ok": True,
         "items": items,
         "total": total,
         "by_kind": db.stats_by_kind(),
+        "groups": db.list_groups(),
     }
+
+
+@app.get("/api/accounts/groups")
+def api_account_groups():
+    return {"ok": True, "groups": db.list_groups()}
+
+
+class SetGroupReq(BaseModel):
+    emails: list[str] = Field(..., min_length=1)
+    group_name: str = Field("", max_length=64)
+
+
+@app.post("/api/accounts/set_group")
+def api_set_accounts_group(req: SetGroupReq):
+    try:
+        updated = db.set_accounts_group(req.emails, req.group_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "updated": updated, "groups": db.list_groups()}
+
+
+class GroupNameReq(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+
+
+class RenameGroupReq(BaseModel):
+    old_name: str = Field(..., min_length=1, max_length=64)
+    new_name: str = Field(..., min_length=1, max_length=64)
+
+
+@app.post("/api/accounts/groups")
+def api_create_account_group(req: GroupNameReq):
+    try:
+        db.create_group(req.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "groups": db.list_groups()}
+
+
+@app.post("/api/accounts/groups/rename")
+def api_rename_account_group(req: RenameGroupReq):
+    try:
+        moved = db.rename_group(req.old_name, req.new_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "moved": moved, "groups": db.list_groups()}
+
+
+@app.delete("/api/accounts/groups/{group_name}")
+def api_delete_account_group(group_name: str):
+    try:
+        ungrouped = db.delete_group(group_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "ungrouped": ungrouped, "groups": db.list_groups()}
 
 
 @app.delete("/api/accounts/{email}")
@@ -285,19 +2088,25 @@ def api_register(req: RegisterReq):
                 f"当前邮箱来源是 {mail_source}，请先切换来源",
             )
     else:
-        account = db.claim_next(kind=mail_source)
+        try:
+            account = db.claim_next(kind=mail_source, group_name=req.group_name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         if not account:
+            group_label = "全部分组" if req.group_name == "__all__" else (req.group_name or "未分组")
             raise HTTPException(
                 400,
-                f"号池里没有 available 的 {provider_cls.display_name} 账号；请先批量导入",
+                f"{group_label}没有 available 的 {provider_cls.display_name} 账号；请先批量导入",
             )
 
     options = {
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
+        "want_password": req.want_password,
         "proxy": req.proxy,
         "otp_timeout": int(req.otp_timeout),
+        "add_phone_mode": req.add_phone_mode,
         "allow_existing_login": req.allow_existing_login,
         "want_2fa": req.want_2fa,
     }
@@ -356,10 +2165,18 @@ def api_runs(limit: int = 50):
 
 
 @app.get("/api/registered")
-def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
-    items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
-    total = db.count_registered(filter_rt=filter)
-    return {"ok": True, "items": items, "total": total}
+def api_registered(
+    limit: int = 20, offset: int = 0, filter: str = "all",
+    group_name: Optional[str] = None,
+):
+    try:
+        items = db.list_registered(
+            limit=limit, offset=offset, filter_rt=filter, group_name=group_name,
+        )
+        total = db.count_registered(filter_rt=filter, group_name=group_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "items": items, "total": total, "groups": db.list_groups()}
 
 
 @app.get("/api/registered/{email}")
@@ -411,6 +2228,7 @@ class ExportRegisteredReq(BaseModel):
     format: str = Field(..., description="格式 id，见 GET /api/registered/export/formats")
     emails: Optional[list[str]] = Field(None, description="要导出的 email 列表")
     all: bool = Field(False, description="true = 导出全部（跨页），忽略 emails")
+    workspace_id: Optional[int] = Field(None, description="按指定 Team 空间导出其独立凭证")
 
 
 @app.post("/api/registered/export")
@@ -419,7 +2237,11 @@ def api_export_registered(req: ExportRegisteredReq):
     if fmt is None:
         raise HTTPException(400, f"未知导出格式: {req.format}")
 
-    if req.all:
+    if req.workspace_id:
+        if not req.emails:
+            raise HTTPException(400, "Team 空间导出需要 emails")
+        rows = db.list_workspace_credentials_by_emails(req.workspace_id, req.emails)
+    elif req.all:
         rows = db.list_registered_full(limit=100000)
     elif req.emails:
         rows = db.list_registered_by_emails(req.emails)
@@ -431,10 +2253,10 @@ def api_export_registered(req: ExportRegisteredReq):
     base = {
         "ok": True,
         "count": len(rows),
-        "filename": fmt.filename,
+        "filename": fmt.filename_for(rows) if fmt.filename_for else fmt.filename,
         "label": fmt.label,
         "mode": fmt.mode,
-        "mime": fmt.mime,
+        "mime": fmt.mime_for(rows) if fmt.mime_for else fmt.mime,
         # 这一批导出的 email 原样带回去 —— 前端「下载并删除」照着它删，删得准。
         # ⚠️ 必须由后端给：`all=true` 时前端手里只有当前页那 20 行，
         #    自己凑列表会漏删；而用 all/status 那种"全清"接口去删号池，
@@ -716,6 +2538,12 @@ class ManualExportReq(BaseModel):
                                 description="选择导出目标：cpa / sub2api")
 
 
+class BulkCpaPushReq(BaseModel):
+    emails: list[str] = Field(..., min_length=1, description="选中的已注册账号邮箱")
+    proxy: str = Field("", description="刷新 OAuth token 时使用的代理")
+    workspace_id: Optional[int] = Field(None, description="按指定 Team 空间推送独立凭证")
+
+
 @app.post("/api/registered/export_to_panel")
 def api_manual_export_to_panel(req: ManualExportReq):
     """对一个已注册账号手动触发到面板的导出。
@@ -748,6 +2576,55 @@ def api_manual_export_to_panel(req: ManualExportReq):
             out["sub2api"] = {"ok": False, "error": str(e)}
 
     return {"ok": True, **out}
+
+
+@app.post("/api/registered/push_cpa")
+def api_push_registered_to_cpa(req: BulkCpaPushReq):
+    """将选中的注册结果逐个转换为 CPA token JSON 并上传到已配置 CPA。"""
+    from . import exporter
+
+    emails = []
+    seen = set()
+    for email in req.emails:
+        normalized = str(email or "").strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            emails.append(normalized)
+    if not emails:
+        raise HTTPException(400, "没有有效的账号邮箱")
+
+    cfg = db.get_export_internal_config()["cpa"]
+    if not cfg.get("cpa_url") or not cfg.get("cpa_mgmt_key"):
+        raise HTTPException(400, "请先在“自动导出”中配置 CPA URL 和管理密钥")
+
+    rows = (db.list_workspace_credentials_by_emails(req.workspace_id, emails)
+            if req.workspace_id else db.list_registered_by_emails(emails))
+    row_map = {str(row.get("email") or "").lower(): row for row in rows}
+    results = []
+    found_rows = []
+    for email in emails:
+        cred = row_map.get(email)
+        if not cred:
+            results.append({"email": email, "ok": False, "error": "未找到注册结果"})
+            continue
+        found_rows.append(cred)
+    refresh_cb = (lambda cred: db.save_workspace_credential(req.workspace_id, cred)) if req.workspace_id else (lambda cred: db.update_registered_oauth_tokens(
+            cred.get("email", ""), access_token=cred.get("access_token", ""), refresh_token=cred.get("refresh_token", ""), id_token=cred.get("id_token", "")))
+    results.extend(exporter.push_many_to_cpa(
+        found_rows,
+        cfg,
+        on_tokens_refreshed=refresh_cb,
+        proxy=req.proxy,
+    ))
+
+    succeeded = sum(1 for item in results if item.get("ok"))
+    return {
+        "ok": succeeded == len(results),
+        "total": len(results),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "results": results,
+    }
 
 
 class UpdateCredReq(BaseModel):
@@ -1000,13 +2877,23 @@ class AutoLoopStartReq(BaseModel):
     want_access_token: bool = True
     want_session_token: bool = True
     want_refresh_token: bool = True
+    want_password: bool = True  # 通用 OTP 是否强制创建密码
+    login_only: bool = False    # 仅投送当前分组已有注册结果，刷新登录凭证
+    login_no_rt_only: bool = False  # 仅对无 RT 的注册结果执行
+    login_emails: Optional[list[str]] = None  # 仅登录时限定指定账号（注册结果页重登录）
+    workspace_id: str = ""  # 空间凭证获取时强制选择目标 Workspace
+    group_name: str = Field("", description="邮箱分组；空=未分组，__all__=全部")
     proxy: str = ""              # 单代理（concurrency=1 + 无代理池时用）
     proxy_pool: str = ""         # 多代理池（每行一个）；优先于 proxy
     concurrency: int = 1         # 并发 worker 数（1-20）
     otp_timeout: int = 10
+    add_phone_mode: str = Field("api", description="add-phone 验证模式：api / camoufox")
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
     target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）
+    account_retry_count: int = Field(1, ge=0, le=10, description="每个账号失败后的额外重试次数")
+    auto_export: bool = True  # 本次任务完成后是否自动推送到已启用的面板
+    export_refresh_oauth: bool = False  # 推送前是否用 RT 刷新 Codex token
     # 批量页已放开关且**默认开**（主人要求每个号都绑）。
     # 这里的 default 仍保持 False —— 它只在「前端没传这个字段」时生效，
     # 是给旧前端缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不要
@@ -1014,9 +2901,27 @@ class AutoLoopStartReq(BaseModel):
     want_2fa: bool = False
 
 
+def _controller_for_options(options: dict):
+    """按任务语义选择控制器：login_only 都属于同一种登录任务。"""
+    if not bool((options or {}).get("login_only")):
+        return AUTO_LOOP
+    return login_controller_for(
+        workspace_db_id=(options or {}).get("workspace_db_id"),
+        workspace_id=(options or {}).get("workspace_id", ""),
+    )
+
+
+def _active_auto_controller():
+    """兼容旧版暂停/停止接口，优先控制当前正在运行的登录任务。"""
+    for controller in all_login_controllers():
+        if controller.status().get("state") in ("running", "paused"):
+            return controller
+    return AUTO_LOOP
+
+
 @app.post("/api/auto/start")
 def api_auto_start(req: AutoLoopStartReq):
-    res = AUTO_LOOP.start(req.model_dump())
+    res = _controller_for_options(req.model_dump()).start(req.model_dump())
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "启动失败"))
     return res
@@ -1024,7 +2929,7 @@ def api_auto_start(req: AutoLoopStartReq):
 
 @app.post("/api/auto/pause")
 def api_auto_pause():
-    res = AUTO_LOOP.pause()
+    res = _active_auto_controller().pause()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "暂停失败"))
     return res
@@ -1032,7 +2937,7 @@ def api_auto_pause():
 
 @app.post("/api/auto/resume")
 def api_auto_resume():
-    res = AUTO_LOOP.resume()
+    res = _active_auto_controller().resume()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "恢复失败"))
     return res
@@ -1040,7 +2945,7 @@ def api_auto_resume():
 
 @app.post("/api/auto/stop")
 def api_auto_stop():
-    res = AUTO_LOOP.stop()
+    res = _active_auto_controller().stop()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "停止失败"))
     return res
@@ -1048,33 +2953,56 @@ def api_auto_stop():
 
 @app.get("/api/auto/status")
 def api_auto_status():
-    return {"ok": True, **AUTO_LOOP.status()}
+    active = _active_auto_controller()
+    return {
+        "ok": True,
+        **active.status(),
+        "register_status": AUTO_LOOP.status(),
+        "login_status": LOGIN_CONTROLLER.status(),
+    }
 
 
 @app.get("/api/auto/stream")
 async def api_auto_stream(request: Request):
     """SSE 推送 auto-loop 状态变化 + run_started / run_finished 事件。"""
-    q = AUTO_LOOP.subscribe()
+    # 注册和登录是两个独立控制器；合并事件流后，原有前端无需区分
+    # 任务来源，也能看到手动登录、空间凭证获取和注册任务的进度。
+    subscriptions = [(AUTO_LOOP, AUTO_LOOP.subscribe())]
+    known_controllers = {id(AUTO_LOOP)}
 
     async def gen():
-        loop = asyncio.get_event_loop()
+        idle_since = time.monotonic()
         try:
             while True:
                 if await request.is_disconnected():
                     break
-                # 阻塞拿消息，但每 30s 心跳
-                try:
-                    msg = await loop.run_in_executor(None, lambda: q.get(timeout=30))
-                except Exception:
-                    yield ": heartbeat\n\n"
+                # 空间首次执行时才会创建对应的登录控制器，动态补订阅。
+                for controller in all_login_controllers():
+                    if id(controller) not in known_controllers:
+                        subscriptions.append((controller, controller.subscribe()))
+                        known_controllers.add(id(controller))
+                delivered = False
+                for _, q in list(subscriptions):
+                    try:
+                        msg = q.get_nowait()
+                    except queue.Empty:
+                        continue
+                    delivered = True
+                    if msg is None:
+                        continue
+                    kind = msg.get("kind", "state")
+                    data = msg.get("data", {})
+                    yield f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                if delivered:
+                    idle_since = time.monotonic()
                     continue
-                if msg is None:
-                    break
-                kind = msg.get("kind", "state")
-                data = msg.get("data", {})
-                yield f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                if time.monotonic() - idle_since >= 30:
+                    yield ": heartbeat\n\n"
+                    idle_since = time.monotonic()
+                await asyncio.sleep(0.2)
         finally:
-            AUTO_LOOP.unsubscribe(q)
+            for controller, q in subscriptions:
+                controller.unsubscribe(q)
 
     return StreamingResponse(
         gen(),
