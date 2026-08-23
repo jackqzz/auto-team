@@ -1,0 +1,1 @@
+import{_ as s,o as a,c as r,j as o,a3 as t}from"./index-DiwhWmDA.js";const c={class:"footer-toolbar"},_={class:"ft-left"},d={class:"ft-right"},n={__name:"FooterToolbar",setup(l){return(e,f)=>(a(),r("div",c,[o("div",_,[t(e.$slots,"left",{},void 0,!0)]),o("div",d,[t(e.$slots,"default",{},void 0,!0)])]))}},p=s(n,[["__scopeId","data-v-d2120ac0"]]);export{p as F};

@@ -2861,6 +2861,7 @@ def get_public_relogin_config() -> dict:
         "enabled": get_setting("public_relogin_enabled", "0"),
         "workspace_whitelist": get_setting("public_relogin_workspace_whitelist", ""),
         "proxy_pool": get_setting("public_relogin_proxy_pool", ""),
+        "use_system_proxy_pool": get_setting("public_relogin_use_system_proxy_pool", "1"),
         "concurrency": get_setting("public_relogin_concurrency", "3"),
         "retry_count": get_setting("public_relogin_retry_count", "2"),
         "quota_timeout": get_setting("public_relogin_quota_timeout", "30"),
@@ -2874,6 +2875,7 @@ def save_public_relogin_config(data: dict) -> None:
     for key_in, key_out in (
         ("workspace_whitelist", "public_relogin_workspace_whitelist"),
         ("proxy_pool", "public_relogin_proxy_pool"),
+        ("use_system_proxy_pool", "public_relogin_use_system_proxy_pool"),
         ("concurrency", "public_relogin_concurrency"),
         ("retry_count", "public_relogin_retry_count"),
         ("quota_timeout", "public_relogin_quota_timeout"),

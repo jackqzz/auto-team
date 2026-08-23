@@ -12,6 +12,7 @@ const form = reactive({
   enabled: false,
   workspaceWhitelist: '',
   proxyPool: '',
+  useSystemProxyPool: true,
   concurrency: 3,
   retryCount: 2,
   quotaTimeout: 30,
@@ -27,6 +28,7 @@ async function load() {
     form.enabled = config.enabled === '1'
     form.workspaceWhitelist = config.workspace_whitelist || ''
     form.proxyPool = config.proxy_pool || ''
+    form.useSystemProxyPool = config.use_system_proxy_pool !== false && config.use_system_proxy_pool !== '0'
     form.concurrency = Number(config.concurrency || 3)
     form.retryCount = Number(config.retry_count || 2)
     form.quotaTimeout = Number(config.quota_timeout || 30)
@@ -46,6 +48,7 @@ async function save() {
       public_relogin_enabled: form.enabled,
       workspace_whitelist: form.workspaceWhitelist.trim(),
       proxy_pool: form.proxyPool.trim(),
+      use_system_proxy_pool: form.useSystemProxyPool,
       concurrency: form.concurrency,
       retry_count: form.retryCount,
       quota_timeout: form.quotaTimeout,
@@ -93,7 +96,12 @@ onActivated(() => load())
           />
         </el-form-item>
 
-        <el-form-item label="后端代理池（公开页不填单账号代理时使用）">
+        <el-form-item>
+          <el-checkbox v-model="form.useSystemProxyPool">复用系统代理池</el-checkbox>
+          <div class="hint">开启后，公开重登会使用“代理池”页面保存的代理；单账号代理仍优先。</div>
+        </el-form-item>
+
+        <el-form-item label="后端备用代理池（系统代理池为空或关闭复用时使用）">
           <el-input
             v-model="form.proxyPool"
             type="textarea"

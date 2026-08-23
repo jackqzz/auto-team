@@ -271,6 +271,7 @@ class PublicReloginSettingsReq(BaseModel):
     public_relogin_enabled: bool = False
     workspace_whitelist: str = ""
     proxy_pool: str = ""
+    use_system_proxy_pool: bool = True
     concurrency: int = Field(3, ge=1, le=20)
     retry_count: int = Field(2, ge=0, le=5)
     quota_timeout: int = Field(30, ge=5, le=120)
@@ -331,6 +332,19 @@ def _public_relogin_proxy_pool(req_pool: str, configured_pool: str) -> list[str]
     return values
 
 
+def _public_relogin_effective_proxy_pool(req_pool: str, cfg: dict) -> list[str]:
+    """公开重登代理池。
+
+    优先级：
+    1. 前端本次请求传入的代理池（用于复用系统代理池）；
+    2. 后台公开重登独立代理池；
+    3. 无代理池，单账号 proxy 仍在调用处优先使用。
+    """
+    configured_pool = cfg.get("proxy_pool") or ""
+    use_system_pool = bool(cfg.get("use_system_proxy_pool", True))
+    return _public_relogin_proxy_pool(req_pool if use_system_pool else "", configured_pool)
+
+
 def _public_relogin_account_key(account: dict, index: int) -> str:
     if str(account.get("id") or "").strip():
         return str(account.get("id")).strip()
@@ -362,6 +376,7 @@ def _public_relogin_validate(account: dict, cfg: dict) -> tuple[dict | None, dic
 def api_get_public_relogin_settings():
     cfg = db.get_public_relogin_config()
     auth_cfg = db.get_admin_auth_config()
+    cfg["use_system_proxy_pool"] = str(cfg.get("use_system_proxy_pool") or "1").lower() in {"1", "true", "yes", "on"}
     return {
         "ok": True,
         "config": {
@@ -375,6 +390,7 @@ def api_get_public_relogin_settings():
 @app.post("/api/settings/public-relogin")
 def api_save_public_relogin_settings(req: PublicReloginSettingsReq):
     payload = req.model_dump()
+    payload["use_system_proxy_pool"] = "1" if req.use_system_proxy_pool else "0"
     db.save_public_relogin_config(payload)
     if req.clear_admin_password:
         db.save_admin_auth_config({"admin_password": ""})
@@ -403,7 +419,7 @@ def api_public_relogin_check(req: PublicReloginCheckReq):
         raise HTTPException(400, "请先导入账号")
     if len(accounts) > 500:
         raise HTTPException(400, "单次最多检查 500 个账号")
-    proxies = _public_relogin_proxy_pool(req.proxy_pool, cfg["proxy_pool"])
+    proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
     max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
     results: dict[str, dict] = {}
 
@@ -443,7 +459,7 @@ def api_public_relogin_relogin(req: PublicReloginReq):
         raise HTTPException(400, "请选择要重新登录的账号")
     if len(accounts) > 200:
         raise HTTPException(400, "单次最多重登 200 个账号")
-    proxies = _public_relogin_proxy_pool(req.proxy_pool, cfg["proxy_pool"])
+    proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
     max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
     results: dict[str, dict] = {}
 

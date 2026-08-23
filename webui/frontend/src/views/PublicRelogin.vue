@@ -2,8 +2,10 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { checkPublicRelogin, runPublicRelogin } from '@/api/publicRelogin'
+import { useProxyStore } from '@/stores/proxy'
 
 const fileInput = ref(null)
+const proxyStore = useProxyStore()
 const loading = ref(false)
 const checking = ref(false)
 const relogining = ref(false)
@@ -145,7 +147,7 @@ const doCheck = async () => {
     const snapshot = [...accounts.value]
     await runConcurrent(snapshot, 8, async (item) => {
       try {
-        const res = await checkPublicRelogin({ accounts: [item], concurrency: 1 })
+        const res = await checkPublicRelogin({ accounts: [item], concurrency: 1, proxy_pool: proxyStore.text })
         const result = res.results?.[item.id] || Object.values(res.results || {})[0]
         applyCheckResult(item, result)
       } catch (e) {
@@ -187,7 +189,7 @@ const doRelogin = async (onlyRevived = true) => {
     // 每个账号单独请求，完成一个就立即刷新该行；前端并发数仍保持为 4。
     await runConcurrent(list, 4, async (item) => {
       try {
-        const res = await runPublicRelogin({ accounts: [item], concurrency: 1 })
+        const res = await runPublicRelogin({ accounts: [item], concurrency: 1, proxy_pool: proxyStore.text })
         const result = res.results?.[item.id] || Object.values(res.results || {})[0]
         if (!result) {
           throw new Error('服务器未返回重登录结果')
@@ -315,6 +317,10 @@ const download = (mode) => {
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+      </div>
+
+      <div class="hint" style="margin-top: 8px">
+        当前会随请求复用系统代理池：{{ proxyStore.count }} 条；单账号代理不为空时优先使用单账号代理。
       </div>
 
       <el-alert

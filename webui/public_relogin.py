@@ -265,6 +265,7 @@ def get_effective_config() -> dict:
         "enabled": str(cfg.get("enabled") or "0") in ("1", "true", "yes", "on"),
         "workspace_whitelist": cfg.get("workspace_whitelist") or "",
         "proxy_pool": cfg.get("proxy_pool") or "",
+        "use_system_proxy_pool": str(cfg.get("use_system_proxy_pool") or "1").lower() in {"1", "true", "yes", "on"},
         "concurrency": max(1, min(20, int(cfg.get("concurrency") or 3))),
         "retry_count": max(0, min(5, int(cfg.get("retry_count") or 2))),
         "quota_timeout": max(5, min(120, int(cfg.get("quota_timeout") or 30))),
