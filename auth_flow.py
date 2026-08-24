@@ -215,6 +215,19 @@ class AuthFlow:
         self._existing_email_verification_mode = ""
         self._existing_page_type = ""
         self._credential_completion_requested = False
+        # ``/api/accounts/user/register`` may return a continuation URL.  Keep
+        # it on the flow so password creation can be performed inside the
+        # verified authorization step (before the ChatGPT callback is
+        # consumed), while callers that only need a boolean remain compatible.
+        self._last_password_continue_url = ""
+        # Passwordless existing-account completion must establish the same
+        # ``create-account/password`` authorization step as a normal signup
+        # before POSTing ``user/register``.  Keep this per-flow so a retry does
+        # not accidentally reuse a stale page/state, while a direct helper call
+        # can still perform the setup itself.
+        self._password_creation_step_opened = False
+        self._password_creation_continue_url = ""
+        self._password_created_during_login = False
         self._manual_login_verifier = (os.getenv("LOGIN_VERIFIER", "") or "").strip()
         self._captured_login_verifier = ""
         self._oauth_client_secret = (os.getenv("OAUTH_CLIENT_SECRET", "") or "").strip()
@@ -2125,6 +2138,10 @@ class AuthFlow:
     def set_password_via_camoufox(self, password: str, *, email: str = "") -> bool:
         """在当前已验证的登录态中补设账号密码。
 
+        .. deprecated::
+           仅保留给旧的外部调用者。WebUI 的 passwordless 凭证补齐绝不调用
+           该 reset-password 页面，而是使用 ``user/register`` 协议接口。
+
         passwordless 账号完成邮箱 OTP 登录后，OpenAI 的
         ``/reset-password/new-password`` 页面允许直接设置新密码，不需要旧密码。
         该页面是 Auth0/NextAuth 的浏览器页面，协议 HTTP 会话本身没有稳定的公开
@@ -2443,13 +2460,24 @@ class AuthFlow:
                         )
                     # 有些版本用 200/202 返回业务失败，而不是 HTTP 4xx；
                     # 这种响应不能被当成密码已设置。
+                    # The reset form can itself be returned with HTTP 200 and
+                    # contains the instructional text "Your password must
+                    # contain ...".  That is not a failed submission (and is
+                    # present even when the entered password is valid), so do
+                    # not classify generic form labels as business errors.
+                    form_still_visible = (
+                        "new password" in body_lower
+                        and "re-enter new password" in body_lower
+                    )
                     if (
                         response_error
+                        or form_still_visible
                         or any(
                             marker in body_lower
                             for marker in (
                                 "invalid or expired", "unable to reset",
                                 "password does not meet", "password reset failed",
+                                "error resetting", "failed to create account",
                             )
                         )
                     ):
@@ -2500,14 +2528,49 @@ class AuthFlow:
                 ):
                     submitted = True
                     break
-                if any(
-                    marker in body_lower
-                    for marker in (
-                        "invalid or expired", "link has expired", "unable to reset",
-                        "something went wrong", "error resetting", "failed to create account",
-                        "please try again", "must contain", "at least 12", "invalid password",
-                        "password does not meet", "密码重置失败", "密码格式不符合",
-                    )
+                # The password form always displays its policy checklist (for
+                # example, "At least 12 characters"), including after a valid
+                # value is entered.  Only treat unambiguous failure messages
+                # as rejection; validation-specific text is handled below via
+                # explicit alert/error nodes so the static checklist is not a
+                # false positive.
+                explicit_error_text = ""
+                for selector in (
+                    "[role='alert']",
+                    "[aria-live='assertive']",
+                    "[data-testid*='error' i]",
+                    "[class*='error' i]",
+                    "[class*='invalid' i]",
+                ):
+                    try:
+                        loc = page.locator(selector)
+                        count = min(int(loc.count()), 5)
+                        for idx in range(max(0, count)):
+                            item = loc.nth(idx)
+                            if _visible(item):
+                                try:
+                                    explicit_error_text += " " + str(
+                                        item.inner_text(timeout=300) or ""
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        continue
+                explicit_error_lower = explicit_error_text.lower()
+                body_failure_markers = (
+                    "invalid or expired", "link has expired", "unable to reset",
+                    "something went wrong", "error resetting", "failed to create account",
+                    "password reset failed", "密码重置失败", "密码格式不符合",
+                )
+                explicit_validation_markers = (
+                    "must contain", "at least 12", "invalid password",
+                    "password does not meet", "passwords do not match",
+                    "password confirmation", "密码不符合", "两次密码",
+                )
+                if (
+                    any(marker in body_lower for marker in body_failure_markers)
+                    or any(marker in explicit_error_lower for marker in body_failure_markers)
+                    or any(marker in explicit_error_lower for marker in explicit_validation_markers)
                 ):
                     raise RuntimeError(f"补设密码被页面拒绝: {body[:180]}")
                 # 提交后通常会跳到 success 或登录页；只有这些已知的后续页面
@@ -3471,22 +3534,144 @@ class AuthFlow:
             logger.info("注册邮箱已提交")
             return True
 
-    # ── Step 6.5: 注册密码 ──
-    def register_password(self, email: str) -> bool:
-        logger.info("[5.5/10] 注册密码...")
-        password = self._random_password()
-        self.result.password = password
+    def _open_password_creation_step(self, continue_url: str = "") -> str:
+        """建立 ``username_password_create`` 状态并返回最终页面 URL。
 
-        # 先访问 create-account/password 页面（HAR 确认需要此步建立服务端状态）
+        ``/api/accounts/user/register`` 是注册密码接口，不是一个独立的
+        reset-password API。OpenAI 先通过 ``GET /create-account/password``
+        建立服务端授权步骤；如果跳过这一步，passwordless 老账号通常会
+        得到 ``invalid_auth_step``，或者浏览器被重定向到 reset-password。
+
+        邮箱 OTP 校验后的 continuation 有时是 callback，有时已经是
+        ``/create-account/password``。callback 不能在这里被 GET 消费，所以
+        只跟随密码创建页面自己的重定向，并对 callback 明确停止。
+        """
+        raw = str(
+            continue_url
+            or getattr(self, "_password_creation_continue_url", "")
+            or ""
+        ).strip()
         try:
-            pw_page = self.session.get(
-                "https://auth.openai.com/create-account/password",
-                headers=self._common_headers("https://auth.openai.com/create-account"),
-                timeout=15,
+            normalized = self._normalize_continue_url(raw) if raw else ""
+        except Exception:
+            normalized = raw
+        if not normalized or "/create-account/password" not in normalized.lower():
+            normalized = "https://auth.openai.com/create-account/password"
+
+        # A successful GET is enough to establish the server-side step.  Do not
+        # repeat it in the same flow unless a caller explicitly starts a new
+        # AuthFlow instance (which resets this flag).
+        if getattr(self, "_password_creation_step_opened", False):
+            return normalized
+
+        current = normalized
+        last_status = 0
+        for hop in range(4):
+            try:
+                response = self.session.get(
+                    current,
+                    headers=self._common_headers(
+                        "https://auth.openai.com/create-account"
+                    ),
+                    timeout=15,
+                    allow_redirects=False,
+                )
+            except TypeError:
+                # A few lightweight test doubles (and older curl wrappers) do
+                # not expose ``allow_redirects``.  Retain the same safety rule
+                # by retrying without it.
+                response = self.session.get(
+                    current,
+                    headers=self._common_headers(
+                        "https://auth.openai.com/create-account"
+                    ),
+                    timeout=15,
+                )
+            self._trace_http("password_creation_step", response)
+            last_status = int(getattr(response, "status_code", 0) or 0)
+            headers = getattr(response, "headers", {}) or {}
+            location = str(
+                headers.get("Location", "") or headers.get("location", "") or ""
+            ).strip()
+            body = str(getattr(response, "text", "") or "")[:500]
+            response_url = str(getattr(response, "url", "") or current)
+            response_url_lower = response_url.lower()
+            body_lower = body.lower()
+
+            # Reaching the reset-password page means the current auth state was
+            # not the signup/password-creation state.  Never silently continue
+            # into that page: the caller explicitly requested user/register.
+            if "reset-password" in response_url_lower or "reset your password" in body_lower:
+                raise RuntimeError(
+                    "密码创建步骤被重定向到 reset-password；"
+                    "当前授权状态未建立 username_password_create"
+                )
+
+            if location:
+                next_url = urljoin(current, location)
+                next_lower = next_url.lower()
+                # The callback code is one-time and belongs to NextAuth.  It is
+                # returned to the outer flow untouched instead of being spent
+                # while opening the password page.
+                if "/api/auth/callback/openai" in next_lower and "code=" in next_lower:
+                    logger.debug(
+                        "密码创建页面返回 callback，保持未消费: %s",
+                        next_url[:180],
+                    )
+                    break
+                if "reset-password" in next_lower:
+                    raise RuntimeError(
+                        "密码创建步骤被重定向到 reset-password；"
+                        "当前授权状态未建立 username_password_create"
+                    )
+                if next_url == current:
+                    break
+                current = next_url
+                continue
+            break
+
+        if last_status and not (200 <= last_status < 400):
+            logger.warning(
+                "打开 create-account/password 返回 HTTP %s，仍尝试 user/register",
+                last_status,
             )
-            logger.info(f"create-account/password 页面: {pw_page.status_code}")
-        except Exception as e:
-            logger.warning(f"访问 create-account/password 页面失败: {e}")
+        self._password_creation_step_opened = True
+        logger.info(
+            "密码创建步骤已建立（create-account/password），准备调用 user/register"
+        )
+        return current
+
+    # ── Step 6.5: 注册密码 ──
+    def register_password(
+        self,
+        email: str,
+        password: str = "",
+        *,
+        existing_account: bool = False,
+    ) -> bool:
+        """通过 auth.openai.com 的协议接口创建账号密码。
+
+        新注册和已经通过邮箱 OTP 验证的 passwordless 账号都使用同一个
+        ``/api/accounts/user/register`` 接口。后者不是“重置密码”：账号原本
+        没有密码，所以必须在当前授权状态里走这个创建接口。
+
+        ``password`` 为空时保持原有注册行为，自动生成随机密码；已有账号的
+        凭证补齐分支会显式传入待创建的密码。只有接口明确返回成功后才写入
+        ``result.password`` 和 ``on_password`` 回调，避免把失败请求的密码误存。
+        """
+        logger.info(
+            "%s...",
+            "[login] 创建已有 passwordless 账号密码" if existing_account else "[5.5/10] 注册密码",
+        )
+        password = str(password or "").strip() or self._random_password()
+        self._last_password_continue_url = ""
+
+        # 新注册和 passwordless 老账号都必须先建立同一个注册密码步骤。
+        # 过去已有账号分支跳过这一步，随后又打开 reset-password 页面，正是
+        # 用户看到“Reset your password”错误的根因。
+        password_step_url = self._open_password_creation_step(
+            getattr(self, "_password_creation_continue_url", "")
+        )
 
         # 注册前需要刷新 sentinel token，且 flow 必须为 username_password_create
         #
@@ -3518,7 +3703,9 @@ class AuthFlow:
                     f"注册前刷新 sentinel 失败，将改用 flow 不匹配的现有 sentinel token 提交: {e}"
                 )
 
-        headers = self._common_headers("https://auth.openai.com/create-account/password")
+        headers = self._common_headers(
+            password_step_url or "https://auth.openai.com/create-account/password"
+        )
         headers["Content-Type"] = "application/json"
         if self._last_sentinel_token:
             headers["openai-sentinel-token"] = self._last_sentinel_token
@@ -3533,10 +3720,104 @@ class AuthFlow:
             timeout=30,
         )
         self._trace_http("register_password", resp)
-        if resp.status_code != 200:
-            logger.warning(f"密码注册返回 {resp.status_code}: {resp.text[:200]}")
+        status = int(getattr(resp, "status_code", 0) or 0)
+        body = (getattr(resp, "text", "") or "")[:360]
+        payload = {}
+        try:
+            parsed = resp.json() if resp is not None else {}
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+        payload_code = str(
+            payload.get("code")
+            or payload.get("error_code")
+            or payload.get("errorCode")
+            or ""
+        ).strip().lower()
+        body_lower = body.lower()
+        # auth.openai 偶尔会用 HTTP 200 返回一段错误 HTML/纯文本，而不是
+        # JSON 4xx。不能因为 status=200 就把密码写入本地；这些是明确的
+        # password-creation 失败文案（尤其是旧 reset-password 页面）。
+        body_business_error = any(
+            marker in body_lower
+            for marker in (
+                "invalid auth step",
+                "invalid authorization step",
+                "invalid_auth_step",
+                "invalid state",
+                "invalid_state",
+                "failed to create account",
+                "already has password",
+                "password creation failed",
+                "reset your password",
+                "unable to reset",
+                "too many requests",
+            )
+        )
+        business_error = (
+            bool(payload.get("error"))
+            or payload.get("success") is False
+            or payload_code in {
+                "invalid_auth_step",
+                "invalid_authorization_step",
+                "invalid_state",
+            }
+            or body_business_error
+        )
+        if not (200 <= status < 300) or business_error:
+            # The server may have consumed/rejected the authorization step;
+            # allow a caller that deliberately retries to reopen the page and
+            # establish a fresh ``username_password_create`` state.
+            self._password_creation_step_opened = False
+            logger.warning(
+                "密码创建接口 user/register 返回 status=%s existing=%s body=%s",
+                status,
+                existing_account,
+                body,
+            )
             return False
-        logger.info("密码注册成功")
+        # The registration endpoint can move the auth state to another step
+        # (for example a fresh email-OTP step).  Do not discard that URL: the
+        # passwordless existing-account path must continue from the response,
+        # not from a reset-password page or an already-consumed callback.
+        nested_payload = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        response_page = payload.get("page") if isinstance(payload.get("page"), dict) else {}
+        response_page_payload = (
+            response_page.get("payload")
+            if isinstance(response_page.get("payload"), dict)
+            else {}
+        )
+        raw_password_continue = ""
+        for candidate in (
+            payload.get("continue_url"),
+            payload.get("continueUrl"),
+            payload.get("next_url"),
+            payload.get("nextUrl"),
+            payload.get("url"),
+            nested_payload.get("continue_url"),
+            nested_payload.get("continueUrl"),
+            nested_payload.get("next_url"),
+            nested_payload.get("nextUrl"),
+            nested_payload.get("url"),
+            response_page_payload.get("continue_url"),
+            response_page_payload.get("continueUrl"),
+            response_page_payload.get("url"),
+        ):
+            if str(candidate or "").strip():
+                raw_password_continue = str(candidate).strip()
+                break
+        try:
+            self._last_password_continue_url = self._normalize_continue_url(
+                raw_password_continue
+            )
+        except Exception:
+            # Small standalone callers/tests may construct AuthFlow without the
+            # full URL/workspace helpers.  The raw server URL is still useful
+            # and must not turn a successful password creation into a failure.
+            self._last_password_continue_url = raw_password_continue
+        self.result.password = password
+        logger.info("密码创建成功%s", "（已有 passwordless 账号）" if existing_account else "")
         # ⚠️ 走到这里 = OpenAI 侧账号连同这个密码**已经建好了**，但注册流程后面还有
         #    发码 → 验证 OTP → create_account 三步，任何一步挂掉都到不了 save_registered。
         #    密码是这个方法现生成的、只活在内存里，进程一退就永久没了 ——
@@ -3550,6 +3831,115 @@ class AuthFlow:
             except Exception as e:
                 logger.warning(f"密码落盘回调失败（不影响注册，日志里还有兜底）: {e}")
         return True
+
+    def create_password_via_api(self, email: str, password: str) -> bool:
+        """为已完成邮箱 OTP 验证的 passwordless 账号创建密码。
+
+        这是 ``register_password`` 的语义化入口，明确保证调用的是账号密码
+        创建接口，而不是 reset-password 浏览器页面。
+        """
+        return self.register_password(
+            email,
+            password=password,
+            existing_account=True,
+        )
+
+    def _create_password_after_otp(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str,
+        continue_url: str,
+        otp_timeout: int,
+    ) -> str:
+        """在已验证的授权步骤中创建 passwordless 账号密码。
+
+        这一步必须位于邮箱 OTP（以及必要的 MFA/手机验证）之后、
+        ``follow_redirect_chain``/NextAuth callback 之前。callback 一旦被消费，
+        服务端会把流程切成普通登录态，再调用 ``user/register`` 就会落入
+        reset-password 或 ``invalid_auth_step`` 分支。
+
+        ``user/register`` 在部分版本会返回新的 email-OTP 继续地址。按照新注册
+        链的处理方式主动发一封新码并验证，避免继续使用已失效的旧码。
+        """
+        password = str(password or "").strip()
+        if not password:
+            return continue_url
+
+        logger.info(
+            "[login] 邮箱 OTP 已验证，调用 user/register 创建密码 email=%s",
+            email,
+        )
+        try:
+            original_url = self._normalize_continue_url(continue_url or "")
+        except Exception:
+            original_url = str(continue_url or "").strip()
+        # Pass the OTP continuation through flow-local state.  The helper will
+        # choose the canonical create-account/password page when this value is
+        # a callback, and will never GET the one-time callback itself.
+        self._password_creation_continue_url = original_url
+        try:
+            created = self.create_password_via_api(email, password)
+        except Exception as exc:
+            raise RuntimeError(
+                f"已有账号密码创建接口异常 ({str(exc)[:240]})"
+            ) from exc
+        finally:
+            self._password_creation_continue_url = ""
+        if not created:
+            raise RuntimeError(
+                "已有账号密码创建接口返回失败，未修改本地密码"
+            )
+
+        self._password_created_during_login = True
+        try:
+            next_url = self._normalize_continue_url(
+                getattr(self, "_last_password_continue_url", "") or ""
+            )
+        except Exception:
+            next_url = str(getattr(self, "_last_password_continue_url", "") or "").strip()
+        next_lower = next_url.lower()
+        # 新密码创建会让服务端回到 email-otp-send。旧验证码已失效，必须
+        # 重新发送/验证，之后才有资格跟随 callback。
+        needs_new_otp = (
+            "/email-otp/send" in next_lower
+            or "/email-verification" in next_lower
+        )
+        if needs_new_otp:
+            otp_sent_at = time.time()
+            try:
+                self.send_otp(
+                    referer="https://auth.openai.com/create-account/password"
+                )
+            except Exception as send_exc:
+                logger.warning(
+                    "密码创建后主动发 OTP 失败，尝试现有 challenge 重发: %s",
+                    send_exc,
+                )
+                otp_sent_at = time.time()
+                if not self.kickoff_otp_delivery("post_register_password_existing"):
+                    raise RuntimeError(
+                        f"密码创建后重新发送 OTP 失败 ({str(send_exc)[:180]})"
+                    ) from send_exc
+            otp_code = mail_provider.wait_for_otp(
+                email,
+                timeout=otp_timeout,
+                issued_after=otp_sent_at,
+            )
+            otp_resp = self.verify_otp(otp_code)
+            self.fetch_client_auth_session_dump("post_register_password_existing")
+            verified_next = self._extract_continue_url_from_step(otp_resp)
+            # The password-registration response's email-OTP URL is only a
+            # delivery step, not a redirect target.  If validation returns no
+            # continuation, let the caller re-authorize rather than trying to
+            # GET ``/api/accounts/email-otp/send`` as a browser page.
+            next_url = self._normalize_continue_url(verified_next) if verified_next else ""
+
+        # An empty response cannot safely reuse the pre-registration callback:
+        # user/register may have advanced or invalidated that one-time code.
+        # Let run_protocol_login re-authorize from the now-passworded account.
+        # Never substitute reset-password here.
+        return next_url
 
     # ── Step 7: 发送 OTP ──
     def send_otp(self, referer: str = "https://auth.openai.com/create-account/password"):
@@ -4048,6 +4438,13 @@ class AuthFlow:
         """手动跟踪重定向，返回 (callback_url, final_url)"""
         logger.info("[9/10] 跟踪重定向链...")
         current_url = start_url
+        # OTP validation and user/register can return the callback directly.
+        # It is intentionally returned untouched so the caller can consume it
+        # exactly once via ``_consume_callback_for_session``.  GETting it here
+        # would spend the one-time code before NextAuth receives it.
+        if "/api/auth/callback/openai" in current_url and "code=" in current_url:
+            logger.info("重定向链起点就是 callback，保持未消费状态")
+            return current_url, current_url
         callback_url = ""
         max_hops = 12
         referer = "https://auth.openai.com/"
@@ -4503,12 +4900,18 @@ class AuthFlow:
         mail_provider: MailProvider,
         *,
         ensure_credentials: bool = False,
+        password_to_create: str = "",
     ) -> AuthResult:
         """执行完整注册流程。
 
         ``ensure_credentials`` 只影响“服务端发现邮箱已存在”的分支：开启
         后允许 registrar 把它转成已有账号登录，再补齐缺失密码/2FA；新邮箱
         仍完全走原注册链。关闭时保留 provider 原有的已有账号策略。
+
+        ``password_to_create`` 由 WebUI 在确认本地没有 OpenAI 密码时传入。
+        它只会在“已有账号”分支传给 ``run_protocol_login``，让密码创建请求
+        发生在邮箱 OTP 验证后、callback 消费前；新账号仍使用本方法内部的
+        ``register_password``。
         """
         self._credential_completion_requested = bool(ensure_credentials)
         # 检查网络
@@ -4603,12 +5006,29 @@ class AuthFlow:
                     f"邮箱 {email} 已被 OpenAI 识别为已有账号，无法创建新密码；"
                     "请开启已有账号凭证补齐后重试"
                 )
+            # ``run_register`` is also used outside the WebUI.  Do not require
+            # those callers to know about the WebUI's candidate-password
+            # preparation step: when credential completion is enabled and the
+            # local record has no OpenAI password, generate one here and pass it
+            # into the OTP-authorized protocol login.
+            if (
+                self._credential_completion_requested
+                and not known_password
+                and not str(password_to_create or "").strip()
+            ):
+                password_to_create = self._random_password()
+                logger.info(
+                    "已有账号缺少本地密码，已生成候选密码并将在 OTP 授权态创建"
+                )
             logger.info(
                 "[%s] 检测到已有账号，切换到协议登录/凭证补齐流程 (%s)",
                 pool_tag,
                 email,
             )
-            return self.run_protocol_login(mail_provider, email)
+            login_kwargs = {}
+            if str(password_to_create or "").strip():
+                login_kwargs["create_password"] = str(password_to_create).strip()
+            return self.run_protocol_login(mail_provider, email, **login_kwargs)
 
         # ⚠️ passwordless_signup **也是新账号**，只是服务端选择了"不设密码直接发码"的注册流程。
         #    signup() 用一个 bool 表达三种服务端状态，把它和"已有账号"压成了同一个 False，
@@ -4947,17 +5367,32 @@ class AuthFlow:
         password: str = "",
         *,
         prefer_email_otp: bool = False,
+        create_password: str = "",
     ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
         - 适配 passwordless / login_password 两类已有账号入口
         - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
-        - ``prefer_email_otp`` 用于补设密码分支：即使调用方通过环境回调提供了
-          候选密码，也先用邮箱 OTP 建立已验证会话，再进入 reset-password 页面；
-          仅补 2FA 且已有密码的账号仍优先走密码登录，不会重复改密码。
+        - ``prefer_email_otp`` / ``create_password`` 用于密码创建分支：即使
+          调用方有候选密码，也先用邮箱 OTP 建立已验证会话，再在 callback
+          消费前调用 ``/api/accounts/user/register``；仅补 2FA 且已有密码的
+          账号仍优先走密码登录，不会重复改密码。
         """
         if not (email or "").strip():
             raise RuntimeError("run_protocol_login 缺少邮箱")
+
+        create_password = str(create_password or "").strip()
+        # A caller may reuse an AuthFlow instance after a failed attempt.  Do
+        # not let a previous successful password creation satisfy the WebUI's
+        # completion check for the next attempt.
+        if create_password:
+            self._password_created_during_login = False
+            self._password_creation_step_opened = False
+            self._last_password_continue_url = ""
+        if create_password:
+            # 创建密码只能建立在 passwordless OTP 授权态上。即使调用方忘记
+            # 设置 prefer_email_otp，也不能拿一个已知/猜测的旧密码走密码页。
+            prefer_email_otp = True
 
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试登录链路以获取精确错误...")
@@ -4998,6 +5433,7 @@ class AuthFlow:
         sentinel = self.get_sentinel_token(device_id)
 
         continue_url = ""
+        otp_verified = False
         try:
             otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "60")))
         except Exception:
@@ -5143,6 +5579,7 @@ class AuthFlow:
             )
             try:
                 otp_resp = self.verify_otp(otp_code)
+                otp_verified = True
                 self.fetch_client_auth_session_dump("post_verify_otp_protocol")
             except RuntimeError as e:
                 if any(code in str(e) for code in ("401", "409")):
@@ -5156,6 +5593,7 @@ class AuthFlow:
                         issued_after=otp_sent_at,
                     )
                     otp_resp = self.verify_otp(otp_code)
+                    otp_verified = True
                     self.fetch_client_auth_session_dump("post_verify_otp_retry_protocol")
                 else:
                     raise
@@ -5196,6 +5634,22 @@ class AuthFlow:
                     )
                 )
 
+
+        if create_password:
+            if not otp_verified:
+                raise RuntimeError(
+                    "已有账号密码创建失败：未完成邮箱 OTP 验证，拒绝离开授权步骤创建密码"
+                )
+            # 这里仍处于 auth.openai.com 的 OTP 授权步骤；不要先跟随
+            # callback，否则 user/register 会被错误地当成 reset-password。
+            continue_url = self._create_password_after_otp(
+                mail_provider=mail_provider,
+                email=email,
+                password=create_password,
+                continue_url=continue_url,
+                otp_timeout=otp_timeout,
+            )
+
         continue_url = self._normalize_continue_url(continue_url)
         # 某些边缘态 OTP 后未返回 callback，回退 reauthorize
         if not continue_url:
@@ -5216,6 +5670,19 @@ class AuthFlow:
                 normalized = self._normalize_continue_url(final_url)
                 if normalized and normalized != final_url:
                     callback_url, final_url = self.follow_redirect_chain(normalized)
+
+        # ``follow_redirect_chain`` deliberately stops at the ChatGPT callback
+        # URL without requesting it, so that an OAuth code is not consumed by
+        # the HTTP client before the caller has a chance to use it.  The
+        # protocol-login path used to go straight to ``/api/auth/session``
+        # here.  That endpoint cannot create a NextAuth session from an
+        # unconsumed callback, which left both ``session_token`` and
+        # ``access_token`` empty even though OTP verification and the callback
+        # redirect had succeeded.  Consume the callback first, just like the
+        # normal registration path, then ask NextAuth for the session.
+        if (not refresh_only_mode) and callback_url:
+            logger.debug("消费 callback 触发 NextAuth Set-Cookie (session-token)")
+            self._consume_callback_for_session(callback_url)
 
         if not refresh_only_mode:
             self.get_auth_session()

@@ -48,10 +48,28 @@ class ExistingRegistrationBranchTests(unittest.TestCase):
 
         result = flow.run_register(provider, ensure_credentials=True)
 
-        flow.run_protocol_login.assert_called_once_with(
-            provider, "existing@example.com",
-        )
+        flow.run_protocol_login.assert_called_once()
+        call = flow.run_protocol_login.call_args
+        self.assertEqual(call.args[:2], (provider, "existing@example.com"))
+        self.assertTrue(call.kwargs.get("create_password"))
         self.assertEqual(result.access_token, "at")
+
+    def test_existing_registration_passes_password_candidate_to_protocol_login(self):
+        flow = self._flow()
+        provider = SimpleNamespace(
+            pooled=True,
+            requires_password=True,
+            kind="icloud_relay",
+            create_mailbox=Mock(return_value="existing@example.com"),
+        )
+
+        flow.run_register(provider, ensure_credentials=True, password_to_create="New!Password123")
+
+        flow.run_protocol_login.assert_called_once_with(
+            provider,
+            "existing@example.com",
+            create_password="New!Password123",
+        )
 
     def test_passwordless_signup_still_uses_registration_path(self):
         flow = self._flow(mode="passwordless_signup")

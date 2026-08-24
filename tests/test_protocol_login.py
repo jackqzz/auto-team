@@ -47,6 +47,7 @@ def _flow(password="", totp_secret=""):
     flow.submit_mfa_totp = Mock(return_value=_step("external_url", CALLBACK_URL))
     flow.fetch_client_auth_session_dump = Mock()
     flow.follow_redirect_chain = Mock(return_value=(CALLBACK_URL, CALLBACK_URL))
+    flow._consume_callback_for_session = Mock(return_value=True)
     flow.oauth_token_exchange = Mock(return_value=False)
     flow.oauth_codex_rt_exchange = Mock(return_value=False)
     flow.oauth_secondary_authorize_exchange = Mock(return_value=False)
@@ -64,6 +65,157 @@ def _flow(password="", totp_secret=""):
 
 
 class ProtocolLoginTests(unittest.TestCase):
+    def test_protocol_login_consumes_callback_before_fetching_session(self):
+        flow = _flow()
+        flow._resolve_login_password = Mock(return_value=("guessed-password", False))
+
+        def passwordless_signup(_email, _sentinel):
+            flow._is_existing_account = True
+            flow._existing_page_type = "email_otp_verification"
+            flow._existing_email_verification_mode = "passwordless_login"
+            return False
+
+        flow.signup = Mock(side_effect=passwordless_signup)
+        flow.verify_otp = Mock(return_value=_step("external_url", CALLBACK_URL))
+        provider = SimpleNamespace(wait_for_otp=Mock(return_value="890681"))
+
+        flow.run_protocol_login(provider, EMAIL)
+
+        flow._consume_callback_for_session.assert_called_once_with(CALLBACK_URL)
+
+    def test_password_creation_runs_after_otp_before_callback(self):
+        """补密码必须走 user/register，且发生在 callback/session 之前。"""
+        flow = _flow()
+        flow._resolve_login_password = Mock(return_value=("guessed-password", False))
+
+        def passwordless_signup(_email, _sentinel):
+            flow._is_existing_account = True
+            flow._existing_page_type = "email_otp_verification"
+            flow._existing_email_verification_mode = "passwordless_login"
+            return False
+
+        flow.signup = Mock(side_effect=passwordless_signup)
+        flow.verify_otp = Mock(return_value=_step("external_url", CALLBACK_URL))
+
+        order = []
+
+        def create_password(_email, password):
+            order.append("create_password")
+            flow.result.password = password
+            flow._password_created_during_login = True
+            flow._last_password_continue_url = CALLBACK_URL
+            return True
+
+        flow.create_password_via_api = Mock(side_effect=create_password)
+        flow.follow_redirect_chain = Mock(
+            side_effect=lambda url: (order.append("follow"), (CALLBACK_URL, CALLBACK_URL))[1]
+        )
+        provider = SimpleNamespace(wait_for_otp=Mock(return_value="890681"))
+
+        result = flow.run_protocol_login(
+            provider,
+            EMAIL,
+            create_password="Created!Password123",
+        )
+
+        self.assertEqual(result.password, "Created!Password123")
+        flow.create_password_via_api.assert_called_once_with(
+            EMAIL,
+            "Created!Password123",
+        )
+        self.assertEqual(order, ["create_password", "follow"])
+
+    def test_password_step_is_opened_before_user_register(self):
+        flow = _flow()
+        password_step = "https://auth.openai.com/create-account/password"
+        flow.session = SimpleNamespace(get=Mock())
+        flow._trace_http = Mock()
+        flow._common_headers = Mock(return_value={})
+        flow._last_password_continue_url = ""
+        sequence = []
+
+        def open_step(*args, **kwargs):
+            sequence.append("open_step")
+            return SimpleNamespace(status_code=200, headers={}, text="")
+
+        flow.session.get.side_effect = open_step
+        flow.create_password_via_api = Mock(
+            side_effect=lambda email, password: sequence.append("register") or True
+        )
+        flow._last_password_continue_url = ""
+        flow._normalize_continue_url = lambda url: url or ""
+        flow._create_password_after_otp(
+            provider := SimpleNamespace(),
+            EMAIL,
+            "Created!Password123",
+            password_step,
+            60,
+        )
+
+        # The API helper owns opening the password step.  This test uses a
+        # mocked helper, so only its registration call is observable here.
+        self.assertEqual(sequence, ["register"])
+
+    def test_real_password_creation_keeps_callback_unconsumed(self):
+        """OTP callback must not be GETed; registration page precedes POST API."""
+        flow = _flow()
+        flow.result.device_id = ""
+        flow.session = SimpleNamespace()
+        sequence = []
+
+        class _Response:
+            status_code = 200
+            text = ""
+            headers = {}
+
+            def __init__(self, payload=None):
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        def get(url, **kwargs):
+            sequence.append(("get", url))
+            return _Response()
+
+        def post(url, **kwargs):
+            sequence.append(("post", url))
+            return _Response({"continue_url": CALLBACK_URL})
+
+        flow.session.get = Mock(side_effect=get)
+        flow.session.post = Mock(side_effect=post)
+        flow._common_headers = Mock(return_value={})
+        flow._trace_http = Mock()
+        flow._normalize_continue_url = lambda url: url or ""
+        flow._password_creation_continue_url = CALLBACK_URL
+        flow._password_creation_step_opened = False
+        flow._last_sentinel_token = ""
+        flow._last_sentinel_so_token = ""
+        flow._on_password = Mock()
+
+        next_url = flow._create_password_after_otp(
+            SimpleNamespace(),
+            EMAIL,
+            "Created!Password123",
+            CALLBACK_URL,
+            60,
+        )
+
+        self.assertEqual(next_url, CALLBACK_URL)
+        self.assertEqual(sequence[0], ("get", "https://auth.openai.com/create-account/password"))
+        self.assertEqual(sequence[1], ("post", "https://auth.openai.com/api/accounts/user/register"))
+        self.assertNotIn(CALLBACK_URL, [url for kind, url in sequence if kind == "get"])
+
+    def test_callback_start_is_not_requested_by_redirect_walker(self):
+        flow = _flow()
+        flow.session = SimpleNamespace(get=Mock())
+
+        callback, final = flow.follow_redirect_chain(CALLBACK_URL)
+
+        self.assertEqual(callback, CALLBACK_URL)
+        self.assertEqual(final, CALLBACK_URL)
+        flow.session.get.assert_not_called()
+
     def test_passwordless_login_uses_email_otp_then_totp(self):
         flow = _flow(totp_secret=TOTP_SECRET)
         flow._resolve_login_password = Mock(return_value=("guessed-password", False))
