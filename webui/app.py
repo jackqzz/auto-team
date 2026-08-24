@@ -1529,6 +1529,9 @@ class RegisterReq(BaseModel):
     otp_timeout: int = 10
     add_phone_mode: str = Field("api", description="add-phone 验证模式：api / camoufox")
     allow_existing_login: bool = True
+    # 服务端识别邮箱已存在时，是否切换到登录并补齐缺失密码/2FA；留空时
+    # 跟随 want_password / want_2fa 两个页面开关推导。
+    ensure_credentials: Optional[bool] = None
     # 注册成功后自动绑定 TOTP 2FA。前端两个页面都**默认开**（主人要求每个号都绑）。
     # 这里的 default 保持 False —— 它只在「调用方没传这个字段」时生效，是给旧前端
     # 缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不替调用方做一个不可逆的决定。
@@ -2681,6 +2684,13 @@ def api_register(req: RegisterReq):
         "add_phone_mode": req.add_phone_mode,
         "allow_existing_login": req.allow_existing_login,
         "want_2fa": req.want_2fa,
+        # 普通注册若服务端把邮箱识别为已有账号，就按两个页面开关只补齐
+        # 缺失项；新账号不会进入该后处理分支。
+        "ensure_credentials": (
+            bool(req.ensure_credentials)
+            if req.ensure_credentials is not None
+            else bool(req.want_password or req.want_2fa)
+        ),
     }
     run_id = registrar.start_registration(account, options)
     logger.info(f"[run] {run_id} -> {account['email']} (mail_source={mail_source})")
@@ -3451,7 +3461,8 @@ class AutoLoopStartReq(BaseModel):
     want_refresh_token: bool = True
     want_password: bool = True  # 通用 OTP 是否强制创建密码
     login_only: bool = False    # 仅投送当前分组已有注册结果，刷新登录凭证
-    ensure_credentials: bool = True  # 仅登录时补齐缺失的密码 / TOTP secret
+    # 仅登录时补齐缺失凭证；普通注册遇到已有邮箱时也复用该开关。
+    ensure_credentials: bool = True
     login_no_rt_only: bool = False  # 仅对无 RT 的注册结果执行
     login_emails: Optional[list[str]] = None  # 仅登录时限定指定账号（注册结果页重登录）
     workspace_id: str = ""  # 空间凭证获取时强制选择目标 Workspace

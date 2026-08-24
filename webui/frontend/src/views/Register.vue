@@ -139,7 +139,7 @@ async function copyField(email, field) {
                 <span>强制创建账号密码</span>
               </div>
               <div class="hint" style="margin-top: 6px">
-                开启时密码创建失败或邮箱已注册会直接报错；关闭后允许回退为仅 OTP 登录。
+                新邮箱开启时会强制创建长期密码；如果邮箱其实已经注册，流程会切换为已有账号登录，并按“2FA”开关补齐缺失项。关闭后不补设密码，但仍可按 2FA 开关执行绑定。
               </div>
             </el-form-item>
             <el-form-item>
@@ -151,7 +151,7 @@ async function copyField(email, field) {
                 默认开。绑定不可逆、即刻生效：<b>之后该号所有登录都需 6 位动态码</b>；
                 secret 仅在绑定时下发<b>一次</b>、服务端取不回，
                 请在下方结果或「注册结果」页<b>立刻复制导出</b>并录入验证器，丢失 = 该号 2FA 永久锁死。
-                仅对<b>有密码</b>的号生效，无密码号会自动跳过。
+                新号和已有账号都适用；已有账号缺密码时会先用邮箱 OTP 登录并补设密码，再绑定 2FA。
               </div>
             </el-form-item>
             <el-button type="primary" :loading="starting || runningSingle" @click="run">

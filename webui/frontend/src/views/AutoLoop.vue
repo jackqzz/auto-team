@@ -120,7 +120,7 @@ async function call(fn, name) {
           <span>仅登录</span>
         </div>
         <div class="hint" style="margin-top: 6px">
-          开启后只投送所选分组内已有注册结果的账号；优先使用密码和 2FA，服务端要求时再使用邮箱 OTP 和 2FA。
+          开启后投送所选分组内的注册结果；“补齐缺失的密码和 2FA”开关打开时，还会把仅有邮箱 OTP 接码凭证、尚未出现在注册结果里的外部账号送入补齐流程。优先使用已有密码和 2FA，缺失时再使用邮箱 OTP。
         </div>
       </el-form-item>
       <el-form-item v-if="form.autoLoginOnly" label="过滤条件">
@@ -132,13 +132,15 @@ async function call(fn, name) {
           开启后仅从注册结果里挑选 refresh_token 为空的账号执行，仅影响“仅登录”任务。
         </div>
       </el-form-item>
-      <el-form-item v-if="form.autoLoginOnly" label="凭证补齐">
+      <el-form-item label="凭证补齐">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
           <el-switch v-model="form.autoEnsureCredentials" />
-          <span>补齐缺失的密码和 2FA（TOTP）</span>
+          <span>{{ form.autoLoginOnly ? '补齐缺失的密码和 2FA（TOTP）' : '已有账号时补齐缺失的密码和 2FA（TOTP）' }}</span>
         </div>
         <div class="hint" style="margin-top: 6px; line-height: 1.5">
-          开启后仅对本地没有的项目操作：无密码账号先用邮箱 OTP 建立登录态；缺两项时先绑定 TOTP，再设置随机密码。已有密码或 2FA 不会重复修改。2FA secret 只下发一次，请及时备份。
+          {{ form.autoLoginOnly
+            ? '开启后仅对本地没有的项目操作：无密码账号先用邮箱 OTP 建立登录态；缺两项时先绑定 TOTP，再设置随机密码。已有密码或 2FA 不会重复修改。2FA secret 只下发一次，请及时备份。'
+            : '开启后普通注册遇到服务端已存在的邮箱会切换为登录流程，只补齐本地缺少的项目；新邮箱仍按正常注册执行。关闭后已有账号不会进入补齐。' }}
         </div>
       </el-form-item>
 
@@ -164,7 +166,7 @@ async function call(fn, name) {
             <el-option label="全部分组" value="__all__" />
             <el-option
               v-for="g in groups.filter((g) => g.name)" :key="g.name"
-              :label="`${g.name}（${form.autoLoginOnly ? `可登录 ${g.active_registered_total ?? g.registered_total}` : `可用 ${g.available}`}）`" :value="g.name"
+              :label="`${g.name}（${form.autoLoginOnly ? `可登录/补齐 ${(g.active_registered_total ?? g.registered_total) + (g.mailbox_only_total || 0)}` : `可用 ${g.available}`}）`" :value="g.name"
             />
           </el-select>
         </el-form-item>
@@ -208,7 +210,7 @@ async function call(fn, name) {
           <span>强制创建账号密码</span>
         </div>
         <div class="hint" style="margin-top: 6px">
-          开启时密码创建失败或邮箱已注册会跳过该任务；关闭后允许无密码 OTP 账号。
+          新邮箱开启时要求创建长期密码；若服务端发现邮箱已注册，会在“凭证补齐”开启时切换为已有账号登录并补设缺失密码。关闭后新号可保留为无密码 OTP 账号。
         </div>
       </el-form-item>
 

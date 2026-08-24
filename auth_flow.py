@@ -214,6 +214,7 @@ class AuthFlow:
         self._is_existing_account = False
         self._existing_email_verification_mode = ""
         self._existing_page_type = ""
+        self._credential_completion_requested = False
         self._manual_login_verifier = (os.getenv("LOGIN_VERIFIER", "") or "").strip()
         self._captured_login_verifier = ""
         self._oauth_client_secret = (os.getenv("OAUTH_CLIENT_SECRET", "") or "").strip()
@@ -4497,8 +4498,19 @@ class AuthFlow:
             return False
 
     # ── 完整注册流程 ──
-    def run_register(self, mail_provider: MailProvider) -> AuthResult:
-        """执行完整注册流程"""
+    def run_register(
+        self,
+        mail_provider: MailProvider,
+        *,
+        ensure_credentials: bool = False,
+    ) -> AuthResult:
+        """执行完整注册流程。
+
+        ``ensure_credentials`` 只影响“服务端发现邮箱已存在”的分支：开启
+        后允许 registrar 把它转成已有账号登录，再补齐缺失密码/2FA；新邮箱
+        仍完全走原注册链。关闭时保留 provider 原有的已有账号策略。
+        """
+        self._credential_completion_requested = bool(ensure_credentials)
         # 检查网络
         if not self.check_proxy():
             logger.warning("网络预检查未通过，继续尝试注册链路以获取精确错误...")
@@ -4531,11 +4543,20 @@ class AuthFlow:
         # ⚠️ 这个分支对**所有号池型 provider** 生效（outlook / icloud_relay / 以后新增的），
         #    不是 outlook 专属 —— 日志前缀用 provider 自己的 kind，别写死。
         pool_tag = getattr(mail_provider, "kind", "pool")
-        is_pooled_existing = not is_new and getattr(mail_provider, "pooled", False)
+        # ``signup`` 返回 False 既可能是“真正已有账号”，也可能是
+        # ``passwordless_signup``（服务端给新账号选择的无密码注册分支）。
+        # 后者仍应继续走注册密码流程，不能被号池已有账号的 fast-fail 误伤。
+        existing_login_required = (
+            not is_new
+            and self._existing_email_verification_mode != "passwordless_signup"
+        )
+        _allow_login = self._get_env("WEBUI_ALLOW_LOGIN", "").strip().lower() in (
+            "1", "true", "yes",
+        )
+        is_pooled_existing = existing_login_required and getattr(
+            mail_provider, "pooled", False
+        )
         if is_pooled_existing:
-            _allow_login = self._get_env("WEBUI_ALLOW_LOGIN", "").strip() in (
-                "1", "true", "yes",
-            )
             if _allow_login:
                 logger.info(
                     f"[{pool_tag}] '已有账号' 分支但 WEBUI_ALLOW_LOGIN=1 → 走 OTP login 拿凭证 ({email})"
@@ -4555,13 +4576,39 @@ class AuthFlow:
                     f"OpenAI 静默拒绝发 OTP (识别 {email} 为已有账号, {pool_tag} 池 fast-fail)"
                 )
 
-        # 通用 OTP 中转要求产出可长期登录的密码。邮箱若已被识别为已有账号，
-        # 后续只能走 passwordless/login，无法在本次注册中安全创建新密码。
-        if requires_password and not is_new and self._existing_email_verification_mode != "passwordless_signup":
-            raise RuntimeError(
-                f"邮箱 {email} 已被 OpenAI 识别为已有账号，无法创建新密码；"
-                "请更换未注册邮箱后重试"
+        # 真正的已有账号不再在这里因为通用 OTP 的“强制密码”开关直接失败。
+        # 只要调用方允许已有账号登录，就重新进入稳健的协议登录链：
+        #   - 本地有密码时走密码 + 已有 TOTP；
+        #   - 本地没有密码时走邮箱 OTP；
+        #   - registrar 随后按 want_password / want_2fa 只补齐缺失项。
+        # 这样普通“注册”入口和“仅登录”入口对外部 OTP 账号使用同一套逻辑。
+        if existing_login_required:
+            if not _allow_login:
+                raise RuntimeError(
+                    f"邮箱 {email} 已被 OpenAI 识别为已有账号，无法创建新账号；"
+                    "如需登录已有账号，请开启允许已有账号登录"
+                )
+            known_credentials = {}
+            account_callback = getattr(self, "_account_callback", None)
+            if account_callback is not None:
+                try:
+                    known_credentials = account_callback(email) or {}
+                except Exception as exc:
+                    logger.debug("读取已有账号凭证失败，按无密码处理: %s", exc)
+            known_password = str(
+                known_credentials.get("password") or ""
+            ).strip() if isinstance(known_credentials, dict) else ""
+            if requires_password and not self._credential_completion_requested and not known_password:
+                raise RuntimeError(
+                    f"邮箱 {email} 已被 OpenAI 识别为已有账号，无法创建新密码；"
+                    "请开启已有账号凭证补齐后重试"
+                )
+            logger.info(
+                "[%s] 检测到已有账号，切换到协议登录/凭证补齐流程 (%s)",
+                pool_tag,
+                email,
             )
+            return self.run_protocol_login(mail_provider, email)
 
         # ⚠️ passwordless_signup **也是新账号**，只是服务端选择了"不设密码直接发码"的注册流程。
         #    signup() 用一个 bool 表达三种服务端状态，把它和"已有账号"压成了同一个 False，

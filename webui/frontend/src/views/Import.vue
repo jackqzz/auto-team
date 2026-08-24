@@ -156,6 +156,7 @@ async function doImport() {
           </div>
           <div class="hint" style="margin-top: 6px">
             已存在的邮箱再次导入时，也会移动到本次选择的分组。
+            外部已注册账号只需导入邮箱和 OTP 中转链接，之后在“批量仅登录”中开启“补齐缺失的密码和 2FA”即可参与。
           </div>
         </el-form-item>
       </el-form>

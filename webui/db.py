@@ -1433,7 +1433,11 @@ def list_groups() -> list[dict]:
         " AND a.status='available') AS available, "
         "(SELECT COUNT(*) FROM registered r WHERE r.group_name=g.name) AS registered_total, "
         "(SELECT COUNT(*) FROM registered r WHERE r.group_name=g.name "
-        " AND COALESCE(r.account_status, 'active') <> 'permanently_invalid') AS active_registered_total "
+        " AND COALESCE(r.account_status, 'active') <> 'permanently_invalid') AS active_registered_total, "
+        "(SELECT COUNT(*) FROM outlook_accounts a "
+        " LEFT JOIN registered r ON r.email=a.email "
+        " WHERE a.group_name=g.name AND r.email IS NULL "
+        " AND a.status IN ('available', 'done', 'failed')) AS mailbox_only_total "
         "FROM account_groups g ORDER BY g.name COLLATE NOCASE"
     ).fetchall()
     return [
@@ -1443,6 +1447,9 @@ def list_groups() -> list[dict]:
             "available": row["available"] or 0,
             "registered_total": row["registered_total"] or 0,
             "active_registered_total": row["active_registered_total"] or 0,
+            # 这些是已经导入 OTP 收件凭证、但尚未在本地注册结果表落库的
+            # 外部账号。开启“补齐凭证”时，它们也属于可投送对象。
+            "mailbox_only_total": row["mailbox_only_total"] or 0,
         }
         for row in rows
     ]
@@ -2355,8 +2362,22 @@ def list_registered(
     return rows
 
 
-def list_login_candidates(group_name: str | None = "", filter_rt: str = "all") -> list[dict]:
-    """为一次“仅登录”任务生成稳定快照，每个注册结果最多出现一次。"""
+def list_login_candidates(
+    group_name: str | None = "",
+    filter_rt: str = "all",
+    *,
+    include_mailbox_only: bool = False,
+) -> list[dict]:
+    """为一次“仅登录”任务生成稳定快照。
+
+    默认只返回 ``registered`` 里的账号，保持旧的“刷新已有结果”语义。
+    开启凭证补齐时，额外把**只有邮箱 OTP 收件凭证、尚未写入
+    ``registered``** 的号池行也加入快照。这样外部已经注册好的账号可以直接
+    用 ``email----中转链接`` 导入后进入补齐流程，而不必先伪造一条注册结果。
+
+    号池行不会在这里 claim：仅登录任务本来就不应改变邮箱池状态；成功后由
+    ``save_registered`` 写入结果表，下一次快照自然会走已注册分支并去重。
+    """
     where = ""
     args: list = []
     conditions = ["COALESCE(r.account_status, 'active') <> 'permanently_invalid'"]
@@ -2378,7 +2399,7 @@ def list_login_candidates(group_name: str | None = "", filter_rt: str = "all") -
         f"{where} ORDER BY r.created_at ASC",
         args,
     ).fetchall()
-    return [
+    candidates = [
         {
             "email": row["email"],
             "password": row["mail_password"] or "",
@@ -2392,6 +2413,60 @@ def list_login_candidates(group_name: str | None = "", filter_rt: str = "all") -
         }
         for row in rows
     ]
+
+    if not include_mailbox_only:
+        return candidates
+
+    # mailbox-only 行没有 OpenAI refresh_token；“仅已有 RT”筛选不能把它们
+    # 当成有 RT 的注册结果混入。
+    if filter_rt == "has_rt":
+        return candidates
+
+    # 外部导入的账号还没有 registered 行。排除 in_use（正在被普通注册任务
+    # 使用）；failed 也纳入“开启补齐”的恢复快照，因为旧版本在发现“已有账号、
+    # 无法创建密码”时会把这些外部账号误记为 failed，用户不应先手工重置。
+    pool_conditions = [
+        "a.status IN ('available', 'done', 'failed')",
+        "NOT EXISTS (SELECT 1 FROM registered r WHERE r.email=a.email)",
+    ]
+    pool_args: list = []
+    if group_name is not None and group_name != "__all__":
+        pool_conditions.append("a.group_name=?")
+        pool_args.append(_normalize_group_name(group_name))
+    pool_rows = con.execute(
+        "SELECT a.email, a.password, a.client_id, a.refresh_token, "
+        "a.relay_url, a.kind, a.group_name, a.imported_at "
+        "FROM outlook_accounts a WHERE "
+        + " AND ".join(pool_conditions)
+        + " ORDER BY a.imported_at ASC",
+        pool_args,
+    ).fetchall()
+
+    existing_emails = {
+        str(row.get("email") or "").strip().lower()
+        for row in candidates
+    }
+    for row in pool_rows:
+        email = str(row["email"] or "").strip().lower()
+        if not email or email in existing_emails:
+            continue
+        # ``password`` here is邮箱收件箱密码（若有），不是 OpenAI 密码；
+        # ``login_password`` 明确留空，registrar 才会优先走邮箱 OTP。
+        candidates.append({
+            "email": email,
+            "password": row["password"] or "",
+            "client_id": row["client_id"] or "",
+            "refresh_token": row["refresh_token"] or "",
+            "relay_url": row["relay_url"] or "",
+            "kind": row["kind"] or "outlook",
+            "login_password": "",
+            "totp_secret": "",
+            "group_name": row["group_name"] or "",
+            "_login_source": "mailbox_only",
+        })
+        existing_emails.add(email)
+
+    return candidates
 
 
 def list_registered_full(limit: int = 5000) -> list[dict]:

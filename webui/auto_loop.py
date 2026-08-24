@@ -156,6 +156,11 @@ class AutoLoopController:
                     self._login_queue = db.list_login_candidates(
                         self._options.get("group_name", ""),
                         filter_rt=("no_rt" if self._options.get("login_no_rt_only") else "all"),
+                        # 只有开启凭证补齐时，才把尚未落到 registered 表的
+                        # 外部 OTP 号池行纳入仅登录快照。
+                        include_mailbox_only=bool(
+                            self._options.get("ensure_credentials", True)
+                        ),
                     )
                 except ValueError as e:
                     return {"ok": False, "error": str(e)}
@@ -177,7 +182,13 @@ class AutoLoopController:
                 for row in self._login_queue:
                     row["_proxy_usage_detail"] = usage_detail
                 if not self._login_queue:
-                    return {"ok": False, "error": "当前分组没有可登录的注册结果"}
+                    return {
+                        "ok": False,
+                        "error": (
+                            "当前分组没有可登录/补齐的账号；"
+                            "开启凭证补齐后，可导入只有邮箱 OTP 中转链接的外部账号"
+                        ),
+                    }
                 self._login_candidate_count = len(self._login_queue)
                 self._login_seen = {
                     (row.get("email") or "").strip().lower()
@@ -268,6 +279,9 @@ class AutoLoopController:
             rows = db.list_login_candidates(
                 options.get("group_name", ""),
                 filter_rt=("no_rt" if options.get("login_no_rt_only") else "all"),
+                include_mailbox_only=bool(
+                    options.get("ensure_credentials", True)
+                ),
             )
         except ValueError as e:
             return {"ok": False, "error": str(e)}

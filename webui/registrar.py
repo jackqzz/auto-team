@@ -254,11 +254,21 @@ def _do_register(
     email = account["email"]
     # 提前读取，避免在 try 块前异常时 except 引用未定义
     login_only = bool(options.get("login_only"))
-    # 仅登录的“凭证补齐”是一个独立开关。默认开启以覆盖 passwordless
-    # 账号；关闭时保持旧行为，只刷新 token/session，不修改账号安全设置。
-    # 仅登录默认补齐缺失凭证；空间凭证/后台巡检等内部登录任务显式传
-    # ensure_credentials=False，避免修改账号安全设置。
-    ensure_login_credentials = login_only and bool(options.get("ensure_credentials", True))
+    # “凭证补齐”是一个独立开关。仅登录默认开启以覆盖 passwordless 账号；
+    # 普通注册遇到已有邮箱时也按这个开关决定是否补齐。空间凭证/后台巡检
+    # 等内部登录任务显式传 ensure_credentials=False，避免修改账号安全设置。
+    # ``ensure_credentials`` 既用于“仅登录”，也用于普通注册任务在服务端
+    # 发现邮箱已存在时的补齐分支。普通新号不会因此多做任何副作用；只有
+    # AuthFlow 明确识别为已有账号后，下面的后处理才会读取/修改凭证。
+    completion_default = (
+        login_only
+        or bool(options.get("want_password", False))
+        or bool(options.get("want_2fa", False))
+    )
+    credential_completion_enabled = bool(
+        options.get("ensure_credentials", completion_default)
+    )
+    ensure_login_credentials = login_only and credential_completion_enabled
     missing_login_password = ensure_login_credentials and not str(
         account.get("login_password") or ""
     ).strip()
@@ -285,9 +295,12 @@ def _do_register(
         #    现在整个 dict 直接传给 AuthFlow，只挂在实例上，谁都污染不到谁。
         env_overrides = {}
         # outlook 接码邮箱常被 OpenAI 走 passwordless_signup 流程（新号收码而非设密码），
-        # auth_flow 会误判为"已有账号"分支 → 不设 WEBUI_ALLOW_LOGIN 会 fast-fail。
-        # 单号 WebUI 场景下 fast-fail 没意义（批量跑才需要"跳过被识别的号"），故强制 ON。
-        env_overrides["WEBUI_ALLOW_LOGIN"] = "1"
+        # auth_flow 会误判为"已有账号"分支。普通注册遇到已有账号时按
+        # allow_existing_login 决定是否切换到登录/补齐分支；以前这里无条件写 1，
+        # 导致 API 参数形同虚设。
+        env_overrides["WEBUI_ALLOW_LOGIN"] = (
+            "1" if bool(options.get("allow_existing_login", True)) else "0"
+        )
         if login_only:
             # 仅登录必须先探测密码页；密码 + TOTP 不通时协议链才回退邮箱 OTP。
             env_overrides["LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"] = "1"
@@ -435,7 +448,10 @@ def _do_register(
                     prefer_email_otp=missing_login_password,
                 )
             else:
-                result = flow.run_register(mail)
+                result = flow.run_register(
+                    mail,
+                    ensure_credentials=credential_completion_enabled,
+                )
             d = result.to_dict()
         except RuntimeError as e:
             # 部分凭证也算成功（OTP 验证通过 + create_account 成功 → flow.result 有 token）
@@ -464,13 +480,19 @@ def _do_register(
             else:
                 raise
 
-        # ─ 仅登录凭证补齐 ─
+        # ─ 已有账号凭证补齐 ─
         # 这一步必须发生在 token/session 已拿到之后、结果过滤和落库之前：
         #   ① passwordless 账号先用邮箱 OTP 建立已验证会话；
         #   ② 缺少本地 TOTP secret 时先用当前 access token enroll/activate；
         #   ③ 缺少密码时再通过浏览器 reset-password 页面设置随机密码。
-        # 只处理本地明确缺失的字段，已有密码/secret 不重复修改或 enroll。
-        if login_only and ensure_login_credentials:
+        # 只处理本地明确缺失且被调用方要求的字段，已有密码/secret 不重复
+        # 修改或 enroll。普通注册若 signup 发现已有账号，也复用这里的逻辑。
+        existing_account_flow = bool(getattr(flow, "_is_existing_account", False))
+        completion_active = bool(
+            credential_completion_enabled
+            and (login_only or existing_account_flow)
+        )
+        if completion_active:
             real_email = str(d.get("email") or email).strip().lower()
             # 自动任务重试时，上一轮可能已经把密码/secret 早落盘但在后续 OAuth
             # 阶段失败；每次重试都重新读一次，避免重复改密码或重复 enroll。
@@ -478,6 +500,18 @@ def _do_register(
                 current_saved = db.get_registered(real_email) or {}
             except Exception:
                 current_saved = {}
+
+            # 仅登录开关的语义是“两项都补齐”；普通注册沿用页面上的
+            # want_password / want_2fa 两个独立开关，关闭哪项就不触碰哪项。
+            if not login_only:
+                missing_login_password = bool(
+                    options.get("want_password", True)
+                    and not str(current_saved.get("password") or "").strip()
+                )
+                missing_login_totp = bool(
+                    options.get("want_2fa", False)
+                    and not str(current_saved.get("totp_secret") or "").strip()
+                )
             if not str(d.get("password") or "").strip() and str(current_saved.get("password") or "").strip():
                 d["password"] = str(current_saved.get("password") or "").strip()
             if not str(d.get("totp_secret") or "").strip() and str(current_saved.get("totp_secret") or "").strip():
@@ -494,6 +528,15 @@ def _do_register(
             )
 
             need_totp = bool(missing_login_totp and not str(d.get("totp_secret") or "").strip())
+            need_password = bool(
+                missing_login_password
+                and not str(d.get("password") or "").strip()
+            )
+            if not need_password and not need_totp:
+                logging.getLogger("registrar").info(
+                    "[login] 本地要求的密码/2FA 已齐，跳过凭证修改 email=%s",
+                    real_email,
+                )
             if need_totp:
                 logging.getLogger("registrar").info(
                     "[login] 账号缺少本地 2FA secret，开始补绑 TOTP email=%s",
@@ -539,12 +582,11 @@ def _do_register(
                     raise
                 except Exception as exc:
                     raise RuntimeError(
-                        f"仅登录凭证补齐失败：2FA 设置失败 ({str(exc)[:240]})"
+                        f"已有账号凭证补齐失败：2FA 设置失败 ({str(exc)[:240]})"
                     ) from exc
 
             # reset-password 提交后部分会话会被刷新或失效，因此放在 TOTP
             # enroll 之后；同时再次读取数据库，避免旧任务快照触发重复重置。
-            need_password = bool(missing_login_password and not str(d.get("password") or "").strip())
             if need_password:
                 try:
                     saved_now = db.get_registered(real_email) or {}
@@ -582,7 +624,7 @@ def _do_register(
                     )
                 except Exception as exc:
                     raise RuntimeError(
-                        f"仅登录凭证补齐失败：密码设置失败 ({str(exc)[:240]})"
+                        f"已有账号凭证补齐失败：密码设置失败 ({str(exc)[:240]})"
                     ) from exc
                 flow.result.password = generated_password
                 d["password"] = generated_password
