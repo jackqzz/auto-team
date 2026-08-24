@@ -511,7 +511,7 @@ async function reloginSelected() {
   try {
     await ElMessageBox.confirm(
       `将选中的 ${emails.length} 个已注册账号投入重登录。\n` +
-      '每个账号按任务配置执行；遇到可重试错误会重新尝试，页面会按账号统计最终成功、最终失败和重试次数。继续？',
+      '仅登录会自动补齐本地缺失的密码和 2FA（已有项不会重复修改）；遇到可重试错误会重新尝试，页面会按账号统计最终成功、最终失败和重试次数。继续？',
       '重登录选中账号',
       { type: 'warning', confirmButtonText: '开始重登录', cancelButtonText: '取消', customClass: 'confirm-multiline' },
     )
@@ -532,6 +532,7 @@ async function reloginSelected() {
       want_refresh_token: true,
       want_password: false,
       want_2fa: false,
+      ensure_credentials: true,
       allow_existing_login: true,
       cool_down_seconds: 0,
       account_retry_count: 1,

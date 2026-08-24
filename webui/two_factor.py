@@ -49,6 +49,98 @@ from auth_flow import AuthFlow  # noqa: E402
 logger = logging.getLogger("two_factor")
 
 
+def _mfa_enabled_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _totp_factor_present(info: dict) -> bool:
+    """兼容 mfa_info 的 factors 映射/数组两种响应形态。"""
+    factors = info.get("factors") if isinstance(info, dict) else None
+    if isinstance(factors, dict):
+        if "totp" not in factors:
+            return False
+        value = factors.get("totp")
+        if value is None or value is False:
+            return False
+        if isinstance(value, dict) and "enabled" in value:
+            enabled = value.get("enabled")
+            if enabled is False or str(enabled or "").strip().lower() in {"0", "false", "off"}:
+                return False
+        # Some API versions return an empty object for an enabled factor; the
+        # key's presence is still authoritative in that response shape.
+        return True
+    if isinstance(factors, list):
+        for item in factors:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or item.get("factor_type") or "").strip().lower()
+            if kind != "totp":
+                continue
+            enabled = item.get("enabled")
+            return enabled is not False and str(enabled or "").lower() not in {"0", "false", "off"}
+    return False
+
+
+def totp_is_enabled(flow: AuthFlow, access_token: str = "") -> bool | None:
+    """查询当前账号是否已经启用 TOTP。
+
+    返回值含义：``True`` = 服务端已启用，``False`` = 明确未启用，``None`` =
+    查询失败/响应格式未知。单独暴露这个判据是为了区分“已启用但本地 secret
+    丢失”和“enroll 失败”；后者可以重试，前者不能再次生成同一份 secret。
+    """
+    try:
+        at = str(
+            access_token
+            or getattr(getattr(flow, "result", None), "access_token", "")
+            or ""
+        ).strip()
+        if not at:
+            return None
+        headers = flow._common_headers("https://chatgpt.com/backend-api/accounts/mfa_info")
+        headers["Authorization"] = f"Bearer {at}"
+        response = flow.session.get(
+            "https://chatgpt.com/backend-api/accounts/mfa_info",
+            headers=headers,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "[2fa] mfa_info 查询失败 status=%s body=%s",
+                response.status_code,
+                (getattr(response, "text", "") or "")[:180],
+            )
+            return None
+        info = response.json() or {}
+        if not isinstance(info, dict):
+            return None
+        factors = info.get("factors") or {}
+        if isinstance(factors, list):
+            # 某些响应版本返回 [{"type":"totp", ...}] 而不是对象映射。
+            factors = {
+                str(item.get("type") or item.get("factor_type") or "").lower(): item
+                for item in factors
+                if isinstance(item, dict)
+            }
+        if not isinstance(factors, dict):
+            factors = {}
+        # 不同版本响应有时只给 mfa_enabled，有时在 factors.totp 下给对象/布尔值。
+        enabled_flag = (
+            _mfa_enabled_flag(info.get("mfa_enabled"))
+            or _mfa_enabled_flag(info.get("mfa_enabled_v2"))
+        )
+        if enabled_flag:
+            if not factors or _totp_factor_present(info):
+                return True
+        if _totp_factor_present(info):
+            return True
+        return False
+    except Exception as exc:  # noqa: BLE001 - 查询失败交给调用方决定
+        logger.warning("[2fa] mfa_info 查询异常: %s", exc)
+        return None
+
+
 # ── RFC 6238 手写实现（无 pyotp 也能算码，双保险）─────────────────
 def hotp(secret_b32: str, counter: int, digits: int = 6) -> str:
     key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8))
@@ -86,7 +178,14 @@ def _enroll_and_activate(flow: AuthFlow, at: str) -> dict | None:
     )
     if r2.status_code == 200:
         info = r2.json() or {}
-        if info.get("mfa_enabled") and (info.get("factors", {}) or {}).get("totp"):
+        if (
+            isinstance(info, dict)
+            and (
+                _mfa_enabled_flag(info.get("mfa_enabled"))
+                or _mfa_enabled_flag(info.get("mfa_enabled_v2"))
+            )
+            and _totp_factor_present(info)
+        ):
             logger.info("[2fa] 该号已绑 totp，跳过（secret 无法从服务端取回）")
             return None
 
@@ -130,6 +229,17 @@ def _enroll_and_activate(flow: AuthFlow, at: str) -> dict | None:
             r4.status_code, (r4.text or "")[:200]
         )
         return None
+    try:
+        activated = r4.json() or {}
+    except Exception:
+        activated = {}
+    if (
+        isinstance(activated, dict)
+        and "success" in activated
+        and not _mfa_enabled_flag(activated.get("success"))
+    ):
+        logger.warning("[2fa] activate_enrollment 返回 success=false: %s", json.dumps(activated)[:200])
+        return None
 
     # 验证（失败不影响返回：enroll+activate 都 200 即视为成功，secret 已到手）
     time.sleep(2)
@@ -138,7 +248,18 @@ def _enroll_and_activate(flow: AuthFlow, at: str) -> dict | None:
     r5 = flow.session.get(
         "https://chatgpt.com/backend-api/accounts/mfa_info", headers=hh, timeout=30
     )
-    if r5.status_code == 200 and (r5.json() or {}).get("mfa_enabled"):
+    try:
+        verify_info = r5.json() or {}
+    except Exception:
+        verify_info = {}
+    if (
+        r5.status_code == 200
+        and isinstance(verify_info, dict)
+        and (
+            _mfa_enabled_flag(verify_info.get("mfa_enabled"))
+            or _mfa_enabled_flag(verify_info.get("mfa_enabled_v2"))
+        )
+    ):
         logger.info("[2fa] ✅ 绑定成功，mfa_enabled=true")
     else:
         logger.warning(

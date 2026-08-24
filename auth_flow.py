@@ -92,6 +92,10 @@ def _is_permanently_invalid_error(text: str) -> bool:
     return any(marker in value for marker in _PERMANENT_INVALID_MARKERS)
 
 
+class _MissingTOTPSecretError(RuntimeError):
+    """密码登录已确认账号启用 2FA，但本地没有可用 secret。"""
+
+
 # ── RFC 6238 TOTP 实现（用于 mfa-challenge 计算动态码）────────────
 def _hotp(secret_b32: str, counter: int, digits: int = 6) -> str:
     """HOTP 算法（RFC 4226）"""
@@ -2116,6 +2120,400 @@ class AuthFlow:
         if last_err:
             raise last_err
         return continue_url or start_url
+
+    def set_password_via_camoufox(self, password: str, *, email: str = "") -> bool:
+        """在当前已验证的登录态中补设账号密码。
+
+        passwordless 账号完成邮箱 OTP 登录后，OpenAI 的
+        ``/reset-password/new-password`` 页面允许直接设置新密码，不需要旧密码。
+        该页面是 Auth0/NextAuth 的浏览器页面，协议 HTTP 会话本身没有稳定的公开
+        ``set-password`` API，因此这里复用当前 flow 的 cookies 打开一个短生命周期
+        Camoufox 页面完成表单提交。成功后把浏览器产生的 cookies 同步回 flow，后续
+        2FA 绑定和 OAuth 仍沿用同一个协议会话。
+
+        只负责提交密码，不会修改 ``result.password`` 或数据库；调用方在确认页面
+        提交成功后再落库，避免把失败的随机密码当成真实凭证保存。
+        """
+        new_password = str(password or "").strip()
+        if not new_password:
+            raise RuntimeError("补设密码缺少新密码")
+
+        try:
+            from camoufox import DefaultAddons
+            from camoufox.sync_api import Camoufox
+        except ImportError as exc:  # pragma: no cover - 依赖缺失时由运行环境报出
+            raise RuntimeError("补设密码需要安装 Camoufox") from exc
+
+        def _browser_cookies() -> list[dict]:
+            out: list[dict] = []
+            seen: set[tuple[str, str, str]] = set()
+            try:
+                jar = getattr(self.session.cookies, "jar", None)
+                cookies = list(jar if jar is not None else self.session.cookies)
+            except Exception:
+                cookies = []
+            fallback_domain = "auth.openai.com"
+            for cookie in cookies:
+                name = str(getattr(cookie, "name", "") or "").strip()
+                value = str(getattr(cookie, "value", "") or "")
+                if not name:
+                    continue
+                domain = str(getattr(cookie, "domain", "") or "").strip() or fallback_domain
+                path = str(getattr(cookie, "path", "") or "/") or "/"
+                key = (name, domain, path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                item = {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": path,
+                    "secure": bool(getattr(cookie, "secure", False)),
+                    "httpOnly": bool(getattr(cookie, "_rest", {}).get("HttpOnly", False))
+                    if isinstance(getattr(cookie, "_rest", {}), dict) else False,
+                }
+                expires = getattr(cookie, "expires", None)
+                try:
+                    if expires not in (None, "") and float(expires) > 0:
+                        item["expires"] = float(expires)
+                except (TypeError, ValueError):
+                    pass
+                out.append(item)
+
+            # get_auth_session 在部分 NextAuth 路径只把 session token 放在 JSON
+            # 响应里；显式补到 chatgpt.com 才等价于浏览器手工替换该 cookie。
+            #
+            # 密码页位于 auth.openai.com，而 __Secure-next-auth.session-token
+            # 通常是从 chatgpt.com 响应拿到的 host/domain cookie。浏览器不会
+            # 把 chatgpt.com 的 cookie 跨站发送给 auth.openai.com，因此只注入
+            # chatgpt.com 会落到 "Your session has ended"。真实浏览器在登录跳转
+            # 后会同时拥有 auth.openai.com 这一 host 的会话 cookie；这里显式补
+            # 一份同值 host cookie，等价于用户在开发者工具里替换该值。
+            session_token = str(getattr(self.result, "session_token", "") or "").strip()
+            if session_token:
+                token_name = "__Secure-next-auth.session-token"
+                # 同一 flow 可能先访问过两个站点，jar 中会留下旧值。不能只
+                # 判断“域名已存在”就跳过，否则浏览器可能发送旧 token，密码页
+                # 仍显示 session ended。删除相关域的旧副本，再注入当前值。
+                kept: list[dict] = []
+                for cookie in out:
+                    name = str(cookie.get("name") or "")
+                    domain = str(cookie.get("domain") or "").lower().lstrip(".")
+                    if name == token_name and (
+                        domain == "chatgpt.com"
+                        or domain.endswith(".chatgpt.com")
+                        or domain == "openai.com"
+                        or domain.endswith(".openai.com")
+                    ):
+                        continue
+                    kept.append(cookie)
+                out = kept
+                for domain in (".chatgpt.com", "auth.openai.com"):
+                    out.append({
+                        "name": token_name,
+                        "value": session_token,
+                        "domain": domain,
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                    })
+            return out
+
+        def _sync_cookies(context) -> None:
+            try:
+                cookies = context.cookies()
+            except Exception:
+                return
+            for cookie in cookies or []:
+                name = str((cookie or {}).get("name") or "").strip()
+                value = str((cookie or {}).get("value") or "")
+                if not name:
+                    continue
+                domain = (cookie or {}).get("domain") or ""
+                path = (cookie or {}).get("path") or "/"
+                try:
+                    self.session.cookies.set(name, value, domain=domain, path=path)
+                except Exception:
+                    try:
+                        self.session.cookies.set(name, value)
+                    except Exception:
+                        pass
+
+        proxy_url = str(getattr(self.config, "proxy", None) or "").strip()
+        if proxy_url.lower().startswith("socks5h://"):
+            proxy_url = "socks5://" + proxy_url[len("socks5h://"):]
+        browser_proxy = {"server": proxy_url} if proxy_url else None
+        headless_env = (self._get_env("OPENAI_CAMOUFOX_HEADLESS", "") or "").strip().lower()
+        if headless_env in {"0", "false", "no", "off"}:
+            headless = False
+        elif headless_env in {"virtual", "xvfb"}:
+            headless = "virtual"
+        elif headless_env in {"1", "true", "yes", "on"}:
+            headless = True
+        else:
+            # 服务器通常没有 DISPLAY；原生 headless 不依赖 Xvfb。
+            headless = not bool(os.getenv("DISPLAY"))
+
+        reset_url = "https://auth.openai.com/reset-password/new-password"
+        logger.info("[login] 打开 reset-password 页面补设密码 email=%s", email or self.result.email or "")
+        submitted = False
+        last_url = reset_url
+        with Camoufox(
+            headless=headless,
+            proxy=browser_proxy,
+            exclude_addons=[DefaultAddons.UBO],
+            geoip=bool(browser_proxy),
+            enable_cache=True,
+            locale=CAMOUFOX_LOCALE,
+        ) as browser:
+            context = browser.new_context()
+            cookies = _browser_cookies()
+            if cookies:
+                try:
+                    context.add_cookies(cookies)
+                except Exception as exc:
+                    logger.debug("[login] 批量注入补设密码 cookies 失败，改逐条注入: %s", exc)
+                    for cookie in cookies:
+                        try:
+                            context.add_cookies([cookie])
+                        except Exception:
+                            continue
+            page = context.new_page()
+            try:
+                goto_with_timeout(
+                    page,
+                    reset_url,
+                    self.config,
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"补设密码页面打开失败: {str(exc)[:180]}") from exc
+
+            def _visible(locator) -> bool:
+                try:
+                    return locator.count() > 0 and locator.first.is_visible()
+                except Exception:
+                    return False
+
+            # SPA 页面渲染可能晚于 domcontentloaded，最多等待 12 秒。
+            password_selectors = (
+                "input[name='new-password']",
+                "input[id*='new-password' i]",
+                "input[autocomplete='new-password']",
+                "input[type='password']",
+            )
+            inputs = None
+            deadline = time.time() + 12
+            while time.time() < deadline:
+                for selector in password_selectors:
+                    try:
+                        loc = page.locator(selector)
+                        if _visible(loc):
+                            inputs = loc
+                            break
+                    except Exception:
+                        continue
+                if inputs is not None:
+                    break
+                try:
+                    page.wait_for_timeout(300)
+                except Exception:
+                    time.sleep(0.3)
+
+            if inputs is None:
+                last_url = str(getattr(page, "url", "") or reset_url)
+                try:
+                    page_title = str(page.title() or "")[:120]
+                except Exception:
+                    page_title = ""
+                try:
+                    page_body = str(page.locator("body").inner_text(timeout=500) or "")[:240]
+                except Exception:
+                    page_body = ""
+                detail = " ".join(
+                    part for part in (
+                        f"title={page_title}" if page_title else "",
+                        f"body={page_body}" if page_body else "",
+                    ) if part
+                )
+                raise RuntimeError(
+                    f"补设密码页面未找到新密码输入框 (url={last_url[:180]}"
+                    f"{', ' + detail if detail else ''})"
+                )
+
+            # 优先用可见 password 输入框的顺序填写新密码和确认密码；不同
+            # Auth0 版本的确认框有时是 confirm-password，有时只有通用 password。
+            try:
+                visible_passwords = page.locator("input[type='password']:visible")
+                count = visible_passwords.count()
+            except Exception:
+                visible_passwords = inputs
+                count = 1
+            if count <= 0:
+                count = 1
+                visible_passwords = inputs
+            try:
+                visible_passwords.nth(0).fill(new_password)
+            except Exception as exc:
+                raise RuntimeError(f"补设密码填写失败: {str(exc)[:160]}") from exc
+
+            confirm_filled = False
+            for selector in (
+                "input[name='confirm-password']",
+                "input[name='confirmPassword']",
+                "input[name='password_confirmation']",
+                "input[name='passwordConfirmation']",
+                "input[id*='confirm-password' i]",
+                "input[id*='confirmPassword' i]",
+                "input[id*='password-confirmation' i]",
+            ):
+                try:
+                    confirm = page.locator(selector).first
+                    if _visible(confirm):
+                        confirm.fill(new_password)
+                        confirm_filled = True
+                        break
+                except Exception:
+                    continue
+            if not confirm_filled and count > 1:
+                try:
+                    visible_passwords.nth(1).fill(new_password)
+                    confirm_filled = True
+                except Exception as exc:
+                    raise RuntimeError(f"补设密码确认项填写失败: {str(exc)[:160]}") from exc
+
+            submit = None
+            for selector in (
+                "button[type='submit']",
+                "button:has-text('Continue')",
+                "button:has-text('Reset password')",
+                "button:has-text('Save password')",
+                "button:has-text('继续')",
+                "button[data-testid='continue-button']",
+            ):
+                try:
+                    loc = page.locator(selector).first
+                    if _visible(loc):
+                        submit = loc
+                        break
+                except Exception:
+                    continue
+            if submit is None:
+                raise RuntimeError("补设密码页面未找到提交按钮")
+            # 记录密码提交请求的结果。成功页的 URL/文案会随 Auth0 版本变化，
+            # 但真正的提交接口仍会返回 2xx；捕获它可以避免把 Cloudflare 或
+            # 未登录跳转误判为“密码已设置”。
+            password_response = {"ok": False, "status": 0, "url": "", "body": ""}
+
+            def _observe_password_response(response) -> None:
+                try:
+                    request = response.request
+                    method = str(getattr(request, "method", "") or "").upper()
+                    response_url = str(getattr(response, "url", "") or "")
+                    if method not in {"POST", "PUT", "PATCH"} or not any(
+                        marker in response_url.lower()
+                        for marker in (
+                            "password", "reset", "user/register",
+                        )
+                    ):
+                        return
+                    status = int(getattr(response, "status", 0) or 0)
+                    if not 200 <= status < 300:
+                        return
+                    password_response.update({
+                        "ok": True,
+                        "status": status,
+                        "url": response_url,
+                    })
+                    try:
+                        password_response["body"] = str(response.text() or "")[:500]
+                    except Exception:
+                        pass
+                except Exception:
+                    return
+
+            try:
+                page.on("response", _observe_password_response)
+            except Exception:
+                pass
+
+            try:
+                submit.click(timeout=8_000)
+            except Exception as exc:
+                raise RuntimeError(f"补设密码提交失败: {str(exc)[:160]}") from exc
+
+            deadline = time.time() + 25
+            submit_url = last_url
+            submit_body = ""
+            while time.time() < deadline:
+                last_url = str(getattr(page, "url", "") or reset_url)
+                submit_url = last_url
+                lowered = last_url.lower()
+                try:
+                    body = str(page.locator("body").inner_text(timeout=300) or "")
+                except Exception:
+                    body = ""
+                submit_body = body[:500]
+                body_lower = body.lower()
+                # 成功页文案随 Auth0/Next.js 版本变化，URL 和正文都检查。
+                if any(
+                    marker in body_lower
+                    for marker in (
+                        "password updated", "password has been updated", "password has been reset",
+                        "password changed", "password has been changed", "password set",
+                        "password created", "password reset successfully", "successfully updated",
+                        "successfully reset", "successfully changed",
+                        "密码已更新",
+                        "密码重置成功", "密码修改成功", "密码设置成功",
+                    )
+                ):
+                    submitted = True
+                    break
+                if any(
+                    marker in body_lower
+                    for marker in (
+                        "invalid or expired", "link has expired", "unable to reset",
+                        "something went wrong", "error resetting", "failed to create account",
+                        "please try again", "must contain", "at least 12", "invalid password",
+                        "password does not meet", "密码重置失败", "密码格式不符合",
+                    )
+                ):
+                    raise RuntimeError(f"补设密码被页面拒绝: {body[:180]}")
+                # 提交后通常会跳到 success 或登录页；只有这些已知的后续页面
+                # 才判定成功，避免把 /reset-password/error 误判成成功。
+                parsed_url = urlparse(last_url)
+                path_lower = (parsed_url.path or "").lower()
+                if (
+                    "reset-password/success" in path_lower
+                    or "password/success" in path_lower
+                    or "password-updated" in path_lower
+                    or "password-changed" in path_lower
+                    or path_lower in {"/log-in", "/login", "/log-in/", "/login/"}
+                ):
+                    submitted = True
+                    break
+                try:
+                    page.wait_for_timeout(400)
+                except Exception:
+                    time.sleep(0.4)
+            _sync_cookies(context)
+
+            if password_response["ok"]:
+                submitted = True
+
+        if not submitted:
+            raise RuntimeError(
+                f"补设密码提交后未确认成功 (url={submit_url[:180] or last_url[:180]}"
+                f" body={submit_body[:180]})"
+            )
+        try:
+            self.result.cookie_header = self._build_chatgpt_cookie_header()
+        except Exception:
+            pass
+        logger.info("[login] ✅ 账号密码补设成功 email=%s", email or self.result.email or "")
+        return True
 
     def _codex_refresh_retry_after_add_phone(
         self,
@@ -4467,11 +4865,21 @@ class AuthFlow:
         return self.result
 
     # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
-    def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
+    def run_protocol_login(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+        *,
+        prefer_email_otp: bool = False,
+    ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
         - 适配 passwordless / login_password 两类已有账号入口
         - 可配合 OAUTH_EXCHANGE_BEFORE_CALLBACK / OAUTH_REFRESH_ONLY 尝试优先拿 refresh_token
+        - ``prefer_email_otp`` 用于补设密码分支：即使调用方通过环境回调提供了
+          候选密码，也先用邮箱 OTP 建立已验证会话，再进入 reset-password 页面；
+          仅补 2FA 且已有密码的账号仍优先走密码登录，不会重复改密码。
         """
         if not (email or "").strip():
             raise RuntimeError("run_protocol_login 缺少邮箱")
@@ -4524,7 +4932,13 @@ class AuthFlow:
         mode = ""
         prefer_login_screen_first = self._env_flag(
             "LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT", "1"
-        ) and pw_is_real
+        ) and pw_is_real and not prefer_email_otp
+
+        if prefer_email_otp and pw_is_real:
+            logger.info("凭证补齐：缺少本地密码，优先走邮箱 OTP 登录")
+            pw_is_real = False
+            login_password = ""
+            self.result.password = ""
 
         if not pw_is_real:
             logger.info("无真实密码：跳过 login_password 探测，使用 passwordless 登录入口")
@@ -4574,7 +4988,10 @@ class AuthFlow:
                             except Exception as e:
                                 logger.warning(f"account_callback 异常: {e}")
                         if not totp_secret:
-                            logger.warning("进入 mfa-challenge 但没有 totp_secret，无法继续")
+                            raise _MissingTOTPSecretError(
+                                "账号已启用 2FA，但本地没有 totp_secret，无法完成登录；"
+                                "请从原始备份导入 2FA secret"
+                            )
                         else:
                             challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
                             if challenge_id:
@@ -4598,6 +5015,8 @@ class AuthFlow:
                         page_type or "(empty)",
                         (continue_url or "")[:180] or "(empty)",
                     )
+            except _MissingTOTPSecretError:
+                raise
             except Exception as e:
                 # 账号已停用/删除时，不能把 403 当成 login screen_hint 探测
                 # 失败再回退 signup；这会对同一个永久失效账号重复发起登录。
@@ -4679,7 +5098,10 @@ class AuthFlow:
                         self.result.totp_secret = totp_secret
                         logger.info("OTP 验证后已从数据库加载 totp_secret")
                 if not totp_secret:
-                    raise RuntimeError("邮箱 OTP 验证成功，但账号需要 2FA 且本地没有 totp_secret")
+                    raise _MissingTOTPSecretError(
+                        "邮箱 OTP 验证成功，但账号已启用 2FA 且本地没有 totp_secret，"
+                        "无法重新生成；请从原始备份导入 2FA secret"
+                    )
                 challenge_id = (
                     continue_url.split("/")[-1]
                     if "/mfa-challenge/" in continue_url else ""

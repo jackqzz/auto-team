@@ -147,6 +147,104 @@ class ProtocolLoginTests(unittest.TestCase):
         provider.wait_for_otp.assert_called_once()
         flow.verify_otp.assert_called_once_with("890681")
 
+    def test_known_password_without_local_totp_uses_password_path(self):
+        flow = _flow(password="known-password")
+        flow._resolve_login_password = Mock(return_value=("known-password", True))
+        flow._env_flag = Mock(
+            side_effect=lambda key, default="0": key == "LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"
+        )
+
+        flow.authorize_continue = Mock(
+            return_value=_step("login_password", "https://auth.openai.com/log-in/password")
+        )
+        flow.login_password_verify.return_value = _step("external_url", CALLBACK_URL)
+        flow.signup = Mock()
+        provider = SimpleNamespace(wait_for_otp=Mock())
+
+        result = flow.run_protocol_login(
+            provider,
+            EMAIL,
+            password="known-password",
+        )
+
+        self.assertEqual(result.access_token, "access")
+        self.assertEqual(result.password, "known-password")
+        flow.login_password_verify.assert_called_once_with("known-password")
+        flow.signup.assert_not_called()
+        provider.wait_for_otp.assert_not_called()
+
+    def test_prefer_email_otp_skips_known_password_for_password_completion(self):
+        """补密码时即使库里有候选密码，也必须先建立邮箱 OTP 登录态。"""
+        flow = _flow(password="old-password", totp_secret=TOTP_SECRET)
+        flow._resolve_login_password = Mock(return_value=("old-password", True))
+
+        def passwordless_signup(_email, _sentinel):
+            flow._is_existing_account = True
+            flow._existing_page_type = "email_otp_verification"
+            flow._existing_email_verification_mode = "passwordless_login"
+            return False
+
+        flow.signup = Mock(side_effect=passwordless_signup)
+        flow.verify_otp = Mock(return_value=_step("external_url", CALLBACK_URL))
+        provider = SimpleNamespace(wait_for_otp=Mock(return_value="890681"))
+
+        result = flow.run_protocol_login(
+            provider,
+            EMAIL,
+            password="old-password",
+            prefer_email_otp=True,
+        )
+
+        self.assertEqual(result.access_token, "access")
+        self.assertEqual(result.password, "")
+        flow.login_password_verify.assert_not_called()
+        flow.signup.assert_called_once_with(EMAIL, "sentinel")
+        provider.wait_for_otp.assert_called_once()
+
+    def test_password_login_reports_missing_totp_secret_explicitly(self):
+        flow = _flow(password="known-password")
+        flow._resolve_login_password = Mock(return_value=("known-password", True))
+        flow._env_flag = Mock(
+            side_effect=lambda key, default="0": key == "LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"
+        )
+        flow.authorize_continue = Mock(
+            return_value=_step("login_password", "https://auth.openai.com/log-in/password")
+        )
+        flow.login_password_verify.return_value = _step(
+            "mfa_challenge",
+            "https://auth.openai.com/mfa-challenge/challenge-id",
+        )
+        flow.signup = Mock()
+        provider = SimpleNamespace(wait_for_otp=Mock())
+
+        with self.assertRaisesRegex(RuntimeError, "已启用 2FA"):
+            flow.run_protocol_login(provider, EMAIL, password="known-password")
+
+        flow.signup.assert_not_called()
+        provider.wait_for_otp.assert_not_called()
+
+    def test_otp_login_reports_missing_totp_secret_explicitly(self):
+        flow = _flow()
+        flow._resolve_login_password = Mock(return_value=("guessed-password", False))
+
+        def passwordless_signup(_email, _sentinel):
+            flow._is_existing_account = True
+            flow._existing_page_type = "email_otp_verification"
+            flow._existing_email_verification_mode = "passwordless_login"
+            return False
+
+        flow.signup = Mock(side_effect=passwordless_signup)
+        flow.verify_otp = Mock(
+            return_value=_step(
+                "mfa_challenge",
+                "https://auth.openai.com/mfa-challenge/challenge-id",
+            )
+        )
+        provider = SimpleNamespace(wait_for_otp=Mock(return_value="890681"))
+
+        with self.assertRaisesRegex(RuntimeError, "无法重新生成"):
+            flow.run_protocol_login(provider, EMAIL)
+
     def test_codex_passwordless_login_never_submits_guessed_password(self):
         flow = _flow(totp_secret=TOTP_SECRET)
         flow._resolve_login_password = Mock(return_value=("guessed-password", False))

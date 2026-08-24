@@ -1,7 +1,12 @@
 import unittest
 from unittest.mock import patch
 
-from webui.auto_loop import AutoLoopController
+from webui.auto_loop import (
+    AutoLoopController,
+    _login_context_key,
+    login_controller_for,
+)
+from webui.registrar import classify_error
 
 
 class _Cursor:
@@ -22,6 +27,32 @@ class _Connection:
 
 
 class AutoLoopTests(unittest.TestCase):
+    def test_login_context_separates_credential_ensuring_strategy(self):
+        base = {"workspace_db_id": 7, "login_only": True}
+        self.assertEqual(
+            _login_context_key({**base, "ensure_credentials": True}),
+            "workspace:7:ensure",
+        )
+        self.assertEqual(
+            _login_context_key({**base, "ensure_credentials": False}),
+            "workspace:7:refresh",
+        )
+        self.assertNotEqual(
+            _login_context_key({**base, "ensure_credentials": True}),
+            _login_context_key({**base, "ensure_credentials": False}),
+        )
+
+    def test_login_controllers_are_not_shared_between_strategies(self):
+        ensured = login_controller_for(
+            workspace_db_id="test-isolation",
+            ensure_credentials=True,
+        )
+        refreshed = login_controller_for(
+            workspace_db_id="test-isolation",
+            ensure_credentials=False,
+        )
+        self.assertIsNot(ensured, refreshed)
+
     def test_stop_waits_for_started_run_terminal_state(self):
         controller = AutoLoopController()
         controller._stop_event.set()
@@ -98,6 +129,26 @@ class AutoLoopTests(unittest.TestCase):
         self.assertEqual(result["registered_fail"], 0)
         self.assertEqual(result["task_completed"], 1)
         self.assertEqual(result["retry_count"], 1)
+
+    def test_missing_totp_secret_is_not_retried_or_marked_as_account_invalid(self):
+        controller = self._controller_for_stats()
+        account = {"email": "no-secret@example.com", "_auto_task_key": "no-secret@example.com"}
+        key = controller._begin_account_attempt(account)
+        self.assertEqual(
+            classify_error(
+                "账号已启用 2FA，但本地没有 totp_secret，无法完成登录；"
+                "请从原始备份导入 2FA secret"
+            ),
+            "credential",
+        )
+        self.assertFalse(
+            controller._finish_with_optional_retry(
+                account, False, "credential", pooled=False,
+            )
+        )
+        result = controller.status()
+        self.assertEqual(result["registered_fail"], 1)
+        self.assertEqual(result["retry_count"], 0)
 
 
 if __name__ == "__main__":

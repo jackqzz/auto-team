@@ -751,6 +751,9 @@ def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, a
         raise HTTPException(400, "全局代理池为空")
     return {
         "login_only": True,
+        # 空间凭证任务只刷新目标 Workspace 的 token，不应因为账号本地缺少
+        # 密码/TOTP 而修改账号安全设置；公开/批量仅登录页面会显式开启它。
+        "ensure_credentials": False,
         "login_emails": [str(email).strip().lower()],
         "group_name": "__all__",
         "workspace_id": master.get("workspace_id", ""),
@@ -773,8 +776,18 @@ def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, a
         "target_count": 0,
     }
 
-def _wait_for_login_completion(workspace_id: int, email: str, timeout: int = 1800) -> bool:
-    controller = login_controller_for(workspace_db_id=workspace_id, workspace_id=(db.get_workspace_master(workspace_id) or {}).get("workspace_id", ""))
+def _wait_for_login_completion(
+    workspace_id: int,
+    email: str,
+    timeout: int = 1800,
+    *,
+    ensure_credentials: bool = False,
+) -> bool:
+    controller = login_controller_for(
+        workspace_db_id=workspace_id,
+        workspace_id=(db.get_workspace_master(workspace_id) or {}).get("workspace_id", ""),
+        ensure_credentials=ensure_credentials,
+    )
     deadline = time.time() + max(30, int(timeout))
     key = str(email or "").strip().lower()
     while time.time() < deadline:
@@ -1276,8 +1289,10 @@ def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], setting
     result = login_controller_for(
         workspace_db_id=workspace_id,
         workspace_id=master["workspace_id"],
+        ensure_credentials=False,
     ).start({
         "login_only": True,
+        "ensure_credentials": False,
         "login_emails": emails,
         "group_name": "__all__",
         "workspace_id": master["workspace_id"],
@@ -1682,6 +1697,7 @@ def _wait_and_relogin_for_candidate(workspace_id: int, email: str, settings: dic
         started = login_controller_for(
             workspace_db_id=workspace_id,
             workspace_id=(db.get_workspace_master(workspace_id) or {}).get("workspace_id", ""),
+            ensure_credentials=False,
         ).start(_workspace_login_options(workspace_id, email, settings, auto_export=auto_export))
     except HTTPException:
         raise
@@ -1691,7 +1707,12 @@ def _wait_and_relogin_for_candidate(workspace_id: int, email: str, settings: dic
     if not started.get("ok") and "已经在跑了" not in str(started.get("error") or ""):
         raise RuntimeError(started.get("error") or "重新登录未启动")
     timeout = int(settings.get("otp_timeout", 180) or 180) + 900
-    _wait_for_login_completion(workspace_id, email, timeout=timeout)
+    _wait_for_login_completion(
+        workspace_id,
+        email,
+        timeout=timeout,
+        ensure_credentials=False,
+    )
     account = db.get_registered(email)
     if account and account.get("account_status") == "permanently_invalid":
         if _candidate_trash_invalid_enabled(workspace_id, settings):
@@ -2344,8 +2365,13 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
         raise HTTPException(400, "全局代理池为空")
     if not eligible:
         return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(skipped), "skipped_emails": skipped}
-    result = login_controller_for(workspace_db_id=req.workspace_id, workspace_id=master["workspace_id"]).start({
-        "login_only": True, "login_emails": eligible, "group_name": "__all__",
+    result = login_controller_for(
+        workspace_db_id=req.workspace_id,
+        workspace_id=master["workspace_id"],
+        ensure_credentials=False,
+    ).start({
+        "login_only": True, "ensure_credentials": False,
+        "login_emails": eligible, "group_name": "__all__",
         "workspace_id": master["workspace_id"], "workspace_db_id": req.workspace_id, "proxy_pool": proxy_pool,
         "proxy": "", "proxy_usage_detail": "workspace_credentials",
         "concurrency": req.concurrency, "otp_timeout": req.otp_timeout,
@@ -3425,6 +3451,7 @@ class AutoLoopStartReq(BaseModel):
     want_refresh_token: bool = True
     want_password: bool = True  # 通用 OTP 是否强制创建密码
     login_only: bool = False    # 仅投送当前分组已有注册结果，刷新登录凭证
+    ensure_credentials: bool = True  # 仅登录时补齐缺失的密码 / TOTP secret
     login_no_rt_only: bool = False  # 仅对无 RT 的注册结果执行
     login_emails: Optional[list[str]] = None  # 仅登录时限定指定账号（注册结果页重登录）
     workspace_id: str = ""  # 空间凭证获取时强制选择目标 Workspace
@@ -3454,6 +3481,8 @@ def _controller_for_options(options: dict):
     return login_controller_for(
         workspace_db_id=(options or {}).get("workspace_db_id"),
         workspace_id=(options or {}).get("workspace_id", ""),
+        ensure_credentials=bool((options or {}).get("ensure_credentials", True)),
+        login_no_rt_only=bool((options or {}).get("login_no_rt_only")),
     )
 
 

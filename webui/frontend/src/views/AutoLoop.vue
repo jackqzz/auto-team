@@ -84,6 +84,7 @@ async function start() {
       add_phone_mode: form.value.autoAddPhoneMode,
       want_password: form.value.autoWantPassword,
       login_only: form.value.autoLoginOnly,
+      ensure_credentials: form.value.autoEnsureCredentials,
       login_no_rt_only: form.value.autoLoginNoRtOnly,
       group_name: form.value.autoGroupName,
       cool_down_seconds: parseFloat(form.value.autoCoolDown) || 0,
@@ -129,6 +130,15 @@ async function call(fn, name) {
         </div>
         <div class="hint" style="margin-top: 6px">
           开启后仅从注册结果里挑选 refresh_token 为空的账号执行，仅影响“仅登录”任务。
+        </div>
+      </el-form-item>
+      <el-form-item v-if="form.autoLoginOnly" label="凭证补齐">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoEnsureCredentials" />
+          <span>补齐缺失的密码和 2FA（TOTP）</span>
+        </div>
+        <div class="hint" style="margin-top: 6px; line-height: 1.5">
+          开启后仅对本地没有的项目操作：无密码账号先用邮箱 OTP 建立登录态；缺两项时先绑定 TOTP，再设置随机密码。已有密码或 2FA 不会重复修改。2FA secret 只下发一次，请及时备份。
         </div>
       </el-form-item>
 

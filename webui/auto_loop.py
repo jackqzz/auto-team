@@ -40,7 +40,14 @@ def _parse_proxy_pool(text: str) -> list[str]:
 
 
 def _login_context_key(options: dict) -> str:
-    """登录任务按空间划分上下文；同一空间后续请求进入同一队列。"""
+    """登录任务按空间和凭证策略划分上下文。
+
+    ``ensure_credentials`` 会改变任务的副作用：公开“仅登录”任务可以为
+    passwordless/无 TOTP 的账号补齐安全凭证，而空间凭证刷新任务必须只刷新
+    token。两者不能共用同一条队列，否则后到的请求可能被并入前一个任务并沿用
+    错误的策略。把策略编码进 key，既保留同一策略的队列合并，也让两类任务
+    可以在不同控制器中独立排队。
+    """
     value = (options or {}).get("workspace_db_id")
     if value not in (None, ""):
         base = f"workspace:{value}"
@@ -50,9 +57,10 @@ def _login_context_key(options: dict) -> str:
             base = f"workspace_external:{value}"
         else:
             base = "personal"
+    suffix = "ensure" if bool((options or {}).get("ensure_credentials", True)) else "refresh"
     if bool((options or {}).get("login_no_rt_only")):
-        return f"{base}:no_rt"
-    return base
+        suffix = f"{suffix}:no_rt"
+    return f"{base}:{suffix}"
 
 
 class AutoLoopController:
@@ -245,6 +253,7 @@ class AutoLoopController:
             "proxy_pool_size": len(self._proxy_pool),
             "target_count": self._target_count,
             "login_only": bool(self._options.get("login_only")),
+            "ensure_credentials": bool(self._options.get("ensure_credentials", True)),
             "login_no_rt_only": bool(self._options.get("login_no_rt_only")),
             "login_candidate_count": self._login_candidate_count,
             "task_total": self._task_total,
@@ -451,6 +460,7 @@ class AutoLoopController:
                 "target_count": self._target_count,
                 "account_retry_count": self._account_retry_count,
                 "login_only": bool(self._options.get("login_only")),
+                "ensure_credentials": bool(self._options.get("ensure_credentials", True)),
                 "task_type": "login" if self._options.get("login_only") else "register",
                 "login_candidate_count": self._login_candidate_count,
                 "remaining": (
@@ -577,7 +587,10 @@ class AutoLoopController:
 
     def _next_retry_number(self, account_key: str, category: str) -> int:
         """返回本账号下一次可用的重试序号；0 表示不再重试。"""
-        if not account_key or category == "account":
+        # account = 明确账号失效；credential = 本地不可恢复的凭证缺失。
+        # 两者重试都不会改变结果，尤其是缺失 TOTP secret 时反复登录只会
+        # 触发更多风控请求。
+        if not account_key or category in {"account", "credential"}:
             return 0
         with self._lock:
             if self._stop_event.is_set():
@@ -1176,10 +1189,18 @@ _LOGIN_CONTROLLERS_LOCK = threading.Lock()
 _LOGIN_CONTROLLERS: dict[str, AutoLoopController] = {}
 
 
-def login_controller_for(workspace_db_id=None, workspace_id: str = "") -> AutoLoopController:
+def login_controller_for(
+    workspace_db_id=None,
+    workspace_id: str = "",
+    *,
+    ensure_credentials: bool = True,
+    login_no_rt_only: bool = False,
+) -> AutoLoopController:
     key = _login_context_key({
         "workspace_db_id": workspace_db_id,
         "workspace_id": workspace_id,
+        "ensure_credentials": ensure_credentials,
+        "login_no_rt_only": login_no_rt_only,
     })
     with _LOGIN_CONTROLLERS_LOCK:
         controller = _LOGIN_CONTROLLERS.get(key)
