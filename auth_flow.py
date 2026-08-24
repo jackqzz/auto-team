@@ -2422,15 +2422,43 @@ class AuthFlow:
                     status = int(getattr(response, "status", 0) or 0)
                     if not 200 <= status < 300:
                         return
+                    body_text = ""
+                    try:
+                        body_text = str(response.text() or "")[:500]
+                    except Exception:
+                        pass
+                    body_lower = body_text.lower()
+                    response_error = False
+                    try:
+                        parsed_body = json.loads(body_text) if body_text else None
+                        if isinstance(parsed_body, dict):
+                            response_error = (
+                                parsed_body.get("success") is False
+                                or bool(parsed_body.get("error"))
+                            )
+                    except Exception:
+                        response_error = bool(
+                            re.search(r'"success"\s*:\s*false', body_lower)
+                        )
+                    # 有些版本用 200/202 返回业务失败，而不是 HTTP 4xx；
+                    # 这种响应不能被当成密码已设置。
+                    if (
+                        response_error
+                        or any(
+                            marker in body_lower
+                            for marker in (
+                                "invalid or expired", "unable to reset",
+                                "password does not meet", "password reset failed",
+                            )
+                        )
+                    ):
+                        return
                     password_response.update({
                         "ok": True,
                         "status": status,
                         "url": response_url,
+                        "body": body_text,
                     })
-                    try:
-                        password_response["body"] = str(response.text() or "")[:500]
-                    except Exception:
-                        pass
                 except Exception:
                     return
 
