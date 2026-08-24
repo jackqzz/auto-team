@@ -32,6 +32,30 @@ const stateType = computed(() => ({
 }[st.value] || 'info'))
 
 const workers = computed(() => Array.isArray(autoStatus.value.workers) ? autoStatus.value.workers : [])
+const proxyUsage = computed(() => (
+  Array.isArray(autoStatus.value.proxy_pool_usage)
+    ? autoStatus.value.proxy_pool_usage
+    : []
+))
+const taskTotalKnown = computed(() => autoStatus.value.task_total_known !== false && autoStatus.value.task_total != null)
+const taskTotal = computed(() => taskTotalKnown.value ? Number(autoStatus.value.task_total || 0) : null)
+const taskCompleted = computed(() => Number(autoStatus.value.task_completed || 0))
+const taskProgress = computed(() => {
+  if (!taskTotalKnown.value) return 0
+  if (!taskTotal.value) return st.value === 'stopped' ? 100 : 0
+  const value = Number(autoStatus.value.progress_percent)
+  if (Number.isFinite(value)) return Math.max(0, Math.min(100, value))
+  return Math.max(0, Math.min(100, taskCompleted.value * 100 / taskTotal.value))
+})
+const taskInProgress = computed(() => Number(autoStatus.value.task_in_progress || workers.value.length || 0))
+const taskRemaining = computed(() => taskTotalKnown.value
+  ? Math.max(0, Number(autoStatus.value.task_remaining ?? (taskTotal.value - taskCompleted.value)))
+  : null)
+const progressStatus = computed(() => (
+  st.value === 'stopped' && taskTotalKnown.value && taskCompleted.value >= (taskTotal.value || 0)
+    ? 'success'
+    : undefined
+))
 const groups = ref([])
 
 async function loadGroups() {
@@ -218,24 +242,83 @@ async function call(fn, name) {
         <el-button type="danger" :disabled="!canStop" @click="call(autoStop, '停止')">停止</el-button>
       </el-space>
 
-      <el-descriptions :column="4" border size="small" style="margin-top: 16px">
+      <el-descriptions :column="6" border size="small" style="margin-top: 16px">
         <el-descriptions-item label="状态"><StatusDot :type="stateType" :text="stateLabel" /></el-descriptions-item>
+        <el-descriptions-item label="任务对象">
+          <b>{{ taskTotalKnown ? taskTotal : '不限量' }}</b>
+        </el-descriptions-item>
+        <el-descriptions-item label="已完成">
+          <b>{{ taskCompleted }}</b>
+          <span v-if="taskTotalKnown"> / {{ taskTotal }}</span>
+        </el-descriptions-item>
         <el-descriptions-item label="成功">
           <b style="color: var(--el-color-success)">{{ autoStatus.registered_ok || 0 }}</b>
           <span v-if="autoStatus.target_count"> / {{ autoStatus.target_count }}</span>
         </el-descriptions-item>
-        <el-descriptions-item label="失败">
+        <el-descriptions-item label="最终失败">
           <b style="color: var(--el-color-danger)">{{ autoStatus.registered_fail || 0 }}</b>
+        </el-descriptions-item>
+        <el-descriptions-item label="重试账号">
+          <b style="color: var(--el-color-warning)">{{ autoStatus.retry_count || 0 }}</b>
+          <span v-if="autoStatus.retry_attempts">（{{ autoStatus.retry_attempts }} 次）</span>
         </el-descriptions-item>
         <el-descriptions-item label="并发">{{ autoStatus.concurrency || 1 }}</el-descriptions-item>
       </el-descriptions>
 
+      <div style="margin-top: 16px">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px">
+          <span>任务进度</span>
+          <span class="hint">
+            {{ taskTotalKnown
+              ? `${taskCompleted} / ${taskTotal}（剩余 ${taskRemaining}）`
+              : `${taskCompleted} 个已完成（总数不限）` }}
+            <span v-if="taskInProgress"> · {{ taskInProgress }} 个执行中</span>
+            <span v-if="autoStatus.task_retrying"> · {{ autoStatus.task_retrying }} 个待重试</span>
+          </span>
+        </div>
+        <el-progress
+          :percentage="taskProgress"
+          :indeterminate="!taskTotalKnown && st !== 'stopped'"
+          :duration="2"
+          :status="progressStatus"
+          :format="(p) => taskTotalKnown ? `${p}%` : (st === 'stopped' ? `${taskCompleted} 个` : '进行中')"
+        />
+        <p v-if="!taskTotalKnown" class="hint" style="margin: 6px 0 0">
+          当前邮箱来源没有有限的任务对象；可用“执行数量限制”设定确定的进度总数。
+        </p>
+        <p class="hint" style="margin: 6px 0 0">
+          统计按账号归并：重试中的中间失败不会计入“最终失败”，仅在重试耗尽后计入。
+        </p>
+      </div>
+
       <div v-if="workers.length" style="margin-top: 12px">
         <el-tag v-for="w in workers" :key="w.id" type="warning" effect="plain" style="margin: 0 6px 6px 0">
-          worker-{{ w.id }} · {{ w.email }}
+          worker-{{ w.id }} · {{ w.email }} · {{ w.proxy || '直连' }}
         </el-tag>
       </div>
       <p v-if="autoStatus.last_message" class="hint" style="margin-top: 8px">{{ autoStatus.last_message }}</p>
+    </el-card>
+
+    <el-card v-if="proxyUsage.length" shadow="never" style="margin-bottom: 16px">
+      <template #header>
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap">
+          <span class="section-title" style="margin: 0">当前代理租用计数</span>
+          <span class="hint">仅统计本次任务快照，任务结束后自动清空</span>
+        </div>
+      </template>
+      <el-table :data="proxyUsage" border size="small" style="width: 100%">
+        <el-table-column prop="index" label="#" width="60" />
+        <el-table-column prop="proxy" label="代理" min-width="260" show-overflow-tooltip />
+        <el-table-column prop="leased_count" label="租用次数" width="110" align="center" />
+        <el-table-column prop="active_count" label="当前执行" width="100" align="center" />
+        <el-table-column label="状态" width="100" align="center">
+          <template #default="scope">
+            <el-tag :type="scope.row.active_count ? 'warning' : 'info'" size="small">
+              {{ scope.row.active_count ? '使用中' : '空闲' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
     </el-card>
 
     <el-card shadow="never">

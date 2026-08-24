@@ -511,7 +511,7 @@ async function reloginSelected() {
   try {
     await ElMessageBox.confirm(
       `将选中的 ${emails.length} 个已注册账号投入重登录。\n` +
-      '每个账号只尝试一次，遇到网络或其他错误将直接结束该账号，不会重试。继续？',
+      '每个账号按任务配置执行；遇到可重试错误会重新尝试，页面会按账号统计最终成功、最终失败和重试次数。继续？',
       '重登录选中账号',
       { type: 'warning', confirmButtonText: '开始重登录', cancelButtonText: '取消', customClass: 'confirm-multiline' },
     )
@@ -563,6 +563,7 @@ onActivated(() => load())
         <el-button :loading="importingSub2Api" @click="chooseSub2ApiFile">导入 Sub2API 账号</el-button>
         <el-select v-model="filter" style="width: 130px" @change="load(true)">
           <el-option label="全部" value="all" />
+          <el-option label="已获取 AT" value="has_at" />
           <el-option label="有 RT" value="has_rt" />
           <el-option label="无 RT" value="no_rt" />
           <el-option label="未检测" value="unchecked" />

@@ -1,8 +1,18 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
-import { checkPublicRelogin, runPublicRelogin } from '@/api/publicRelogin'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  checkPublicRelogin,
+  getPublicReloginQueueStatus,
+  runPublicRelogin,
+} from '@/api/publicRelogin'
 import { useProxyStore } from '@/stores/proxy'
+import {
+  pushToCpa,
+  pushToSub2Api,
+  testCpaConnection,
+  testSub2ApiConnection,
+} from '@/utils/publicPoolPush'
 
 const fileInput = ref(null)
 const proxyStore = useProxyStore()
@@ -15,7 +25,35 @@ const lastResults = ref({})
 const checkProgress = ref({ done: 0, total: 0 })
 const reloginProgress = ref({ done: 0, total: 0 })
 const ACCESS_KEY_CACHE = 'gpt_auto_register_public_relogin_access_key'
+const INSPECTION_SETTINGS_CACHE = 'gpt_auto_register_public_relogin_inspection'
+const POOL_PUSH_CONFIG_CACHE = 'gpt_auto_register_public_relogin_pool_push'
 const accessKey = ref('')
+const inspectionBatchSize = ref(8)
+const inspectionIntervalMinutes = ref(5)
+const inspectionRunning = ref(false)
+const inspectionNextAt = ref(0)
+const inspectionRound = ref(0)
+const inspectionLastBatch = ref(0)
+const queueStatus = ref({ quota: null, relogin: null })
+const clockNow = ref(Date.now())
+const poolPushDrawerVisible = ref(false)
+const testingPoolTarget = ref('')
+const manualPoolPushing = ref(false)
+const poolPushResults = ref({})
+const poolPushStats = reactive({ queued: 0, running: 0, success: 0, failed: 0, lastMessage: '' })
+
+const defaultPoolPushConfig = () => ({
+  autoEnabled: false,
+  cpa: { enabled: false, url: '', key: '', timeout: 30 },
+  sub2api: { enabled: false, url: '', key: '', groupIds: '2', timeout: 30 },
+})
+const poolPushConfig = reactive(defaultPoolPushConfig())
+const pushedCredentials = new Set()
+let inspectionTimer = null
+let clockTimer = null
+let queueStatusTimer = null
+let poolPushQueue = Promise.resolve()
+let suppressPoolPushSave = false
 
 const statusCount = computed(() => ({
   total: accounts.value.length,
@@ -25,7 +63,36 @@ const statusCount = computed(() => ({
   deactivated: accounts.value.filter((a) => a.status === 'deactivated').length,
 }))
 
+const inspectionCountdown = computed(() => {
+  if (!inspectionRunning.value || !inspectionNextAt.value) return '-'
+  const seconds = Math.max(0, Math.ceil((inspectionNextAt.value - clockNow.value) / 1000))
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}:${String(seconds % 60).padStart(2, '0')}`
+})
+const queueItems = computed(() => [queueStatus.value.quota, queueStatus.value.relogin].filter(Boolean))
+const enabledPoolTargetNames = computed(() => [
+  poolPushConfig.cpa.enabled ? 'CPA' : '',
+  poolPushConfig.sub2api.enabled ? 'Sub2API' : '',
+].filter(Boolean))
+const poolPushConfigIssue = computed(() => {
+  if (!enabledPoolTargetNames.value.length) return '请至少启用一个推送目标'
+  if (poolPushConfig.cpa.enabled && (!poolPushConfig.cpa.url.trim() || !poolPushConfig.cpa.key.trim())) {
+    return 'CPA 已启用，但 URL 或管理密钥未填写完整'
+  }
+  if (poolPushConfig.sub2api.enabled && (!poolPushConfig.sub2api.url.trim() || !poolPushConfig.sub2api.key.trim())) {
+    return 'Sub2API 已启用，但 URL 或 API Key 未填写完整'
+  }
+  return ''
+})
+
 const openFile = () => fileInput.value?.click()
+
+async function loadQueueStatus() {
+  try {
+    const result = await getPublicReloginQueueStatus()
+    queueStatus.value = result.queues || { quota: null, relogin: null }
+  } catch (_) { /* 页面未启用或服务重启时保留上一次状态 */ }
+}
 
 function handleAuthError(e) {
   if (e?.status === 403 && String(e.message || '').includes('访问密钥')) {
@@ -41,6 +108,177 @@ function requireAccessKey() {
     return ''
   }
   return key
+}
+
+function poolTargetConfig(target) {
+  return target === 'cpa' ? poolPushConfig.cpa : poolPushConfig.sub2api
+}
+
+function poolTargetLabel(target) {
+  return target === 'cpa' ? 'CPA' : 'Sub2API'
+}
+
+function loadPoolPushConfig() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(POOL_PUSH_CONFIG_CACHE) || '{}')
+    poolPushConfig.autoEnabled = Boolean(saved.autoEnabled)
+    Object.assign(poolPushConfig.cpa, {
+      enabled: Boolean(saved.cpa?.enabled),
+      url: String(saved.cpa?.url || ''),
+      key: String(saved.cpa?.key || ''),
+      timeout: Math.max(5, Math.min(300, Number(saved.cpa?.timeout) || 30)),
+    })
+    Object.assign(poolPushConfig.sub2api, {
+      enabled: Boolean(saved.sub2api?.enabled),
+      url: String(saved.sub2api?.url || ''),
+      key: String(saved.sub2api?.key || ''),
+      groupIds: String(saved.sub2api?.groupIds || '2'),
+      timeout: Math.max(5, Math.min(300, Number(saved.sub2api?.timeout) || 30)),
+    })
+  } catch (_) {
+    localStorage.removeItem(POOL_PUSH_CONFIG_CACHE)
+  }
+}
+
+function savePoolPushConfig() {
+  if (suppressPoolPushSave) return
+  localStorage.setItem(POOL_PUSH_CONFIG_CACHE, JSON.stringify({
+    autoEnabled: poolPushConfig.autoEnabled,
+    cpa: { ...poolPushConfig.cpa },
+    sub2api: { ...poolPushConfig.sub2api },
+  }))
+}
+
+async function clearPoolPushConfig() {
+  if (poolPushStats.queued || poolPushStats.running) {
+    ElMessage.warning('号池推送仍在执行，请等待当前队列结束后再清除配置')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '将从当前浏览器清除 CPA/Sub2API 地址、密钥和自动推送设置。',
+      '清除本地号池配置',
+      { type: 'warning', confirmButtonText: '清除', cancelButtonText: '取消' },
+    )
+  } catch (_) {
+    return
+  }
+  suppressPoolPushSave = true
+  Object.assign(poolPushConfig, defaultPoolPushConfig())
+  poolPushResults.value = {}
+  poolPushStats.queued = 0
+  poolPushStats.running = 0
+  poolPushStats.success = 0
+  poolPushStats.failed = 0
+  poolPushStats.lastMessage = ''
+  pushedCredentials.clear()
+  localStorage.removeItem(POOL_PUSH_CONFIG_CACHE)
+  await nextTick()
+  suppressPoolPushSave = false
+  ElMessage.success('当前浏览器的号池配置已清除')
+}
+
+async function testPoolTarget(target) {
+  testingPoolTarget.value = target
+  try {
+    const config = poolTargetConfig(target)
+    const result = target === 'cpa'
+      ? await testCpaConnection(config)
+      : await testSub2ApiConnection(config)
+    ElMessage.success(result.message)
+  } catch (error) {
+    ElMessage.error(error.message || `${poolTargetLabel(target)} 连接失败`)
+  } finally {
+    testingPoolTarget.value = ''
+  }
+}
+
+function pushCredentialKey(target, account) {
+  return `${target}:${String(account.email || '').toLowerCase()}:${String(account.access_token || '')}`
+}
+
+function setPoolPushResult(account, target, result) {
+  const key = `${account.id}:${target}`
+  poolPushResults.value = {
+    ...poolPushResults.value,
+    [key]: { ...result, updatedAt: Date.now() },
+  }
+}
+
+async function executePoolPush(account, target, config, credentialKey) {
+  const label = poolTargetLabel(target)
+  poolPushStats.queued = Math.max(0, poolPushStats.queued - 1)
+  poolPushStats.running += 1
+  setPoolPushResult(account, target, { status: 'pushing', message: `${label} 推送中` })
+  try {
+    const result = target === 'cpa'
+      ? await pushToCpa(account, config)
+      : await pushToSub2Api(account, config)
+    poolPushStats.success += 1
+    poolPushStats.lastMessage = `${label}：${result.message}`
+    setPoolPushResult(account, target, { status: 'success', message: result.message })
+    return true
+  } catch (error) {
+    pushedCredentials.delete(credentialKey)
+    const message = error.message || `${label} 推送失败`
+    poolPushStats.failed += 1
+    poolPushStats.lastMessage = `${label}：${message}`
+    setPoolPushResult(account, target, { status: 'failed', message })
+    return false
+  } finally {
+    poolPushStats.running = Math.max(0, poolPushStats.running - 1)
+  }
+}
+
+function enqueuePoolPush(account, { auto = false, force = false } = {}) {
+  if (auto && !poolPushConfig.autoEnabled) return 0
+  const targets = ['cpa', 'sub2api'].filter((target) => poolTargetConfig(target).enabled)
+  let queued = 0
+  for (const target of targets) {
+    const config = { ...poolTargetConfig(target) }
+    const credentialKey = `${pushCredentialKey(target, account)}:${config.url.trim()}`
+    if (!force && pushedCredentials.has(credentialKey)) continue
+    pushedCredentials.add(credentialKey)
+    poolPushStats.queued += 1
+    queued += 1
+    poolPushQueue = poolPushQueue.then(() => executePoolPush(account, target, config, credentialKey))
+  }
+  return queued
+}
+
+async function pushCurrentRevived() {
+  if (poolPushStats.queued || poolPushStats.running) {
+    return ElMessage.warning('已有号池推送正在执行，请等待当前队列结束')
+  }
+  const rows = accounts.value.filter((item) => item.status === 'revived')
+  if (!rows.length) return ElMessage.warning('当前没有复活项可推送')
+  if (poolPushConfigIssue.value) return ElMessage.warning(poolPushConfigIssue.value)
+  manualPoolPushing.value = true
+  const startStats = { success: poolPushStats.success, failed: poolPushStats.failed }
+  let queued = 0
+  for (const account of rows) queued += enqueuePoolPush(account, { force: true })
+  if (!queued) {
+    manualPoolPushing.value = false
+    return ElMessage.info('没有需要推送的目标')
+  }
+  try {
+    await poolPushQueue
+    const success = poolPushStats.success - startStats.success
+    const failed = poolPushStats.failed - startStats.failed
+    if (failed) ElMessage.warning(`手动推送完成：成功 ${success}，失败 ${failed}`)
+    else ElMessage.success(`手动推送完成：成功 ${success}`)
+  } finally {
+    manualPoolPushing.value = false
+  }
+}
+
+function autoPushRevived(account) {
+  if (!poolPushConfig.autoEnabled || poolPushConfigIssue.value) return
+  enqueuePoolPush(account, { auto: true })
+}
+
+function poolPushStatusFor(row, target) {
+  return poolPushResults.value[`${row.id}:${target}`] || null
 }
 
 const normalizeAccount = (item, idx) => {
@@ -82,6 +320,7 @@ const normalizeAccount = (item, idx) => {
     status: 'unknown',
     quota: null,
     error: '',
+    last_checked_at: 0,
     account: item,
   }
 }
@@ -115,6 +354,7 @@ const handleFile = async (event) => {
     const payload = JSON.parse(rawText.value)
     accounts.value = parsePayload(payload)
     lastResults.value = {}
+    stopInspection(false)
     ElMessage.success(`已导入 ${accounts.value.length} 个账号`)
   } catch (e) {
     ElMessage.error(e.message || '导入失败')
@@ -127,76 +367,176 @@ const updateOne = (targetId, patch) => {
   accounts.value = accounts.value.map((item) => (item.id === targetId ? { ...item, ...patch } : item))
 }
 
-const runConcurrent = async (items, limit, worker) => {
-  let cursor = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const current = cursor
-      cursor += 1
-      await worker(items[current], current)
-    }
-  })
-  await Promise.all(workers)
-}
-
-const applyCheckResult = (item, result) => {
+const applyCheckResult = (item, result, checkedAt = Date.now()) => {
   if (!result) return
   lastResults.value = { ...lastResults.value, [item.id]: result }
+  if (result.status === 'revived' && result.account) {
+    const refreshed = normalizeAccount(result.account, 0)
+    const revivedAccount = {
+      ...refreshed,
+      id: item.id,
+      proxy: item.proxy || refreshed.proxy,
+      status: 'revived',
+      error: '',
+      last_checked_at: checkedAt,
+    }
+    updateOne(item.id, revivedAccount)
+    autoPushRevived(revivedAccount)
+    return
+  }
   updateOne(item.id, {
     status: result.status === 'active' ? 'active' : result.status,
     email: result.email || item.email,
     workspace_id: result.workspace_id || item.workspace_id,
     quota: result.quota || null,
     error: result.error || '',
+    last_checked_at: checkedAt,
   })
 }
 
-const doCheck = async () => {
-  if (!accounts.value.length) return ElMessage.warning('请先导入账号')
+const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => {
+  if (!items.length) return false
+  if (checking.value || relogining.value) return false
   const key = requireAccessKey()
-  if (!key) return
+  if (!key) return false
   checking.value = true
-  checkProgress.value = { done: 0, total: accounts.value.length }
+  checkProgress.value = { done: 0, total: items.length }
+  const ids = new Set(items.map((item) => item.id))
   accounts.value = accounts.value.map((item) => ({
     ...item,
-    status: 'checking',
-    quota: null,
-    error: '',
+    ...(ids.has(item.id) ? { status: 'checking', quota: null, error: '' } : {}),
   }))
+  const checkedAt = Date.now()
   try {
-    const snapshot = [...accounts.value]
-    await runConcurrent(snapshot, 8, async (item) => {
-      try {
-        const res = await checkPublicRelogin({
-          accounts: [item],
-          access_key: key,
-          concurrency: 1,
-          proxy_pool: proxyStore.text,
+    // 一批账号放在同一个请求里，后端才能在该批次内正确轮换代理。
+    const res = await checkPublicRelogin({
+      accounts: items,
+      access_key: key,
+      concurrency: 0,
+      proxy_pool: proxyStore.text,
+      auto_relogin_on_401: autoReloginOn401,
+    })
+    for (const item of items) {
+      const result = res.results?.[item.id] || {
+        ok: false,
+        status: 'error',
+        email: item.email,
+        workspace_id: item.workspace_id,
+        error: '服务器未返回该账号的巡检结果',
+      }
+      applyCheckResult(item, result, checkedAt)
+      checkProgress.value = { ...checkProgress.value, done: checkProgress.value.done + 1 }
+    }
+    const queueFullCount = Object.values(res.results || {}).filter(
+      (result) => result?.status === 'queue_full',
+    ).length
+    if (queueFullCount) {
+      ElMessage.warning(`${queueFullCount} 个账号未能进入 401 重登录队列，请稍后重试`)
+    }
+    queueStatus.value = res.queues || queueStatus.value
+    if (notify) ElMessage.success(`额度检查完成，共 ${items.length} 个`)
+    return true
+  } catch (e) {
+    handleAuthError(e)
+    if (e.status === 429) {
+      for (const item of items) {
+        updateOne(item.id, {
+          status: item.status,
+          quota: item.quota,
+          error: e.message || '额度查询队列已满，请稍后重试',
         })
-        const result = res.results?.[item.id] || Object.values(res.results || {})[0]
-        applyCheckResult(item, result)
-      } catch (e) {
-        handleAuthError(e)
-        applyCheckResult(item, {
+      }
+      ElMessage.warning(e.message || '额度查询队列已满，请稍后重试')
+      loadQueueStatus()
+      return false
+    }
+    for (const item of items) {
+      applyCheckResult(item, {
           ok: false,
           status: e.status === 401 ? '401' : 'error',
           email: item.email,
           workspace_id: item.workspace_id,
           error: e.message || '额度检查失败',
-        })
-      } finally {
-        checkProgress.value = {
-          ...checkProgress.value,
-          done: checkProgress.value.done + 1,
-        }
-      }
-    })
-    ElMessage.success('额度检查完成')
-  } catch (e) {
-    ElMessage.error(e.message)
+      }, checkedAt)
+      checkProgress.value = { ...checkProgress.value, done: checkProgress.value.done + 1 }
+    }
+    if (notify) ElMessage.error(e.message)
+    return false
   } finally {
     checking.value = false
   }
+}
+
+const doCheck = async () => {
+  if (!accounts.value.length) return ElMessage.warning('请先导入账号')
+  await checkAccounts([...accounts.value])
+}
+
+function clearInspectionTimer() {
+  if (inspectionTimer) clearTimeout(inspectionTimer)
+  inspectionTimer = null
+  inspectionNextAt.value = 0
+}
+
+function scheduleInspection(delayMs) {
+  clearInspectionTimer()
+  if (!inspectionRunning.value) return
+  inspectionNextAt.value = Date.now() + delayMs
+  inspectionTimer = setTimeout(runInspectionBatch, delayMs)
+}
+
+async function runInspectionBatch() {
+  if (!inspectionRunning.value) return
+  if (checking.value || relogining.value) {
+    scheduleInspection(5000)
+    return
+  }
+  if (!accounts.value.length) {
+    stopInspection()
+    return
+  }
+  const size = Math.min(
+    Math.max(1, Number(inspectionBatchSize.value) || 8),
+    accounts.value.length,
+  )
+  const batch = accounts.value
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (a.item.last_checked_at || 0) - (b.item.last_checked_at || 0) || a.index - b.index)
+    .slice(0, size)
+    .map(({ item }) => item)
+  const completed = await checkAccounts(batch, false, true)
+  if (!accessKey.value.trim()) {
+    stopInspection(false)
+    return
+  }
+  if (completed) {
+    inspectionRound.value += 1
+    inspectionLastBatch.value = batch.length
+  }
+  if (inspectionRunning.value) {
+    scheduleInspection(Math.max(1, Number(inspectionIntervalMinutes.value) || 5) * 60000)
+  }
+}
+
+function startInspection() {
+  if (!accounts.value.length) return ElMessage.warning('请先导入账号')
+  if (!requireAccessKey()) return
+  inspectionRunning.value = true
+  inspectionRound.value = 0
+  inspectionLastBatch.value = 0
+  clearInspectionTimer()
+  ElMessage.success('定时巡检已启动')
+  runInspectionBatch()
+}
+
+function stopInspection(notify = true) {
+  inspectionRunning.value = false
+  clearInspectionTimer()
+  if (notify) ElMessage.info('定时巡检已停止')
+}
+
+function formatCheckedAt(value) {
+  return value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : '未检查'
 }
 
 const doRelogin = async (onlyRevived = true) => {
@@ -207,6 +547,7 @@ const doRelogin = async (onlyRevived = true) => {
   relogining.value = true
   reloginProgress.value = { done: 0, total: list.length }
   const targetIds = new Set(list.map((item) => item.id))
+  const previousStates = new Map(list.map((item) => [item.id, item.status]))
   let revived = 0
   accounts.value = accounts.value.map((item) => (
     targetIds.has(item.id)
@@ -232,13 +573,15 @@ const doRelogin = async (onlyRevived = true) => {
         if (result.status === 'revived' && result.account) {
           revived += 1
           const refreshed = normalizeAccount(result.account, 0)
-          updateOne(item.id, {
+          const revivedAccount = {
             ...refreshed,
             id: item.id,
             proxy: item.proxy || refreshed.proxy,
             status: 'revived',
             error: '',
-          })
+          }
+          updateOne(item.id, revivedAccount)
+          autoPushRevived(revivedAccount)
         } else {
           updateOne(item.id, {
             status: result.status || 'failed',
@@ -260,11 +603,20 @@ const doRelogin = async (onlyRevived = true) => {
         reloginProgress.value = { ...reloginProgress.value, done: reloginProgress.value.done + 1 }
       }
     }
+    queueStatus.value = res.queues || queueStatus.value
     ElMessage.success(`重登完成，成功 ${revived} 个`)
   } catch (e) {
-    ElMessage.error(e.message)
+    for (const item of list) {
+      updateOne(item.id, {
+        status: previousStates.get(item.id) || '401',
+        error: e.message || '401 重登录队列已满，请稍后重试',
+      })
+    }
+    if (e.status === 429) ElMessage.warning(e.message || '401 重登录队列已满，请稍后重试')
+    else ElMessage.error(e.message)
   } finally {
     relogining.value = false
+    loadQueueStatus()
   }
 }
 
@@ -329,8 +681,29 @@ watch(accessKey, (value) => {
   else localStorage.removeItem(ACCESS_KEY_CACHE)
 })
 
+watch([inspectionBatchSize, inspectionIntervalMinutes], ([batchSize, interval]) => {
+  localStorage.setItem(INSPECTION_SETTINGS_CACHE, JSON.stringify({ batchSize, interval }))
+})
+
+watch(poolPushConfig, savePoolPushConfig, { deep: true })
+
 onMounted(() => {
   accessKey.value = localStorage.getItem(ACCESS_KEY_CACHE) || ''
+  try {
+    const saved = JSON.parse(localStorage.getItem(INSPECTION_SETTINGS_CACHE) || '{}')
+    inspectionBatchSize.value = Math.max(1, Number(saved.batchSize) || 8)
+    inspectionIntervalMinutes.value = Math.max(1, Number(saved.interval) || 5)
+  } catch (_) { /* 使用默认值 */ }
+  loadPoolPushConfig()
+  clockTimer = setInterval(() => { clockNow.value = Date.now() }, 1000)
+  loadQueueStatus()
+  queueStatusTimer = setInterval(loadQueueStatus, 5000)
+})
+
+onBeforeUnmount(() => {
+  clearInspectionTimer()
+  if (clockTimer) clearInterval(clockTimer)
+  if (queueStatusTimer) clearInterval(queueStatusTimer)
 })
 </script>
 
@@ -359,10 +732,14 @@ onMounted(() => {
       />
 
       <div class="toolbar">
-        <input ref="fileInput" type="file" accept="application/json,.json" class="hidden" @change="handleFile" />
+        <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="handleFile" />
         <el-button :loading="loading" @click="openFile">导入 JSON</el-button>
         <el-button :loading="checking" type="primary" @click="doCheck">检查额度 / 401</el-button>
         <el-button :loading="relogining" type="success" @click="doRelogin(true)">一键重新登录</el-button>
+        <el-button @click="poolPushDrawerVisible = true">
+          <el-icon><Upload /></el-icon>
+          自动号池推送
+        </el-button>
         <el-dropdown>
           <el-button>
             下载
@@ -375,6 +752,74 @@ onMounted(() => {
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+      </div>
+
+      <div class="pool-push-strip">
+        <el-tag :type="poolPushConfig.autoEnabled ? 'success' : 'info'" size="small">
+          自动推送{{ poolPushConfig.autoEnabled ? '已开启' : '未开启' }}
+        </el-tag>
+        <el-tag
+          v-if="poolPushConfig.autoEnabled && poolPushConfigIssue"
+          type="danger"
+          size="small"
+          effect="plain"
+        >{{ poolPushConfigIssue }}</el-tag>
+        <span>目标：{{ enabledPoolTargetNames.join(' + ') || '未配置' }}</span>
+        <span v-if="poolPushStats.queued || poolPushStats.running">
+          等待 {{ poolPushStats.queued }}，推送中 {{ poolPushStats.running }}
+        </span>
+        <span>成功 {{ poolPushStats.success }}，失败 {{ poolPushStats.failed }}</span>
+        <span>配置仅存当前浏览器，浏览器直接连接号池</span>
+        <span v-if="poolPushStats.lastMessage" class="pool-push-last" :title="poolPushStats.lastMessage">
+          {{ poolPushStats.lastMessage }}
+        </span>
+      </div>
+
+      <div class="inspection-bar">
+        <el-form-item label="巡检批次" style="margin: 0">
+          <el-input-number
+            v-model="inspectionBatchSize"
+            :min="1"
+            :max="200"
+            controls-position="right"
+          />
+        </el-form-item>
+        <el-form-item label="巡检周期（分钟）" style="margin: 0">
+          <el-input-number
+            v-model="inspectionIntervalMinutes"
+            :min="1"
+            :max="1440"
+            controls-position="right"
+          />
+        </el-form-item>
+        <el-button
+          v-if="!inspectionRunning"
+          type="primary"
+          plain
+          :disabled="!accounts.length"
+          @click="startInspection"
+        >启动定时巡检</el-button>
+        <el-button v-else type="danger" plain @click="stopInspection()">停止定时巡检</el-button>
+        <div class="inspection-status">
+          <el-tag :type="inspectionRunning ? 'success' : 'info'">
+            {{ inspectionRunning ? '运行中' : '未运行' }}
+          </el-tag>
+          <span v-if="inspectionRunning">
+            下一轮 {{ inspectionCountdown }}，已完成 {{ inspectionRound }} 批，上一批 {{ inspectionLastBatch }} 个；发现 401 立即复活
+          </span>
+          <span v-else>启动后立即检查最久未检查的一批</span>
+        </div>
+      </div>
+
+      <div class="queue-strip">
+        <div v-for="item in queueItems" :key="item.name" class="queue-item">
+          <el-tag :type="item.full ? 'danger' : item.waiting ? 'warning' : 'success'" size="small">
+            {{ item.name }}{{ item.full ? ' · 已满' : '' }}
+          </el-tag>
+          <span>运行 {{ item.running }}/{{ item.concurrency }}</span>
+          <span>等待 {{ item.waiting }}/{{ item.capacity }}</span>
+          <span>可接收 {{ item.available }}</span>
+        </div>
       </div>
 
       <div class="hint" style="margin-top: 8px">
@@ -443,7 +888,31 @@ onMounted(() => {
             <el-tag v-else-if="row.status === 'active'" type="success" effect="plain">正常</el-tag>
             <el-tag v-else-if="row.status === 'error'" type="danger" effect="plain">错误</el-tag>
             <el-tag v-else-if="row.status === 'failed'" type="danger" effect="plain">重登录失败</el-tag>
+            <el-tag v-else-if="row.status === 'queue_full'" type="danger" effect="plain">队列已满</el-tag>
             <el-tag v-else type="info" effect="plain">未知</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="最近检查" width="110">
+          <template #default="{ row }">
+            <span class="hint">{{ formatCheckedAt(row.last_checked_at) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="号池推送" min-width="180">
+          <template #default="{ row }">
+            <div v-if="poolPushStatusFor(row, 'cpa') || poolPushStatusFor(row, 'sub2api')" class="push-result-list">
+              <el-tag
+                v-for="target in ['cpa', 'sub2api']"
+                v-show="poolPushStatusFor(row, target)"
+                :key="target"
+                :type="poolPushStatusFor(row, target)?.status === 'success' ? 'success' : poolPushStatusFor(row, target)?.status === 'failed' ? 'danger' : 'info'"
+                size="small"
+                effect="plain"
+                :title="poolPushStatusFor(row, target)?.message"
+              >
+                {{ poolTargetLabel(target) }} · {{ poolPushStatusFor(row, target)?.status === 'success' ? '成功' : poolPushStatusFor(row, target)?.status === 'failed' ? '失败' : '推送中' }}
+              </el-tag>
+            </div>
+            <span v-else>-</span>
           </template>
         </el-table-column>
         <el-table-column label="额度" min-width="220">
@@ -454,10 +923,186 @@ onMounted(() => {
         </el-table-column>
       </el-table>
     </el-card>
+
+    <el-drawer
+      v-model="poolPushDrawerVisible"
+      title="浏览器自动号池推送"
+      size="min(620px, 94vw)"
+      append-to-body
+    >
+      <el-alert
+        type="success"
+        show-icon
+        :closable="false"
+        title="号池地址与密钥仅保存在当前浏览器；推送由浏览器直接连接 CPA / Sub2API。本项目服务器不会接收、保存或转发这些配置。"
+      />
+      <el-alert
+        class="pool-push-alert"
+        type="warning"
+        show-icon
+        :closable="false"
+        title="目标号池必须允许跨域请求（CORS）及对应鉴权请求头；本页面为 HTTPS 时只能连接 HTTPS 号池。"
+      />
+
+      <div class="pool-auto-row">
+        <div>
+          <div class="pool-setting-title">复活后自动推送</div>
+          <div class="hint">手动重登录和定时巡检复活成功后立即进入浏览器推送队列。</div>
+        </div>
+        <el-switch v-model="poolPushConfig.autoEnabled" />
+      </div>
+      <el-alert
+        v-if="poolPushConfig.autoEnabled && poolPushConfigIssue"
+        class="pool-push-alert"
+        type="error"
+        show-icon
+        :closable="false"
+        :title="poolPushConfigIssue"
+      />
+
+      <section class="pool-target-section">
+        <div class="pool-target-header">
+          <el-checkbox v-model="poolPushConfig.cpa.enabled">启用 CPA</el-checkbox>
+          <span class="hint">POST /v0/management/auth-files</span>
+        </div>
+        <el-form label-position="top">
+          <el-form-item label="CPA URL">
+            <el-input v-model="poolPushConfig.cpa.url" placeholder="https://cpa.example.com" clearable />
+          </el-form-item>
+          <el-form-item label="管理密钥（Authorization Bearer + X-Management-Key）">
+            <el-input v-model="poolPushConfig.cpa.key" type="password" show-password clearable placeholder="CPA 管理密钥" />
+          </el-form-item>
+          <div class="pool-target-actions">
+            <el-form-item label="请求超时（秒）" style="margin-bottom: 0">
+              <el-input-number v-model="poolPushConfig.cpa.timeout" :min="5" :max="300" controls-position="right" />
+            </el-form-item>
+            <el-button :loading="testingPoolTarget === 'cpa'" @click="testPoolTarget('cpa')">测试浏览器直连</el-button>
+          </div>
+        </el-form>
+      </section>
+
+      <section class="pool-target-section">
+        <div class="pool-target-header">
+          <el-checkbox v-model="poolPushConfig.sub2api.enabled">启用 Sub2API</el-checkbox>
+          <span class="hint">POST /api/v1/admin/accounts</span>
+        </div>
+        <el-form label-position="top">
+          <el-form-item label="Sub2API URL">
+            <el-input v-model="poolPushConfig.sub2api.url" placeholder="https://sub2api.example.com" clearable />
+          </el-form-item>
+          <el-form-item label="API Key（x-api-key）">
+            <el-input v-model="poolPushConfig.sub2api.key" type="password" show-password clearable placeholder="Sub2API API Key" />
+          </el-form-item>
+          <el-form-item label="分组 IDs（逗号分隔）">
+            <el-input v-model="poolPushConfig.sub2api.groupIds" placeholder="2" clearable />
+          </el-form-item>
+          <div class="pool-target-actions">
+            <el-form-item label="请求超时（秒）" style="margin-bottom: 0">
+              <el-input-number v-model="poolPushConfig.sub2api.timeout" :min="5" :max="300" controls-position="right" />
+            </el-form-item>
+            <el-button :loading="testingPoolTarget === 'sub2api'" @click="testPoolTarget('sub2api')">测试浏览器直连</el-button>
+          </div>
+        </el-form>
+      </section>
+
+      <div class="pool-drawer-actions">
+        <el-button type="danger" plain @click="clearPoolPushConfig">清除本地配置</el-button>
+        <el-button
+          type="primary"
+          :loading="manualPoolPushing"
+          :disabled="Boolean(poolPushConfigIssue) || Boolean(poolPushStats.queued || poolPushStats.running)"
+          @click="pushCurrentRevived"
+        >推送当前复活项</el-button>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
 <style scoped>
 .page { padding: 16px; }
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+.pool-push-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 34px;
+  padding-top: 10px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.pool-push-last {
+  max-width: min(520px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspection-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 12px 0;
+  border-top: 1px solid var(--el-border-color-light);
+  border-bottom: 1px solid var(--el-border-color-light);
+}
+.inspection-status {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.queue-strip {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  min-height: 34px;
+  padding-top: 10px;
+}
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.push-result-list { display: flex; gap: 6px; flex-wrap: wrap; }
+.pool-push-alert { margin-top: 12px; }
+.pool-auto-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 0 14px;
+  border-bottom: 1px solid var(--el-border-color-light);
+}
+.pool-setting-title { font-weight: 600; }
+.pool-target-section {
+  padding: 18px 0;
+  border-bottom: 1px solid var(--el-border-color-light);
+}
+.pool-target-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.pool-target-actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pool-drawer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 18px;
+}
 </style>

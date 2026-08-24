@@ -132,7 +132,24 @@ def init_db():
             error           TEXT,
             error_category  TEXT         -- network / account / unknown
         );
+
+        CREATE TABLE IF NOT EXISTS proxy_lease_usage (
+            proxy           TEXT NOT NULL,
+            task_type       TEXT NOT NULL,
+            task_detail     TEXT NOT NULL DEFAULT '',
+            leased_count    INTEGER NOT NULL DEFAULT 0,
+            first_leased_at REAL NOT NULL,
+            last_leased_at  REAL NOT NULL,
+            PRIMARY KEY (proxy, task_type, task_detail)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_proxy_lease_usage_last
+            ON proxy_lease_usage(last_leased_at DESC);
     """)
+    con.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_usage_since', ?)",
+        (str(time.time()),),
+    )
     con.commit()
 
     workspace_cols = {
@@ -2272,7 +2289,12 @@ def get_workspace_candidate_seat_type(workspace_master_id: int, email: str) -> s
 def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[str, list]:
     conditions: list[str] = []
     args: list = []
-    if filt == "has_rt":
+    if filt == "has_at":
+        conditions.append(
+            "COALESCE(account_status, 'active') <> 'permanently_invalid' "
+            "AND length(COALESCE(access_token, '')) > 0"
+        )
+    elif filt == "has_rt":
         conditions.append("length(refresh_token) > 0")
     elif filt == "no_rt":
         conditions.append("coalesce(length(refresh_token),0) = 0")
@@ -2599,6 +2621,62 @@ def set_setting(key: str, value) -> None:
         con.commit()
 
 
+# ──────────────────────── 全局代理池租借统计 ────────────────────────
+
+
+def record_proxy_lease_usage(proxy: str, task_type: str, task_detail: str = "") -> None:
+    """持久化一次从代理池领取代理的事件。
+
+    这里只记录“领取”而不是 HTTP 请求次数。同一个任务在 warmup 403 或账号重试时
+    重新领取代理，会自然产生新的计数；同一会话里的后续请求不会重复累计。
+    """
+    proxy_value = str(proxy or "").strip()
+    type_value = str(task_type or "").strip().lower()
+    detail_value = str(task_detail or "").strip().lower()
+    if not proxy_value or not type_value:
+        return
+    now = time.time()
+    with _lock:
+        con = _conn()
+        con.execute(
+            """INSERT INTO proxy_lease_usage(
+                   proxy, task_type, task_detail, leased_count,
+                   first_leased_at, last_leased_at
+               ) VALUES (?, ?, ?, 1, ?, ?)
+               ON CONFLICT(proxy, task_type, task_detail) DO UPDATE SET
+                   leased_count=proxy_lease_usage.leased_count + 1,
+                   last_leased_at=excluded.last_leased_at""",
+            (proxy_value, type_value, detail_value, now, now),
+        )
+        con.commit()
+
+
+def list_proxy_lease_usage() -> list[dict]:
+    con = _conn()
+    rows = con.execute(
+        """SELECT proxy, task_type, task_detail, leased_count,
+                  first_leased_at, last_leased_at
+           FROM proxy_lease_usage
+           ORDER BY last_leased_at DESC, proxy, task_type, task_detail"""
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def reset_proxy_lease_usage() -> float:
+    """清空全局累计统计，返回新统计周期的开始时间。"""
+    started_at = time.time()
+    with _lock:
+        con = _conn()
+        con.execute("DELETE FROM proxy_lease_usage")
+        con.execute(
+            """INSERT INTO settings(key, value) VALUES ('proxy_usage_since', ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (str(started_at),),
+        )
+        con.commit()
+    return started_at
+
+
 def _setting_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -2863,6 +2941,8 @@ def get_public_relogin_config() -> dict:
         "proxy_pool": get_setting("public_relogin_proxy_pool", ""),
         "use_system_proxy_pool": get_setting("public_relogin_use_system_proxy_pool", "1"),
         "concurrency": get_setting("public_relogin_concurrency", "3"),
+        "quota_queue_capacity": get_setting("public_relogin_quota_queue_capacity", "512"),
+        "relogin_queue_capacity": get_setting("public_relogin_relogin_queue_capacity", "128"),
         "retry_count": get_setting("public_relogin_retry_count", "2"),
         "quota_timeout": get_setting("public_relogin_quota_timeout", "30"),
         "login_timeout": get_setting("public_relogin_login_timeout", "180"),
@@ -2876,6 +2956,8 @@ def save_public_relogin_config(data: dict) -> None:
         ("proxy_pool", "public_relogin_proxy_pool"),
         ("use_system_proxy_pool", "public_relogin_use_system_proxy_pool"),
         ("concurrency", "public_relogin_concurrency"),
+        ("quota_queue_capacity", "public_relogin_quota_queue_capacity"),
+        ("relogin_queue_capacity", "public_relogin_relogin_queue_capacity"),
         ("retry_count", "public_relogin_retry_count"),
         ("quota_timeout", "public_relogin_quota_timeout"),
         ("login_timeout", "public_relogin_login_timeout"),

@@ -7,3 +7,5 @@ export const deleteWorkspaceMaster = (id) => http.delete(`/api/workspaces/${id}`
 export const bulkDeleteWorkspaceMasters = (ids) => http.post('/api/workspaces/bulk_delete', { ids })
 export const updateWorkspaceProxy = (id, proxy) => http.post(`/api/workspaces/${id}/proxy`, { proxy })
 export const syncWorkspace = (id) => http.post(`/api/workspaces/${id}/sync`)
+export const syncWorkspaceMembers = (id) =>
+  http.post(`/api/workspaces/${id}/sync-members`, null, { timeout: 300000 })

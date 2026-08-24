@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listWorkspaceMasters, importWorkspaceSessions, getWorkspaceMaster,
   deleteWorkspaceMaster, bulkDeleteWorkspaceMasters, updateWorkspaceProxy, syncWorkspace,
+  syncWorkspaceMembers,
 } from '@/api/workspaces'
 import { copyText, fmtTime } from '@/api/request'
 import { isValidProxy } from '@/stores/proxy'
@@ -16,13 +17,43 @@ const total = ref(0)
 const page = ref(1)
 const selected = ref([])
 const loading = ref(false)
+const syncingStats = ref({})
+const syncingMembers = ref({})
 const importing = ref(false)
 const importVisible = ref(false)
 const importText = ref('')
 const importProxy = ref('')
 const router = useRouter()
 function cst(value) { if (!value) return '未同步'; return new Intl.DateTimeFormat('zh-CN', { timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hour12:false }).format(new Date(value)) }
-async function sync(row) { try { await syncWorkspace(row.id); ElMessage.success('空间席位信息已同步'); await load() } catch(e) { ElMessage.error(e.message) } }
+function setRowBusy(target, id, busy) {
+  target.value = { ...target.value, [id]: busy }
+}
+async function sync(row) {
+  setRowBusy(syncingStats, row.id, true)
+  try {
+    await syncWorkspace(row.id)
+    ElMessage.success('席位统计已同步')
+    await load()
+  } catch(e) {
+    ElMessage.error(e.message)
+  } finally {
+    setRowBusy(syncingStats, row.id, false)
+  }
+}
+async function syncMembers(row) {
+  setRowBusy(syncingMembers, row.id, true)
+  try {
+    const result = await syncWorkspaceMembers(row.id)
+    ElMessage.success(
+      `成员席位同步完成：更新 ${result.refreshed || 0}，未匹配 ${result.missing || 0}，剩余未知 ${result.remaining || 0}`,
+    )
+    await load()
+  } catch(e) {
+    ElMessage.error(e.status === 429 ? '上游请求过于频繁，请稍后重试' : e.message)
+  } finally {
+    setRowBusy(syncingMembers, row.id, false)
+  }
+}
 function candidates(row) { router.push({ name:'workspace-candidates', query:{ workspace_id:row.id } }) }
 function handleWorkspaceUpdated() { load() }
 
@@ -191,11 +222,18 @@ onActivated(() => load())
         <el-table-column label="导入时间" width="180">
           <template #default="{ row }">{{ fmtTime(row.imported_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="390" fixed="right">
+        <el-table-column label="操作" width="520" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text type="primary" @click="copySession(row)">复制 Session</el-button>
             <el-button size="small" text type="warning" @click="editProxy(row)">修改代理</el-button>
-            <el-button size="small" text type="success" @click="sync(row)">同步席位</el-button>
+            <el-button
+              size="small" text type="success" :loading="syncingStats[row.id]"
+              :disabled="syncingMembers[row.id]" @click="sync(row)"
+            >同步席位统计</el-button>
+            <el-button
+              size="small" text type="primary" :loading="syncingMembers[row.id]"
+              :disabled="syncingStats[row.id]" @click="syncMembers(row)"
+            >同步成员席位</el-button>
             <el-button size="small" text type="primary" @click="candidates(row)">候选管理</el-button>
             <el-button size="small" text type="danger" @click="deleteOne(row)">删除</el-button>
           </template>

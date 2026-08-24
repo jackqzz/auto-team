@@ -49,8 +49,13 @@ const autoStateType = computed(() => ({
           <el-descriptions :column="2" border size="small">
             <el-descriptions-item label="状态"><StatusDot :type="autoStateType" :text="autoStateLabel" /></el-descriptions-item>
             <el-descriptions-item label="并发">{{ autoStatus.concurrency || 1 }}</el-descriptions-item>
+            <el-descriptions-item label="账号进度">
+              {{ autoStatus.task_completed || 0 }} /
+              {{ autoStatus.task_total_known === false || autoStatus.task_total == null ? '不限' : autoStatus.task_total }}
+            </el-descriptions-item>
             <el-descriptions-item label="成功">{{ autoStatus.registered_ok || 0 }}</el-descriptions-item>
-            <el-descriptions-item label="失败">{{ autoStatus.registered_fail || 0 }}</el-descriptions-item>
+            <el-descriptions-item label="最终失败">{{ autoStatus.registered_fail || 0 }}</el-descriptions-item>
+            <el-descriptions-item label="重试账号">{{ autoStatus.retry_count || 0 }}</el-descriptions-item>
           </el-descriptions>
           <div style="margin-top: 12px">
             <el-button type="primary" @click="router.push('/auto')">前往自动批量</el-button>

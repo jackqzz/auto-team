@@ -16,10 +16,11 @@ import re
 import secrets
 import struct
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from config import Config
@@ -32,6 +33,32 @@ from mail_providers import MailProvider
 from http_client import create_http_session, USER_AGENT
 
 logger = logging.getLogger(__name__)
+
+
+# Camoufox add-phone 页面标题会随 OpenAI 的前端版本/语言变化。流程判断以
+# URL 和 locator 为主，只保留稳定的 consent 标题作为辅助信号。
+CAMOUFOX_LOCALE = "en-US"
+CODEX_CONSENT_TITLE = "Sign in with ChatGPT - OpenAI"
+
+
+def goto_with_timeout(page, url: str, config: Any = None, **kwargs):
+    """带有限超时的 Camoufox 导航 helper。
+
+    ``Config`` 在不同部署版本里可能没有统一的浏览器超时字段，因此只读取
+    常见属性，最终使用 60 秒兜底。保留独立 helper 也方便单元测试替换导航。
+    """
+    if "timeout" not in kwargs:
+        timeout = 60_000
+        for key in ("camoufox_navigation_timeout", "browser_timeout", "navigation_timeout"):
+            try:
+                value = getattr(config, key, None) if config is not None else None
+                if value not in (None, ""):
+                    timeout = max(1_000, int(float(value)))
+                    break
+            except (TypeError, ValueError):
+                continue
+        kwargs["timeout"] = timeout
+    return page.goto(url, **kwargs)
 
 
 _PERMANENT_INVALID_MARKERS = (
@@ -221,8 +248,12 @@ class AuthFlow:
         cookie_pairs: list[tuple[str, str]] = []
         seen: set[str] = set()
 
+        # curl_cffi 的 Cookies.__iter__() 只返回 cookie 名称；真实的
+        # ``name/value/domain/path`` 对象在 ``.jar`` 里。这里必须遍历 jar，
+        # 否则导出的 Cookie 头会悄悄变成空字符串。
         try:
-            jar_iter = list(self.session.cookies)
+            jar = getattr(self.session.cookies, "jar", None)
+            jar_iter = list(jar if jar is not None else self.session.cookies)
         except Exception:
             jar_iter = []
 
@@ -274,13 +305,17 @@ class AuthFlow:
         for name in critical_names:
             if name in seen:
                 continue
-            try:
-                value = self.session.cookies.get(name, "")
-            except Exception:
-                value = ""
+            value = self._get_cookie_value_by_name(name, preferred_domains=(".chatgpt.com", "chatgpt.com"))
             if value:
                 seen.add(name)
                 cookie_pairs.append((name, value))
+
+        # NextAuth 的某些接口只在 JSON 中返回 sessionToken；即使 CookieJar
+        # 没有它，导出的 cookie_header 也应包含浏览器恢复会话所需的字段。
+        if "__Secure-next-auth.session-token" not in seen:
+            session_token = str(getattr(self.result, "session_token", "") or "").strip()
+            if session_token:
+                cookie_pairs.append(("__Secure-next-auth.session-token", session_token))
 
         return "; ".join(f"{name}={value}" for name, value in cookie_pairs if name and value)
         if self._trace_dump_enabled:
@@ -568,19 +603,45 @@ class AuthFlow:
         msg = str(exc).lower()
         return "registration_disallowed" in msg
 
-    def _get_cookie_value_by_name(self, name: str) -> str:
-        """按 cookie 名称获取值（忽略 domain 冲突）。"""
+    def _get_cookie_value_by_name(
+        self,
+        name: str,
+        preferred_domains: tuple[str, ...] = (),
+    ) -> str:
+        """按名称读取 Cookie，并可在同名 Cookie 存在多个域时指定优先域。"""
         try:
             jar = getattr(self.session.cookies, "jar", None)
             if jar is None:
                 return ""
             target = (name or "").strip().lower()
+            matches = []
             for c in jar:
-                if (getattr(c, "name", "") or "").strip().lower() == target:
-                    return (getattr(c, "value", "") or "").strip()
+                if (getattr(c, "name", "") or "").strip().lower() != target:
+                    continue
+                value = (getattr(c, "value", "") or "").strip()
+                if not value:
+                    continue
+                domain = (getattr(c, "domain", "") or "").strip().lower()
+                matches.append((domain, value))
+            if not matches:
+                return ""
+            for preferred in preferred_domains:
+                wanted = (preferred or "").strip().lower()
+                if not wanted:
+                    continue
+                for domain, value in matches:
+                    if domain == wanted:
+                        return value
+            return matches[0][1]
         except Exception:
-            pass
-        return ""
+            return ""
+
+    def _get_device_id_cookie(self) -> str:
+        """读取设备 Cookie，优先使用 warmup 得到的 chatgpt.com 值。"""
+        return self._get_cookie_value_by_name(
+            "oai-did",
+            preferred_domains=(".chatgpt.com", "chatgpt.com", ".openai.com", "openai.com"),
+        )
 
     def _extract_login_challenge_from_cookie(self) -> str:
         """
@@ -889,10 +950,53 @@ class AuthFlow:
         )
         return True
 
-    def _codex_drive_login_from_log_in(self, mail_provider: Optional[MailProvider] = None) -> str:
+    def _reauthorize_for_add_phone(
+        self,
+        mail_provider: Optional[MailProvider] = None,
+    ) -> str:
+        """为 add-phone 换号建立一套全新的 OAuth + 登录/2FA 状态。
+
+        ``/api/accounts/add-phone/send`` 是绑定在一次 authorize state 上的
+        一次性步骤。旧实现只释放手机号后重试该 POST，第二个号码必然可能收到
+        ``Invalid authorization step``。这里通过 ChatGPT signin 入口建立一套
+        全新授权状态，再调用 ``_codex_drive_login_from_log_in`` 完成密码/TOTP
+        （无密码账号则完成邮箱 OTP + TOTP），最后只返回新的 add-phone URL，
+        不在此处租号或提交手机号。
+        """
+        email = (self.result.email or "").strip()
+        if not email:
+            raise RuntimeError("换号前重新 OAuth 缺少账号邮箱")
+
+        logger.info("[sms] 换号前重新初始化 OAuth，并重新执行密码/2FA")
+        csrf_token = self.get_csrf_token()
+        auth_url = self.get_auth_url(csrf_token, email=email)
+        self.auth_oauth_init(auth_url)
+
+        continue_url = self._codex_drive_login_from_log_in(
+            mail_provider=mail_provider,
+            handle_add_phone=False,
+        )
+        continue_url = self._normalize_continue_url(continue_url or "")
+        if not self._is_add_phone_state(page_type="", continue_url=continue_url):
+            raise RuntimeError(
+                "换号前重新登录/2FA完成，但未进入 add-phone 状态"
+            )
+        return continue_url
+
+    def _codex_drive_login_from_log_in(
+        self,
+        mail_provider: Optional[MailProvider] = None,
+        *,
+        handle_add_phone: bool = True,
+    ) -> str:
         """
         当 Codex 授权回落到 /log-in 时，补走一次纯协议登录推进状态机。
         返回可继续跟随的 continue_url（若无则返回空字符串）。
+
+        ``handle_add_phone=False`` 只推进到 add-phone 页面，不消费该页面的
+        authorization state。SMS 换号时会用它重新建立一套 OAuth + 密码/TOTP
+        状态，避免在旧 state 上再次 POST add-phone/send 得到
+        ``Invalid authorization step``。
         """
         email = (self.result.email or "").strip()
         if not email:
@@ -908,7 +1012,7 @@ class AuthFlow:
             password = ""
             logger.info("Codex 登录推进：该号无已知密码，改走邮箱 OTP 登录")
 
-        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        device_id = (self.result.device_id or "").strip() or self._get_device_id_cookie()
         if not device_id:
             device_id = str(uuid.uuid4())
             self.result.device_id = device_id
@@ -1019,10 +1123,14 @@ class AuthFlow:
                     self._extract_continue_url_from_step(mfa_resp)
                 )
 
-        # add-phone 分支（可选）：
-        # 仅在配置了手机号与验证码获取方式时尝试自动推进
-        if self._is_add_phone_state(page_type="", continue_url=continue_url):
-            next_url = self._handle_add_phone_verification(continue_url=continue_url)
+        # add-phone 分支（可选）。换号重新授权时必须停在这里，由外层 SMS
+        # handler 接管；否则本方法会递归进入 SMS handler，重新授权回调就无法
+        # 在“租新号之前”执行。
+        if handle_add_phone and self._is_add_phone_state(page_type="", continue_url=continue_url):
+            next_url = self._handle_add_phone_verification(
+                continue_url=continue_url,
+                mail_provider=mail_provider,
+            )
             if next_url:
                 continue_url = self._normalize_continue_url(next_url)
 
@@ -1046,7 +1154,7 @@ class AuthFlow:
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json"
         headers["Origin"] = "https://auth.openai.com"
-        device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+        device_id = (self.result.device_id or "").strip() or self._get_device_id_cookie()
         if device_id:
             headers["oai-device-id"] = device_id
         return headers
@@ -1142,21 +1250,46 @@ class AuthFlow:
             time.sleep(4)
         raise TimeoutError(f"等待手机 OTP 超时 ({timeout}s)")
 
-    def _handle_add_phone_verification(self, continue_url: str = "") -> str:
+    def _handle_add_phone_verification(
+        self,
+        continue_url: str = "",
+        *,
+        mail_provider: Optional[MailProvider] = None,
+        reauthorize_callback: Optional[Callable[[], str]] = None,
+    ) -> str:
         """
         处理 add-phone 验证分支：
         - 优先使用 self._sms_callback（SMS 接码 controller，自动租号 + 接码）
         - 回退到环境变量路径：OPENAI_PHONE_NUMBER + OPENAI_PHONE_OTP_CMD/OPENAI_PHONE_OTP
         """
         mode = (self._get_env("OPENAI_ADD_PHONE_MODE", "api") or "api").strip().lower()
+        if mode not in {"api", "camoufox"}:
+            logger.warning("未知 add-phone 模式=%s，按 api 处理", mode)
+            mode = "api"
+        logger.info("[add-phone] 使用模式=%s", mode)
+
+        # SMS/Camoufox 两种自动接码模式都需要一个可重复建立 OAuth state 的
+        # 回调。调用方可以显式传入（例如测试或特殊流程）；正常流程使用当前
+        # AuthFlow 的 Codex reauthorize helper。
+        if reauthorize_callback is None and self._sms_callback is not None:
+            reauthorize_callback = lambda: self._reauthorize_for_add_phone(
+                mail_provider=mail_provider
+            )
+
         if mode == "camoufox":
-            try:
-                return self._handle_add_phone_via_camoufox(continue_url)
-            except Exception as e:
-                logger.warning("Camoufox add-phone 流程失败，回退原有接口流程: %s", e)
+            # 明确选择浏览器模式时绝不能静默降级到 API；否则用户看到的是
+            # “Camoufox 已选择”，实际请求却仍然走 add-phone/send 接口。
+            return self._handle_add_phone_via_camoufox(
+                continue_url,
+                mail_provider=mail_provider,
+                reauthorize_callback=reauthorize_callback,
+            )
         if self._sms_callback is not None:
             try:
-                return self._handle_add_phone_via_sms(continue_url)
+                return self._handle_add_phone_via_sms(
+                    continue_url,
+                    reauthorize_callback=reauthorize_callback,
+                )
             except Exception as e:
                 logger.warning("SMS 接码流程失败，回退环境变量路径: %s", e)
                 try:
@@ -1165,7 +1298,12 @@ class AuthFlow:
                     pass
         return self._handle_add_phone_via_env(continue_url)
 
-    def _handle_add_phone_via_sms(self, continue_url: str = "") -> str:
+    def _handle_add_phone_via_sms(
+        self,
+        continue_url: str = "",
+        *,
+        reauthorize_callback: Optional[Callable[[], str]] = None,
+    ) -> str:
         """走 SMS 接码 controller：租号 → add-phone/send → 等 SMS → validate。
 
         支持平台：SmsBower（smsbower.page）。
@@ -1180,7 +1318,10 @@ class AuthFlow:
 
         # 用 try/finally 保证即使 for 循环抛异常，也能 release lock + 最后一次 cleanup
         try:
-            return self._do_sms_loop(ctrl)
+            return self._do_sms_loop(
+                ctrl,
+                reauthorize_callback=reauthorize_callback,
+            )
         finally:
             # 无论成败都释放 lock + cleanup 最后一个号（如果有）
             try:
@@ -1192,7 +1333,12 @@ class AuthFlow:
             except Exception:
                 pass
 
-    def _do_sms_loop(self, ctrl) -> str:
+    def _do_sms_loop(
+        self,
+        ctrl,
+        *,
+        reauthorize_callback: Optional[Callable[[], str]] = None,
+    ) -> str:
         """SMS 接码循环逻辑（for 0..max_attempts）。"""
         # provider 信息（目前只支持 SmsBower）
         provider_key = (getattr(ctrl, "provider_key", "") or "").lower()
@@ -1203,7 +1349,7 @@ class AuthFlow:
         def _read_int(cfg_key: str, env_key: str, default: str, min_v: int = 1) -> int:
             raw = (str(ctrl_cfg.get(cfg_key) or "")).strip()
             if not raw:
-                raw = os.getenv(env_key, default)
+                raw = self._get_env(env_key, default)
             try:
                 return max(min_v, int(raw))
             except Exception:
@@ -1241,8 +1387,51 @@ class AuthFlow:
 
         last_err: Optional[Exception] = None
 
+        def _cleanup_current_phone() -> None:
+            """释放当前 activation，确保下一轮不会复用旧号/state。"""
+            try:
+                ctrl.cleanup()
+            except Exception:
+                pass
+
         for phone_attempt in range(1, max_phone_attempts + 1):
             logger.info("[sms] 🔁 第 %d/%d 个号尝试...", phone_attempt, max_phone_attempts)
+
+            # 一次 add-phone/send 会消费当前 authorization state。第二个号码
+            # 不能只 cleanup 后继续 POST；必须重新建立 OAuth 授权并重新走密码
+            # + TOTP（或邮箱 OTP + TOTP）流程，再租新号码。
+            if phone_attempt > 1:
+                if reauthorize_callback is None:
+                    last_err = RuntimeError(
+                        "SMS 换号前无法重新建立 OAuth/2FA 授权状态；"
+                        "请提供 reauthorize_callback 后再重试"
+                    )
+                    logger.error("[sms] %s", last_err)
+                    break
+                try:
+                    logger.info(
+                        "[sms] 第 %d 个号码前重新建立 OAuth 授权并重新验证 2FA",
+                        phone_attempt,
+                    )
+                    fresh_url = self._normalize_continue_url(
+                        reauthorize_callback() or ""
+                    )
+                    if not fresh_url or not self._is_add_phone_state(
+                        page_type="", continue_url=fresh_url
+                    ):
+                        raise RuntimeError(
+                            "换号前重新授权未回到 add-phone 状态"
+                        )
+                    logger.info(
+                        "[sms] 重新授权成功，继续 add-phone: %s",
+                        fresh_url[:180],
+                    )
+                except Exception as e:
+                    last_err = e
+                    logger.warning("[sms] 第 %d 个号码前重新授权失败: %s", phone_attempt, e)
+                    # 重新授权失败时不要继续租号/提交号码；继续下一轮会再次
+                    # 尝试建立 fresh state（若最终失败则由 last_err 退出）。
+                    continue
 
             # 阶段 1：租号（第 2+ 个号会自动租新号，SmsBower cache 已被前一次 cleanup 清掉）
             try:
@@ -1271,18 +1460,21 @@ class AuthFlow:
                     )
                     ctrl.mark_send_failed(err_text)
                     last_err = e
+                    _cleanup_current_phone()
                     break
                 if _is_phone_rejected(err_text):
                     logger.warning("[sms] 号 %s 被 OpenAI 拒（已用过/不允许）: %s",
                                    phone, err_text[:200])
                     ctrl.mark_send_failed(err_text)
                     last_err = e
+                    _cleanup_current_phone()
                     continue
                 # 其它未识别错误 → 也打详细日志但不视为"号码问题"
                 logger.warning("[sms] 号 %s POST add-phone/send 失败（未识别错误）: %s",
                                phone, err_text[:300])
                 ctrl.mark_send_failed(err_text)
                 last_err = e
+                _cleanup_current_phone()
                 continue
 
             send_page_type = self._extract_page_type(send_resp)
@@ -1296,6 +1488,7 @@ class AuthFlow:
                 )
                 ctrl.mark_send_failed("did not enter phone-verification page")
                 last_err = RuntimeError(f"add-phone/send 未进入 phone-verification: page={send_page_type}")
+                _cleanup_current_phone()
                 continue
 
             ctrl.mark_send_succeeded()
@@ -1343,10 +1536,7 @@ class AuthFlow:
 
             # 单号窗口结束：cancel 这个号
             logger.warning("[sms] 号 %s 已用尽 %ds 窗口", phone, per_phone_timeout)
-            try:
-                ctrl.cleanup()
-            except Exception:
-                pass
+            _cleanup_current_phone()
             # cleanup 清掉 controller.activation，下一轮 get_phone 会租新号
 
         # 所有号都失败
@@ -1404,7 +1594,13 @@ class AuthFlow:
             logger.warning("add-phone 阶段未成功: %s", last_err)
         return continue_url or ""
 
-    def _handle_add_phone_via_camoufox(self, continue_url: str = "") -> str:
+    def _handle_add_phone_via_camoufox(
+        self,
+        continue_url: str = "",
+        *,
+        mail_provider: Optional[MailProvider] = None,
+        reauthorize_callback: Optional[Callable[[], str]] = None,
+    ) -> str:
         """
         走 Camoufox 浏览器完成 add-phone：
         - 浏览器负责页面交互
@@ -1425,6 +1621,11 @@ class AuthFlow:
             ctrl.set_resend_callback(self._phone_otp_resend)
         except Exception:
             pass
+
+        if reauthorize_callback is None:
+            reauthorize_callback = lambda: self._reauthorize_for_add_phone(
+                mail_provider=mail_provider
+            )
 
         phone_selectors = (
             "input[autocomplete='tel']",
@@ -1447,15 +1648,21 @@ class AuthFlow:
             "button[type='submit']",
         )
 
+        def _first_locator_now(page, selectors):
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector).first
+                    if locator.count() > 0:
+                        return locator
+                except Exception:
+                    continue
+            return None
+
         def _wait_first_locator(page, selectors, attempts: int = 20, wait_ms: int = 500):
             for attempt in range(max(1, attempts)):
-                for selector in selectors:
-                    try:
-                        locator = page.locator(selector).first
-                        if locator.count() > 0:
-                            return locator
-                    except Exception:
-                        continue
+                locator = _first_locator_now(page, selectors)
+                if locator is not None:
+                    return locator
                 if attempt < max(1, attempts) - 1:
                     try:
                         page.wait_for_timeout(wait_ms)
@@ -1469,18 +1676,6 @@ class AuthFlow:
             except Exception:
                 return ""
 
-        def _wait_for_state(page, titles: tuple[str, ...], attempts: int = 60, wait_ms: int = 500) -> str:
-            for attempt in range(max(1, attempts)):
-                title = _page_title(page)
-                if title in titles:
-                    return title
-                if attempt < max(1, attempts) - 1:
-                    try:
-                        page.wait_for_timeout(wait_ms)
-                    except Exception:
-                        time.sleep(wait_ms / 1000.0)
-            return _page_title(page)
-
         def _is_callback_url(url: str) -> bool:
             try:
                 parsed = urlparse(str(url or ""))
@@ -1492,6 +1687,16 @@ class AuthFlow:
                 or "localhost" in (parsed.netloc or "")
                 or parsed.path.endswith("/callback/openai")
             )
+
+        def _page_url(page) -> str:
+            try:
+                return str(getattr(page, "url", "") or "")
+            except Exception:
+                return ""
+
+        def _is_phone_pending_url(url: str) -> bool:
+            value = str(url or "").lower()
+            return ("add-phone" in value) or ("phone-verification" in value)
 
         captured = {"url": ""}
 
@@ -1509,21 +1714,174 @@ class AuthFlow:
             except Exception:
                 pass
 
+        def _wait_after_phone_submit(page, attempts: int = 50, wait_ms: int = 400):
+            """等待手机号提交真正离开输入页，避免点击后立刻读取旧 title 误判。"""
+            for attempt in range(max(1, attempts)):
+                current_url = _page_url(page)
+                title = _page_title(page)
+                if captured["url"] or _is_callback_url(current_url):
+                    return "complete", None
+                code_input = _first_locator_now(page, code_selectors)
+                if code_input is not None:
+                    return "code", code_input
+                if title == CODEX_CONSENT_TITLE or title == "ChatGPT":
+                    return "complete", None
+                if current_url and not _is_phone_pending_url(current_url):
+                    return "complete", None
+                if attempt < max(1, attempts) - 1:
+                    try:
+                        page.wait_for_timeout(wait_ms)
+                    except Exception:
+                        time.sleep(wait_ms / 1000.0)
+            return "stuck", None
+
+        def _wait_after_code_submit(page, attempts: int = 50, wait_ms: int = 400) -> str:
+            """验证码只有在页面确实离开 phone-verification 后才算成功。"""
+            for attempt in range(max(1, attempts)):
+                current_url = _page_url(page)
+                title = _page_title(page)
+                if captured["url"] or _is_callback_url(current_url):
+                    return captured["url"] or current_url
+                if title == CODEX_CONSENT_TITLE or title == "ChatGPT":
+                    return current_url
+                if current_url and not _is_phone_pending_url(current_url):
+                    return current_url
+                if attempt < max(1, attempts) - 1:
+                    try:
+                        page.wait_for_timeout(wait_ms)
+                    except Exception:
+                        time.sleep(wait_ms / 1000.0)
+            return ""
+
+        def _session_cookie_list() -> list[dict]:
+            """把协议 HTTP session cookie 转成 Playwright cookie 结构。"""
+            out: list[dict] = []
+            seen: set[tuple[str, str, str]] = set()
+            try:
+                # curl_cffi Cookies.__iter__() 只返回名称；真实 Cookie 对象
+                # （包括 domain/path）必须从 CookieJar 遍历。
+                jar = getattr(self.session.cookies, "jar", None)
+                cookies = list(jar if jar is not None else self.session.cookies)
+            except Exception:
+                cookies = []
+            fallback_domain = (urlparse(continue_url or self._oauth_auth_url or "").hostname
+                               or "auth.openai.com")
+            for cookie in cookies:
+                name = str(getattr(cookie, "name", "") or "").strip()
+                value = str(getattr(cookie, "value", "") or "")
+                if not name:
+                    continue
+                domain = str(getattr(cookie, "domain", "") or "").strip() or fallback_domain
+                path = str(getattr(cookie, "path", "") or "/") or "/"
+                key = (name, domain, path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                item = {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": path,
+                    "secure": bool(getattr(cookie, "secure", False)),
+                    "httpOnly": bool(getattr(cookie, "_rest", {}).get("HttpOnly", False))
+                    if isinstance(getattr(cookie, "_rest", {}), dict) else False,
+                }
+                expires = getattr(cookie, "expires", None)
+                try:
+                    if expires not in (None, "") and float(expires) > 0:
+                        item["expires"] = float(expires)
+                except (TypeError, ValueError):
+                    pass
+                out.append(item)
+
+            # get_auth_session 在某些 NextAuth 路径会从 JSON 返回 sessionToken，
+            # 而不是把它写回 curl_cffi 的 CookieJar。浏览器端恢复 GPT 会话时，
+            # 这个字段就是 __Secure-next-auth.session-token；显式补到
+            # chatgpt.com，等价于用户在网页开发者工具里手动替换它。
+            session_token = str(getattr(self.result, "session_token", "") or "").strip()
+            if session_token:
+                key = ("__Secure-next-auth.session-token", ".chatgpt.com", "/")
+                if key not in seen:
+                    out.append(
+                        {
+                            "name": "__Secure-next-auth.session-token",
+                            "value": session_token,
+                            "domain": ".chatgpt.com",
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": True,
+                        }
+                    )
+            return out
+
+        def _add_session_cookies(context) -> None:
+            cookies = _session_cookie_list()
+            if not cookies:
+                return
+            try:
+                context.add_cookies(cookies)
+                return
+            except Exception as exc:
+                logger.debug("Camoufox 批量注入 session cookies 失败，改为逐条注入: %s", exc)
+            for cookie in cookies:
+                try:
+                    context.add_cookies([cookie])
+                except Exception:
+                    continue
+
+        def _sync_cookies_to_session(context) -> None:
+            try:
+                cookies = context.cookies()
+            except Exception:
+                return
+            for cookie in cookies or []:
+                name = str((cookie or {}).get("name") or "").strip()
+                value = str((cookie or {}).get("value") or "")
+                if not name:
+                    continue
+                try:
+                    kwargs = {
+                        "domain": (cookie or {}).get("domain") or "",
+                        "path": (cookie or {}).get("path") or "/",
+                    }
+                    self.session.cookies.set(name, value, **kwargs)
+                except Exception:
+                    try:
+                        self.session.cookies.set(name, value)
+                    except Exception:
+                        pass
+
         start_url = (continue_url or self._oauth_auth_url or "").strip()
         if not start_url:
             start_url = "https://auth.openai.com/add-phone"
 
-        max_phone_attempts = 3
-        try:
-            per_phone_timeout = max(40, int(self._get_env("OPENAI_PHONE_OTP_TIMEOUT", "80")))
-        except Exception:
-            per_phone_timeout = 80
-        try:
-            max_code_retries = max(1, int(self._get_env("OPENAI_PHONE_OTP_CODE_RETRIES", "2")))
-        except Exception:
-            max_code_retries = 2
+        ctrl_cfg = getattr(ctrl, "config", None) or {}
 
-        browser_proxy = {"server": self.config.proxy} if getattr(self.config, "proxy", None) else None
+        def _read_int(cfg_key: str, env_key: str, default: int, minimum: int = 1) -> int:
+            raw = str(ctrl_cfg.get(cfg_key) or "").strip()
+            if not raw:
+                raw = self._get_env(env_key, str(default))
+            try:
+                return max(minimum, int(raw))
+            except (TypeError, ValueError):
+                return max(minimum, int(default))
+
+        max_phone_attempts = _read_int(
+            "sms_max_phone_attempts", "OPENAI_PHONE_MAX_ATTEMPTS", 3
+        )
+        per_phone_timeout = _read_int(
+            "sms_per_phone_timeout", "OPENAI_PHONE_OTP_TIMEOUT", 80, minimum=40
+        )
+        max_code_retries = _read_int(
+            "sms_code_retries_per_phone", "OPENAI_PHONE_OTP_CODE_RETRIES", 2
+        )
+
+        browser_proxy_url = str(getattr(self.config, "proxy", None) or "").strip()
+        # curl_cffi 用 socks5h 表示远端 DNS；Playwright/Camoufox 只接受 socks5
+        # scheme，但其 SOCKS 代理同样负责域名解析。
+        if browser_proxy_url.lower().startswith("socks5h://"):
+            browser_proxy_url = "socks5://" + browser_proxy_url[len("socks5h://"):]
+        browser_proxy = {"server": browser_proxy_url} if browser_proxy_url else None
         headless_env = (self._get_env("OPENAI_CAMOUFOX_HEADLESS", "") or "").strip().lower()
         if headless_env in {"1", "true", "yes", "on"}:
             headless = True
@@ -1532,18 +1890,31 @@ class AuthFlow:
         elif headless_env in {"0", "false", "no", "off"}:
             headless = False
         else:
-            headless = "virtual" if (sys.platform.startswith("linux") and not os.getenv("DISPLAY")) else False
+            # 服务器通常没有 DISPLAY，也未必安装 Xvfb。Camoufox 的
+            # headless="virtual" 会硬依赖 Xvfb；原生 headless=True 不需要额外
+            # 系统包，已在当前运行环境实际启动验证。
+            headless = True if (sys.platform.startswith("linux") and not os.getenv("DISPLAY")) else False
 
         last_err: Exception | None = None
+        logger.info(
+            "[camoufox] 启动浏览器 headless=%s proxy=%s",
+            headless,
+            "已配置" if browser_proxy else "直连",
+        )
         with Camoufox(
             headless=headless,
             proxy=browser_proxy,
             exclude_addons=[DefaultAddons.UBO],
-            geoip=True,
+            geoip=bool(browser_proxy),
             enable_cache=True,
             locale=CAMOUFOX_LOCALE,
         ) as browser:
-            page = browser.new_page()
+            # Camoufox 返回标准 Playwright Browser；先建立 context 并注入协议
+            # session cookie，否则浏览器会重新落到登录页，用户看起来就像
+            # “选择 Camoufox 但流程没生效”。
+            context = browser.new_context()
+            _add_session_cookies(context)
+            page = context.new_page()
             try:
                 page.on("request", _hook_request)
                 page.on("response", _hook_response)
@@ -1556,11 +1927,55 @@ class AuthFlow:
                 self.config,
                 wait_until="domcontentloaded",
             )
+            try:
+                browser_cookie_names = sorted(
+                    {
+                        str(item.get("name") or "")
+                        for item in context.cookies()
+                        if isinstance(item, dict) and item.get("name")
+                    }
+                )
+            except Exception:
+                browser_cookie_names = []
+            logger.info(
+                "[camoufox] 初始导航完成 url=%s title=%s cookies=%s",
+                _page_url(page)[:180],
+                _page_title(page)[:100],
+                browser_cookie_names,
+            )
 
             for phone_attempt in range(1, max_phone_attempts + 1):
                 phone = ""
                 activation_id = ""
+                send_was_accepted = False
                 try:
+                    captured["url"] = ""
+                    if phone_attempt > 1:
+                        if reauthorize_callback is None:
+                            raise RuntimeError(
+                                "Camoufox 换号前无法重新建立 OAuth/2FA 授权状态"
+                            )
+                        # 先把浏览器可能更新的登录 cookie 写回 HTTP session，
+                        # 再由 callback 建立 fresh state；完成后重新注入新 cookie。
+                        _sync_cookies_to_session(context)
+                        fresh_url = self._normalize_continue_url(
+                            reauthorize_callback() or ""
+                        )
+                        if not fresh_url or not self._is_add_phone_state(
+                            page_type="", continue_url=fresh_url
+                        ):
+                            raise RuntimeError(
+                                "Camoufox 换号前重新授权未回到 add-phone 状态"
+                            )
+                        start_url = fresh_url
+                        _add_session_cookies(context)
+                        goto_with_timeout(
+                            page,
+                            start_url,
+                            self.config,
+                            wait_until="domcontentloaded",
+                        )
+
                     phone = ctrl.get_phone()
                     activation_id = str(getattr(ctrl.activation, "activation_id", "") or "")
                     logger.info(
@@ -1573,6 +1988,16 @@ class AuthFlow:
 
                     phone_input = _wait_first_locator(page, phone_selectors, attempts=30, wait_ms=500)
                     if phone_input is None:
+                        try:
+                            body_preview = page.locator("body").inner_text(timeout=2_000)[:240].replace("\n", " | ")
+                        except Exception:
+                            body_preview = ""
+                        logger.warning(
+                            "[camoufox] 未找到手机号输入框 url=%s title=%s body=%s",
+                            _page_url(page)[:180],
+                            _page_title(page)[:100],
+                            body_preview,
+                        )
                         raise RuntimeError("Camoufox 未找到手机号输入框")
                     phone_input.fill(phone)
 
@@ -1580,23 +2005,21 @@ class AuthFlow:
                     if continue_btn is None:
                         raise RuntimeError("Camoufox 未找到手机号提交按钮")
                     continue_btn.click(timeout=5000)
+
+                    phone_state, code_input = _wait_after_phone_submit(page)
+                    if phone_state == "stuck":
+                        raise RuntimeError(
+                            "手机号提交后仍停留在 add-phone 页面，未进入验证码阶段"
+                        )
+                    send_was_accepted = True
                     ctrl.mark_send_succeeded()
-
-                    state_title = _wait_for_state(page, (*PHONE_NUMBER_TITLES, PHONE_CODE_TITLE, CODEX_CONSENT_TITLE), attempts=40, wait_ms=500)
-                    if state_title in PHONE_NUMBER_TITLES:
-                        logger.info("[camoufox] 仍停留在手机号页面，重试下一号码")
-                        ctrl.mark_send_failed("did not leave phone input page")
-                        raise RuntimeError("手机号提交后仍停留在手机号页面")
-
-                    code_input = _wait_first_locator(page, code_selectors, attempts=40, wait_ms=500)
-                    if code_input is None:
-                        if state_title == CODEX_CONSENT_TITLE:
-                            code_input = None
-                        else:
-                            raise RuntimeError("Camoufox 未找到验证码输入框")
+                    # 浏览器提交手机号后可能更新 authorization cookie；SmsBower
+                    # 等码期间的 API resend 复用 HTTP session，所以先同步回去。
+                    _sync_cookies_to_session(context)
 
                     if code_input is not None:
                         code_error: Exception | None = None
+                        completed_url = ""
                         for code_attempt in range(1, max_code_retries + 1):
                             try:
                                 code = ctrl.get_code(timeout=per_phone_timeout)
@@ -1608,6 +2031,11 @@ class AuthFlow:
                                 if code_btn is None:
                                     raise RuntimeError("Camoufox 未找到验证码提交按钮")
                                 code_btn.click(timeout=5000)
+                                completed_url = _wait_after_code_submit(page)
+                                if not completed_url:
+                                    raise RuntimeError(
+                                        "验证码提交后仍停留在 phone-verification 页面"
+                                    )
                                 code_error = None
                                 break
                             except Exception as exc:
@@ -1619,6 +2047,7 @@ class AuthFlow:
                                     exc,
                                 )
                                 try:
+                                    _sync_cookies_to_session(context)
                                     ctrl.mark_code_failed(str(exc))
                                 except Exception:
                                     pass
@@ -1631,22 +2060,29 @@ class AuthFlow:
                         if code_error is not None:
                             raise code_error
 
-                    # 通过验证码后，通常会落到 consent 或直接回跳 callback。
-                    _wait_for_state(page, (CODEX_CONSENT_TITLE, "ChatGPT"), attempts=40, wait_ms=500)
-                    if not captured["url"] and _is_callback_url(getattr(page, "url", "") or ""):
-                        captured["url"] = str(page.url or "")
+                    # 没有 code_input 代表手机号提交后已直接完成；有 code_input
+                    # 则上面的 wait 已确认页面离开验证态。两条路径都在这里统一
+                    # 读取最终 URL/callback。
+                    if not captured["url"] and _is_callback_url(_page_url(page)):
+                        captured["url"] = _page_url(page)
 
-                    if captured["url"] or _is_callback_url(getattr(page, "url", "") or ""):
-                        logger.info("[camoufox] 捕获到 callback: %s", (captured["url"] or page.url or "")[:180])
+                    if captured["url"] or _is_callback_url(_page_url(page)):
+                        logger.info("[camoufox] 捕获到 callback: %s", (captured["url"] or _page_url(page))[:180])
+                        _sync_cookies_to_session(context)
                         try:
                             ctrl.report_success()
                         except Exception:
                             pass
-                        return captured["url"] or str(page.url or continue_url or start_url)
+                        return captured["url"] or _page_url(page) or continue_url or start_url
 
                     # 没捕获到 callback，也返回当前页面继续走原有 HTTP 重定向链。
-                    final_url = str(getattr(page, "url", "") or "")
+                    final_url = _page_url(page)
+                    if not final_url or _is_phone_pending_url(final_url):
+                        raise RuntimeError(
+                            "Camoufox 验证结束但页面仍处于 add-phone/phone-verification"
+                        )
                     logger.info("[camoufox] add-phone 成功，继续使用当前 URL: %s", final_url[:180])
+                    _sync_cookies_to_session(context)
                     try:
                         ctrl.report_success()
                     except Exception:
@@ -1661,24 +2097,21 @@ class AuthFlow:
                         exc,
                     )
                     try:
-                        if activation_id:
-                            ctrl.mark_code_failed(str(exc))
+                        # 验证码阶段的失败已在内层逐次 mark_code_failed；这里
+                        # 只把尚未进入验证码页的号码标为 send_failed，避免重复
+                        # resend 两次后再 cleanup。
+                        if activation_id and not send_was_accepted:
+                            ctrl.mark_send_failed(str(exc))
                     except Exception:
                         pass
                     try:
                         ctrl.cleanup()
                     except Exception:
                         pass
-                    if phone_attempt < max_phone_attempts:
-                        try:
-                            goto_with_timeout(
-                                page,
-                                start_url,
-                                self.config,
-                                wait_until="domcontentloaded",
-                            )
-                        except Exception:
-                            pass
+                    try:
+                        _sync_cookies_to_session(context)
+                    except Exception:
+                        pass
 
         if last_err:
             raise last_err
@@ -1745,7 +2178,13 @@ class AuthFlow:
                 logger.info("Codex 授权回落到 /log-in，尝试协议推进登录状态...")
                 continue_url = ""
                 try:
-                    continue_url = self._codex_drive_login_from_log_in(mail_provider=mail_provider)
+                    # 先只推进到 add-phone；手机号验证由下面统一的 handler 处理，
+                    # 这样换号时可以复用同一个“重新 OAuth + 2FA”回调而不会递归
+                    # 进入 SMS handler。
+                    continue_url = self._codex_drive_login_from_log_in(
+                        mail_provider=mail_provider,
+                        handle_add_phone=False,
+                    )
                 except Exception as e:
                     logger.warning(f"Codex 登录推进失败，改走 no-prompt 兜底: {e}")
                 if continue_url:
@@ -1788,23 +2227,45 @@ class AuthFlow:
                 else:
                     logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
                     try:
-                        add_phone_result = self._handle_add_phone_verification(continue_url=final_url)
-                        if add_phone_result and "code=" in add_phone_result:
-                            callback_url = add_phone_result
-                            final_url = add_phone_result
-                        else:
-                            # 绑号成功后重新 authorize 拿 callback code
-                            callback_url, final_url = self._follow_authorize_for_callback(
-                                auth_url, redirect_uri, "codex_authorize_after_add_phone"
-                            )
-                            if not callback_url:
-                                no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
-                                if no_prompt_url and no_prompt_url != auth_url:
-                                    callback_url, final_url = self._follow_authorize_for_callback(
-                                        no_prompt_url,
-                                        redirect_uri,
-                                        "codex_authorize_noprompt_after_add_phone",
-                                    )
+                        add_phone_result = self._handle_add_phone_verification(
+                            continue_url=final_url,
+                            mail_provider=mail_provider,
+                        )
+                        if not add_phone_result or self._is_add_phone_state(
+                            page_type="", continue_url=add_phone_result
+                        ):
+                            raise RuntimeError("SMS/Camoufox 手机验证未返回成功的后续 URL")
+
+                        # add-phone/send + validate 会消费旧 authorization state。
+                        # 成功后也重新构造一组 Codex PKCE 参数，避免拿旧 state/
+                        # verifier 去换 token；这同时覆盖 Camoufox 捕获 callback 的
+                        # 情况，授权链路保持单一且可校验。
+                        (
+                            auth_url,
+                            state,
+                            verifier,
+                            redirect_uri,
+                            client_id,
+                        ) = self._build_codex_authorize(prompt_override="")
+                        self._oauth_auth_url = auth_url
+                        self._oauth_client_id = client_id
+                        self._oauth_redirect_uri = redirect_uri
+                        self._oauth_state = state
+                        self._manual_login_verifier = verifier
+                        self._captured_login_verifier = verifier
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            auth_url,
+                            redirect_uri,
+                            "codex_authorize_after_add_phone",
+                        )
+                        if not callback_url:
+                            no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                            if no_prompt_url and no_prompt_url != auth_url:
+                                callback_url, final_url = self._follow_authorize_for_callback(
+                                    no_prompt_url,
+                                    redirect_uri,
+                                    "codex_authorize_noprompt_after_add_phone",
+                                )
                     except Exception as e:
                         logger.warning(f"SMS 接码绑号失败: {e}")
 
@@ -1852,28 +2313,34 @@ class AuthFlow:
             logger.info("尝试 SMS 手机验证，完成后重新发起 Codex PKCE 授权...")
             try:
                 add_phone_result = self._handle_add_phone_verification(
-                    continue_url="https://auth.openai.com/add-phone"
+                    continue_url="https://auth.openai.com/add-phone",
+                    mail_provider=mail_provider,
                 )
-                if add_phone_result and "code=" in add_phone_result:
-                    retry_callback = add_phone_result
-                    retry_final = add_phone_result
-                    retry_state = state
-                    retry_verifier = verifier
-                    retry_redirect = redirect_uri
-                    retry_client = client_id
-                else:
-                    retry_url, retry_state, retry_verifier, retry_redirect, retry_client = (
-                        self._build_codex_authorize(prompt_override="")
+                if not add_phone_result or self._is_add_phone_state(
+                    page_type="", continue_url=add_phone_result
+                ):
+                    raise RuntimeError("SMS/Camoufox 手机验证未返回成功的后续 URL")
+
+                retry_url, retry_state, retry_verifier, retry_redirect, retry_client = (
+                    self._build_codex_authorize(prompt_override="")
+                )
+                self._oauth_auth_url = retry_url
+                self._oauth_client_id = retry_client
+                self._oauth_redirect_uri = retry_redirect
+                self._oauth_state = retry_state
+                self._manual_login_verifier = retry_verifier
+                self._captured_login_verifier = retry_verifier
+                retry_callback, retry_final = self._follow_authorize_for_callback(
+                    retry_url,
+                    retry_redirect,
+                    "codex_authorize_after_token_user_error_phone",
+                )
+                if not retry_callback:
+                    logger.warning(
+                        "手机验证后 Codex 授权仍未返回 callback，final=%s",
+                        (retry_final or "")[:180],
                     )
-                    retry_callback, retry_final = self._follow_authorize_for_callback(
-                        retry_url, retry_redirect, "codex_authorize_after_token_user_error_phone"
-                    )
-                    if not retry_callback:
-                        logger.warning(
-                            "手机验证后 Codex 授权仍未返回 callback，final=%s",
-                            (retry_final or "")[:180],
-                        )
-                        return False
+                    return False
                 return self._exchange_codex_callback_code(
                     callback_url=retry_callback,
                     expected_state=retry_state,
@@ -2089,7 +2556,7 @@ class AuthFlow:
         except Exception:
             host = ""
         if "auth.openai.com" in host:
-            device_id = (self.result.device_id or "").strip() or (self.session.cookies.get("oai-did", "") or "").strip()
+            device_id = (self.result.device_id or "").strip() or self._get_device_id_cookie()
             if device_id:
                 headers["oai-device-id"] = device_id
 
@@ -2410,23 +2877,9 @@ class AuthFlow:
         resp = self.session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
         self._trace_http("auth_oauth_init", resp)
 
-        # 从 cookie 获取 oai-did
-        device_id = ""
-        for cookie in self.session.cookies:
-            if hasattr(cookie, "name"):
-                if cookie.name == "oai-did":
-                    device_id = cookie.value
-                    break
-            elif isinstance(cookie, str) and cookie == "oai-did":
-                device_id = self.session.cookies.get("oai-did", "")
-                break
-
-        # curl_cffi cookies 访问方式
-        if not device_id:
-            try:
-                device_id = self.session.cookies.get("oai-did", "")
-            except Exception:
-                pass
+        # curl_cffi 的 Cookies.__iter__ 只返回名称；按域名从 jar 读取，
+        # 避免 .chatgpt.com / .openai.com 同名 oai-did 触发 CookieConflict。
+        device_id = self._get_device_id_cookie()
 
         # fallback: 从 HTML 提取
         if not device_id:
@@ -3304,17 +3757,18 @@ class AuthFlow:
         所以这里把所有 cookie 都遍历一遍，按名字精确匹配。
         """
         target = "__Secure-next-auth.session-token"
-        # 路径1：直接 get
-        try:
-            v = self.session.cookies.get(target, "")
-            if v:
-                return v
-        except Exception:
-            pass
+        # 路径1：按域名优先从 CookieJar 读取，避免同名 Cookie 冲突。
+        v = self._get_cookie_value_by_name(
+            target,
+            preferred_domains=(".chatgpt.com", "chatgpt.com"),
+        )
+        if v:
+            return v
         # 路径2：遍历 jar
         try:
-            for c in self.session.cookies:
-                name = getattr(c, "name", "") if hasattr(c, "name") else str(c)
+            jar = getattr(self.session.cookies, "jar", None)
+            for c in (jar if jar is not None else self.session.cookies):
+                name = getattr(c, "name", "")
                 if name == target:
                     val = getattr(c, "value", "") or ""
                     if val:
@@ -3323,7 +3777,10 @@ class AuthFlow:
             pass
         # 路径3：用 _get_cookie_value_by_name（不挑 domain）
         try:
-            return self._get_cookie_value_by_name(target)
+            return self._get_cookie_value_by_name(
+                target,
+                preferred_domains=(".chatgpt.com", "chatgpt.com"),
+            )
         except Exception:
             return ""
 
@@ -3367,6 +3824,17 @@ class AuthFlow:
 
         if session_token:
             self.result.session_token = session_token
+            # 某些 NextAuth 响应只在 JSON 中返回 sessionToken，CookieJar 里
+            # 不一定有对应项；后续 Camoufox 需要把它作为 GPT Web 会话注入。
+            try:
+                self.session.cookies.set(
+                    "__Secure-next-auth.session-token",
+                    session_token,
+                    domain=".chatgpt.com",
+                    path="/",
+                )
+            except Exception:
+                pass
         if access_token:
             self.result.access_token = access_token
         self.result.cookie_header = self._build_chatgpt_cookie_header()
@@ -3416,7 +3884,7 @@ class AuthFlow:
                     except Exception:
                         pass
                     break
-            return bool(self.session.cookies.get("__Secure-next-auth.session-token", ""))
+            return bool(self._get_cookie_value_by_name("__Secure-next-auth.session-token"))
         except Exception as e:
             logger.warning(f"消费 callback 失败: {e}")
             return False
@@ -3888,7 +4356,10 @@ class AuthFlow:
                 continue_url = self._normalize_continue_url(continue_url)
                 if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
                     continue_url = self._normalize_continue_url(
-                        self._handle_add_phone_verification(continue_url=continue_url)
+                        self._handle_add_phone_verification(
+                            continue_url=continue_url,
+                            mail_provider=mail_provider,
+                        )
                     )
 
             # 某些已有账号在 OTP 后会进入 about-you，需要补一次 create_account
@@ -4222,7 +4693,10 @@ class AuthFlow:
                 otp_page_type = self._extract_page_type(mfa_resp)
             if self._is_add_phone_state(page_type=otp_page_type, continue_url=continue_url):
                 continue_url = self._normalize_continue_url(
-                    self._handle_add_phone_verification(continue_url=continue_url)
+                    self._handle_add_phone_verification(
+                        continue_url=continue_url,
+                        mail_provider=mail_provider,
+                    )
                 )
 
         continue_url = self._normalize_continue_url(continue_url)
@@ -4301,7 +4775,7 @@ class AuthFlow:
                 user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
                 if isinstance(user_obj, dict):
                     detected_email = detected_email or (user_obj.get("email", "") or "")
-                new_session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
+                new_session_token = self._get_cookie_value_by_name("__Secure-next-auth.session-token")
                 if new_access_token:
                     access_token = new_access_token
                     logger.info("access_token 刷新成功")
@@ -4326,7 +4800,7 @@ class AuthFlow:
                 user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
                 if isinstance(user_obj, dict):
                     detected_email = detected_email or (user_obj.get("email", "") or "")
-                session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
+                session_token = self._get_cookie_value_by_name("__Secure-next-auth.session-token")
                 if session_token:
                     logger.info("通过 access_token 获取 session_token 成功")
                 else:

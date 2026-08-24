@@ -19,9 +19,10 @@ class PublicReloginConfigTests(unittest.TestCase):
     def test_bool_enabled_and_zero_retry_count_round_trip(self):
         db.save_public_relogin_config({
             "public_relogin_enabled": True,
-            "workspace_whitelist": " workspace-1 \n workspace-2 ",
             "proxy_pool": " socks5://127.0.0.1:7897 ",
             "concurrency": 4,
+            "quota_queue_capacity": 512,
+            "relogin_queue_capacity": 128,
             "retry_count": 0,
             "quota_timeout": 15,
             "login_timeout": 180,
@@ -29,9 +30,10 @@ class PublicReloginConfigTests(unittest.TestCase):
 
         cfg = db.get_public_relogin_config()
         self.assertEqual(cfg["enabled"], "1")
-        self.assertEqual(cfg["workspace_whitelist"], "workspace-1 \n workspace-2")
         self.assertEqual(cfg["proxy_pool"], "socks5://127.0.0.1:7897")
         self.assertEqual(cfg["concurrency"], "4")
+        self.assertEqual(cfg["quota_queue_capacity"], "512")
+        self.assertEqual(cfg["relogin_queue_capacity"], "128")
         self.assertEqual(cfg["retry_count"], "0")
         self.assertEqual(cfg["quota_timeout"], "15")
         self.assertEqual(cfg["login_timeout"], "180")

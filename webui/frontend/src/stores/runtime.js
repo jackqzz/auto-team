@@ -18,7 +18,18 @@ function classify(line) {
 // 放在 store 里是为了「切换菜单页面时，后台自动跑号和日志不中断」。
 export const useRuntimeStore = defineStore('runtime', () => {
   const logs = ref([])            // { id, text, kind }
-  const autoStatus = ref({ state: 'stopped', registered_ok: 0, registered_fail: 0 })
+  const autoStatus = ref({
+    state: 'stopped',
+    registered_ok: 0,
+    registered_fail: 0,
+    retry_count: 0,
+    retry_attempts: 0,
+    task_total: null,
+    task_total_known: false,
+    task_completed: 0,
+    progress_percent: null,
+    proxy_pool_usage: [],
+  })
   const banner = ref('')          // 熔断/严重错误横幅
   const lastRunResult = ref(null) // { email, password, access_token_len, partial } 或 { error }
   const dataVersion = ref(0)      // 递增：通知号池/结果/记录表刷新
@@ -101,11 +112,16 @@ export const useRuntimeStore = defineStore('runtime', () => {
       run_finished: (e) => {
         try {
           const d = JSON.parse(e.data)
-          const tag = d.ok ? '[成功]' : (d.category === 'network' ? '[网络错误，号已 release]' : '[失败]')
-          // 失败任务同样会触发 run_finished，但不能写成“完成”，避免把网络错误
-          // 误解为账号已成功处理；这里的“结束”表示该账号本次尝试已退出。
-          const suffix = d.ok ? '完成' : '结束（本次不重试）'
-          addLog(`[auto] ${tag} ${d.email} ${suffix}`, d.ok ? 'ok' : 'err')
+          const tag = d.ok
+            ? '[成功]'
+            : (d.retry_scheduled ? '[重试中]' : (d.category === 'network' ? '[网络错误，号已 release]' : '[最终失败]'))
+          // run_finished 描述的是一次尝试；是否计入最终失败由后端的
+          // retry_scheduled 字段决定，避免把中途失败误显示成账号失败。
+          const suffix = d.ok ? '完成' : (d.retry_scheduled ? '本次失败，已排队重试' : '最终结束')
+          addLog(
+            `[auto] ${tag} ${d.email} ${suffix}`,
+            d.ok ? 'ok' : (d.retry_scheduled ? 'warn' : 'err'),
+          )
           useStatsStore().refresh()
           bumpData()
         } catch (_) {}

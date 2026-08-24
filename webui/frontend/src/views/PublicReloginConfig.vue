@@ -22,6 +22,8 @@ const form = reactive({
   proxyPool: '',
   useSystemProxyPool: true,
   concurrency: 3,
+  quotaQueueCapacity: 512,
+  reloginQueueCapacity: 128,
   retryCount: 2,
   quotaTimeout: 30,
   loginTimeout: 180,
@@ -47,6 +49,8 @@ async function load() {
     form.proxyPool = config.proxy_pool || ''
     form.useSystemProxyPool = config.use_system_proxy_pool !== false && config.use_system_proxy_pool !== '0'
     form.concurrency = Number(config.concurrency || 3)
+    form.quotaQueueCapacity = Number(config.quota_queue_capacity || 512)
+    form.reloginQueueCapacity = Number(config.relogin_queue_capacity || 128)
     form.retryCount = Number(config.retry_count || 2)
     form.quotaTimeout = Number(config.quota_timeout || 30)
     form.loginTimeout = Number(config.login_timeout || 180)
@@ -67,6 +71,8 @@ async function save() {
       proxy_pool: form.proxyPool.trim(),
       use_system_proxy_pool: form.useSystemProxyPool,
       concurrency: form.concurrency,
+      quota_queue_capacity: form.quotaQueueCapacity,
+      relogin_queue_capacity: form.reloginQueueCapacity,
       retry_count: form.retryCount,
       quota_timeout: form.quotaTimeout,
       login_timeout: form.loginTimeout,
@@ -155,8 +161,14 @@ onActivated(() => load())
         </el-form-item>
 
         <div class="grid">
-          <el-form-item label="最大并发">
+          <el-form-item label="全局最大并发">
             <el-input-number v-model="form.concurrency" :min="1" :max="20" />
+          </el-form-item>
+          <el-form-item label="额度查询等待队列">
+            <el-input-number v-model="form.quotaQueueCapacity" :min="1" :max="10000" />
+          </el-form-item>
+          <el-form-item label="401 重登录等待队列">
+            <el-input-number v-model="form.reloginQueueCapacity" :min="1" :max="10000" />
           </el-form-item>
           <el-form-item label="401 重登录失败重试">
             <el-input-number v-model="form.retryCount" :min="0" :max="5" />

@@ -5,6 +5,9 @@ import logging
 import threading
 import time
 import uuid
+from collections import deque
+from concurrent.futures import Future
+from typing import Callable
 from typing import Any
 
 from config import Config
@@ -12,7 +15,7 @@ from auth_flow import AuthFlow
 from http_client import create_http_session
 from mail_providers.base import MailProvider
 
-from . import db, exporter
+from . import db, exporter, proxy_usage
 
 BASE = "https://chatgpt.com"
 logger = logging.getLogger("public_relogin")
@@ -26,6 +29,120 @@ class PublicAccountDeactivated(RuntimeError):
     pass
 
 
+class PublicTaskQueueFull(RuntimeError):
+    pass
+
+
+class BoundedTaskDispatcher:
+    """进程级有界任务队列，所有公开页访问者共享并发额度。"""
+
+    def __init__(self, name: str, default_capacity: int):
+        self.name = name
+        self._capacity = max(1, int(default_capacity))
+        self._concurrency = 1
+        self._queue: deque[tuple[Future, Callable[[], Any]]] = deque()
+        self._condition = threading.Condition()
+        self._workers: list[threading.Thread] = []
+        self._running = 0
+        self._submitted = 0
+        self._completed = 0
+        self._rejected = 0
+
+    def configure(self, *, concurrency: int, capacity: int) -> None:
+        with self._condition:
+            self._concurrency = max(1, min(20, int(concurrency or 1)))
+            self._capacity = max(1, int(capacity or 1))
+            while len(self._workers) < self._concurrency:
+                index = len(self._workers)
+                worker = threading.Thread(
+                    target=self._worker,
+                    args=(index,),
+                    daemon=True,
+                    name=f"public-{self.name}-{index + 1}",
+                )
+                self._workers.append(worker)
+                worker.start()
+            self._condition.notify_all()
+
+    def submit_many(self, tasks: list[Callable[[], Any]]) -> list[Future]:
+        if not tasks:
+            return []
+        with self._condition:
+            outstanding = self._running + len(self._queue)
+            if outstanding + len(tasks) > self._concurrency + self._capacity:
+                self._rejected += len(tasks)
+                raise PublicTaskQueueFull(
+                    f"{self.name} 队列已满（等待上限 {self._capacity}），请稍后重试"
+                )
+            futures = [Future() for _ in tasks]
+            self._queue.extend(zip(futures, tasks))
+            self._submitted += len(tasks)
+            self._condition.notify_all()
+            return futures
+
+    def submit(self, task: Callable[[], Any]) -> Future:
+        return self.submit_many([task])[0]
+
+    def snapshot(self) -> dict:
+        with self._condition:
+            waiting = len(self._queue)
+            outstanding = self._running + waiting
+            return {
+                "name": self.name,
+                "waiting": waiting,
+                "running": self._running,
+                "capacity": self._capacity,
+                "concurrency": self._concurrency,
+                "available": max(0, self._concurrency + self._capacity - outstanding),
+                "full": outstanding >= self._concurrency + self._capacity,
+                "submitted": self._submitted,
+                "completed": self._completed,
+                "rejected": self._rejected,
+            }
+
+    def _worker(self, index: int) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: index < self._concurrency and bool(self._queue)
+                )
+                future, task = self._queue.popleft()
+                self._running += 1
+            try:
+                if future.set_running_or_notify_cancel():
+                    future.set_result(task())
+            except BaseException as exc:
+                future.set_exception(exc)
+            finally:
+                with self._condition:
+                    self._running -= 1
+                    self._completed += 1
+                    self._condition.notify_all()
+
+
+QUOTA_TASKS = BoundedTaskDispatcher("额度查询", 512)
+RELOGIN_TASKS = BoundedTaskDispatcher("401重登录", 128)
+
+
+def configure_task_dispatchers(cfg: dict) -> None:
+    concurrency = max(1, min(20, int(cfg.get("concurrency") or 1)))
+    QUOTA_TASKS.configure(
+        concurrency=concurrency,
+        capacity=max(1, int(cfg.get("quota_queue_capacity") or 512)),
+    )
+    RELOGIN_TASKS.configure(
+        concurrency=concurrency,
+        capacity=max(1, int(cfg.get("relogin_queue_capacity") or 128)),
+    )
+
+
+def task_queue_status() -> dict:
+    return {
+        "quota": QUOTA_TASKS.snapshot(),
+        "relogin": RELOGIN_TASKS.snapshot(),
+    }
+
+
 class ProxyLeasePool:
     """公开重登单次请求内的代理租取计数快照。"""
 
@@ -35,7 +152,13 @@ class ProxyLeasePool:
         self._usage = [0] * len(self._proxies)
         self._lock = threading.Lock()
 
-    def lease(self, exclude_proxy: str = "") -> tuple[str, int, int]:
+    def lease(
+        self,
+        exclude_proxy: str = "",
+        *,
+        task_type: str = "",
+        task_detail: str = "",
+    ) -> tuple[str, int, int]:
         """领取使用次数最少的代理；有其他选择时避开上一条失败代理。"""
         with self._lock:
             if not self._proxies:
@@ -47,7 +170,11 @@ class ProxyLeasePool:
             minimum = min(self._usage[i] for i in candidates)
             index = next(i for i in candidates if self._usage[i] == minimum)
             self._usage[index] += 1
-            return self._proxies[index], index, self._usage[index]
+            proxy = self._proxies[index]
+            leased_count = self._usage[index]
+        if task_type:
+            proxy_usage.record_lease(proxy, task_type, task_detail)
+        return proxy, index, leased_count
 
     def snapshot(self) -> list[dict]:
         with self._lock:
@@ -296,6 +423,8 @@ def get_effective_config() -> dict:
         "proxy_pool": cfg.get("proxy_pool") or "",
         "use_system_proxy_pool": str(cfg.get("use_system_proxy_pool") or "1").lower() in {"1", "true", "yes", "on"},
         "concurrency": max(1, min(20, int(cfg.get("concurrency") or 3))),
+        "quota_queue_capacity": max(1, min(10000, int(cfg.get("quota_queue_capacity") or 512))),
+        "relogin_queue_capacity": max(1, min(10000, int(cfg.get("relogin_queue_capacity") or 128))),
         "retry_count": max(0, min(5, int(cfg.get("retry_count") or 2))),
         "quota_timeout": max(5, min(120, int(cfg.get("quota_timeout") or 30))),
         "login_timeout": max(30, min(900, int(cfg.get("login_timeout") or 180))),

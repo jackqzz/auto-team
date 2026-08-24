@@ -5,7 +5,7 @@ import { Icon } from "@iconify/vue";
 import { useRoute } from "vue-router";
 import { storeToRefs } from "pinia";
 import { useProxyStore } from "@/stores/proxy";
-import { listWorkspaceMasters, syncWorkspace } from "@/api/workspaces";
+import { listWorkspaceMasters, syncWorkspace, syncWorkspaceMembers } from "@/api/workspaces";
 import {
   listExportFormats,
   exportRegistered,
@@ -63,6 +63,10 @@ const accountStatusFilter = ref(""), joinStatusFilter = ref(""), credentialStatu
 const settingsReady = ref(false);
 const settingsWorkspaceId = ref(null);
 const syncingWorkspace = ref(false);
+const syncingWorkspaceMembers = ref(false);
+const membershipTaskRunning = ref(false);
+const candidateCheckRunning = ref(false);
+const candidateMembershipBusy = computed(() => membershipTaskRunning.value || candidateCheckRunning.value);
 let settingsLoadGeneration = 0;
 let settingsSaveTimer = null;
 function setOperation(emails, text) { const next = { ...operationStatus.value }; emails.forEach((e) => { next[e] = text }); operationStatus.value = next }
@@ -187,11 +191,26 @@ async function syncCurrentWorkspace() {
     await loadSpaces();
     await load();
     window.dispatchEvent(new CustomEvent("workspace-master-updated", { detail: { id: workspaceId.value } }));
-    ElMessage.success("母号信息已同步");
+    ElMessage.success("席位统计已同步");
   } catch (e) {
     ElMessage.error("同步母号信息失败: " + e.message);
   } finally {
     syncingWorkspace.value = false;
+  }
+}
+async function syncCurrentWorkspaceMembers() {
+  if (!workspaceId.value) return ElMessage.warning("请选择母号空间");
+  syncingWorkspaceMembers.value = true;
+  try {
+    const result = await syncWorkspaceMembers(workspaceId.value);
+    await load();
+    ElMessage.success(
+      `成员席位同步完成：更新 ${result.refreshed || 0}，未匹配 ${result.missing || 0}，剩余未知 ${result.remaining || 0}`,
+    );
+  } catch (e) {
+    ElMessage.error(e.status === 429 ? "上游请求过于频繁，请稍后重试" : e.message);
+  } finally {
+    syncingWorkspaceMembers.value = false;
   }
 }
 async function load() {
@@ -272,16 +291,20 @@ async function moveToTrash() {
   }
 }
 async function invite() {
+  if (candidateMembershipBusy.value) return ElMessage.warning("空间加入或候选校验正在执行中");
   const emails = selected.value.filter((x) => x.assigned && x.account_status !== "permanently_invalid" && x.trash_status !== "trashed").map((x) => x.email);
   if (!emails.length)
     return ElMessage.warning("请先将账号划分为当前空间的候选人");
+  membershipTaskRunning.value = true;
   setOperation(emails, "邀请中…"); try {
     const r = await inviteCandidates(workspaceId.value, emails, seatType.value);
     const states = Object.values(r.states || {});
     const confirmed = states.filter((x) => x !== "not_invited").length;
     const pending = states.filter((x) => x === "not_invited").length;
     const seatName = seatType.value === "default" ? "标准席位" : "Codex席位";
-    if (pending === 0) {
+    if (r.recheck_error) {
+      ElMessage.warning(`邀请已提交，但状态复查受上游限流影响，请稍后执行候选状态校验`);
+    } else if (pending === 0) {
       ElMessage.success(
         `邀请完成并已复查状态（${seatName}）${r.invite_error ? "，上游请求超时但状态已确认" : ""}`,
       );
@@ -293,13 +316,18 @@ async function invite() {
     await load();
   } catch (e) {
     ElMessage.error(e.message);
-  } finally { clearOperation(emails); }
+  } finally {
+    membershipTaskRunning.value = false;
+    clearOperation(emails);
+  }
 }
 async function join() {
+  if (candidateMembershipBusy.value) return ElMessage.warning("空间加入或候选校验正在执行中");
   const emails = selected.value.filter((x) => x.assigned && x.account_status !== "permanently_invalid" && x.trash_status !== "trashed").map((x) => x.email);
   if (!emails.length) return ElMessage.warning("请先选择当前空间的候选人");
   if (!proxyList.value.length)
     return ElMessage.warning("全局代理池为空，请先在代理池页面配置代理");
+  membershipTaskRunning.value = true;
   setOperation(emails, "申请加入中…"); try {
     const r = await requestJoin(
       workspaceId.value,
@@ -315,18 +343,26 @@ async function join() {
     await load();
   } catch (e) {
     ElMessage.error(e.message);
-  } finally { clearOperation(emails); }
+  } finally {
+    membershipTaskRunning.value = false;
+    clearOperation(emails);
+  }
 }
 async function check() {
+  if (candidateMembershipBusy.value) return ElMessage.warning("空间加入或候选校验正在执行中");
   const emails = selected.value.filter((x) => x.account_status !== "permanently_invalid").map((x) => x.email);
   if (!emails.length) return ElMessage.warning("请选择候选人");
+  candidateCheckRunning.value = true;
   setOperation(emails, "校验中…"); try {
     await checkCandidates(workspaceId.value, emails);
     ElMessage.success("候选状态校验完成");
     await load();
   } catch (e) {
     ElMessage.error(e.message);
-  } finally { clearOperation(emails); }
+  } finally {
+    candidateCheckRunning.value = false;
+    clearOperation(emails);
+  }
 }
 async function setInviteStatus(joinStatus, label) {
   const emails = selected.value.filter((x) => x.account_status !== "permanently_invalid" && x.trash_status !== "trashed").map((x) => x.email);
@@ -345,10 +381,19 @@ async function setInviteStatus(joinStatus, label) {
 async function quota() {
   const emails = selected.value.filter((x) => x.has_workspace_access_token && x.account_status !== "permanently_invalid" && x.trash_status !== "trashed" && !["usage_based", "usage-based", "usagebased", "codex", "Codex席位"].includes(String(x.seat_label || x.seat_type || ""))).map((x) => x.email);
   if (!emails.length) return ElMessage.warning("没有已获得当前空间凭证的候选人");
+  const quotaProxies = [...new Set(proxyList.value.map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!quotaProxies.length) return ElMessage.warning("全局代理池为空，无法查询候选额度");
   if (quotaTaskRunning.value) return ElMessage.warning("额度查询任务正在执行中");
   const concurrency = Math.min(Math.max(1, Number(taskConcurrency.value) || 1), 20);
   const workspace = workspaceId.value;
   const results = {};
+  const quotaProxyUsage = quotaProxies.map(() => 0);
+  const leaseQuotaProxy = () => {
+    const minimum = Math.min(...quotaProxyUsage);
+    const index = quotaProxyUsage.findIndex((count) => count === minimum);
+    quotaProxyUsage[index] += 1;
+    return quotaProxies[index];
+  };
   quotaTaskRunning.value = true;
   quotaProgress.value = { done: 0, total: emails.length, active: 0, succeeded: 0, failed: 0, relogged: 0 };
   setOperation(emails, "排队中…");
@@ -358,6 +403,7 @@ async function quota() {
       quotaProgress.value = { ...quotaProgress.value, active: quotaProgress.value.active + 1 };
       let result;
       try {
+        const quotaProxy = leaseQuotaProxy();
         const response = await queryCandidateQuota(
           workspace,
           [email],
@@ -369,6 +415,7 @@ async function quota() {
             otp_timeout: taskOtpTimeout.value,
             account_retry_count: taskRetry.value,
             cool_down_seconds: taskCooldown.value,
+            quota_proxy: quotaProxy,
           },
         );
         result = response.results?.[email.toLowerCase()] || Object.values(response.results || {})[0];
@@ -816,8 +863,11 @@ onBeforeUnmount(() => {
           <span>费用 {{ currentWorkspace.seat_cost || '未同步' }}</span>
           <span>到期 {{ cst(currentWorkspace.renewal_date) }}</span>
         </div>
-        <el-button size="small" :loading="syncingWorkspace" @click="syncCurrentWorkspace">
-          <el-icon><Refresh /></el-icon>同步母号信息
+        <el-button size="small" :loading="syncingWorkspace" :disabled="syncingWorkspaceMembers" @click="syncCurrentWorkspace">
+          <el-icon><Refresh /></el-icon>同步席位统计
+        </el-button>
+        <el-button size="small" :loading="syncingWorkspaceMembers" :disabled="syncingWorkspace" @click="syncCurrentWorkspaceMembers">
+          同步成员席位
         </el-button>
       </div>
       <el-form inline style="margin-bottom: 8px">
@@ -856,8 +906,8 @@ onBeforeUnmount(() => {
       </el-form>
       <div class="tool-row">
         <div class="tool-left">
-          <el-dropdown @command="runMembershipAction"
-            ><el-button type="warning"
+          <el-dropdown :disabled="candidateMembershipBusy" @command="runMembershipAction"
+            ><el-button type="warning" :loading="membershipTaskRunning"
               >空间加入操作<i class="el-icon-arrow-down el-icon--right" /></el-button
             ><template #dropdown
               ><el-dropdown-menu
@@ -874,8 +924,8 @@ onBeforeUnmount(() => {
                 ><el-dropdown-item command="manual_joined">标记已加入</el-dropdown-item
               ></el-dropdown-menu></template
             ></el-dropdown
-          ><el-dropdown @command="runCandidateAction"
-          ><el-button type="primary"
+          ><el-dropdown :disabled="candidateMembershipBusy" @command="runCandidateAction"
+          ><el-button type="primary" :loading="candidateCheckRunning"
             >候选操作<i class="el-icon-arrow-down el-icon--right" /></el-button
           ><template #dropdown
             ><el-dropdown-menu
@@ -941,7 +991,7 @@ onBeforeUnmount(() => {
       <el-drawer v-model="settingsVisible" :title="currentSpaceLabel()" direction="rtl" size="360px" @close="queueSpaceSettingsSave">
         <div class="settings-panel">
           <div class="setting-row"><span>定时额度查询</span><el-switch v-model="quotaRunning" @change="toggleQuotaSchedule" /></div>
-          <div class="hint">只查询当前空间已获得 Team 凭证的候选人，默认关闭。</div>
+          <div class="hint">只查询当前空间已获得 Team 凭证的候选人；每个候选都从全局代理池租取代理，不使用母号专属出口。</div>
           <el-form label-position="top" style="margin-top:20px"><el-form-item label="查询间隔"><el-select v-model="quotaInterval" style="width:100%"><el-option :value="15" label="每 15 分钟" /><el-option :value="30" label="每 30 分钟" /><el-option :value="60" label="每 1 小时" /></el-select></el-form-item></el-form>
           <div class="setting-row"><span>401 自动重新登录</span><el-switch v-model="reloginOn401" /></div>
           <div class="hint">额度接口返回 401 时，将该账号重新投入当前 Team 空间登录。</div>

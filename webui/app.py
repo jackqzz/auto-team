@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, export_formats, registrar  # noqa: E402
+from . import db, export_formats, proxy_usage, registrar  # noqa: E402
 from . import workspace_membership  # noqa: E402
 from . import public_relogin  # noqa: E402
 from .auto_loop import (  # noqa: E402
@@ -221,6 +221,10 @@ class WorkspaceCandidatesReq(BaseModel):
     emails: list[str] = Field(default_factory=list)
     proxy: str = ""
     proxy_pool: str = ""
+    quota_proxy: str = Field(
+        "",
+        description="前端在本次手动额度任务快照中预选的全局池代理",
+    )
     seat_type: str = "default"
     tag_status: str = ""
     auto_push: bool = False
@@ -272,6 +276,8 @@ class PublicReloginSettingsReq(BaseModel):
     proxy_pool: str = ""
     use_system_proxy_pool: bool = True
     concurrency: int = Field(3, ge=1, le=20)
+    quota_queue_capacity: int = Field(512, ge=1, le=10000)
+    relogin_queue_capacity: int = Field(128, ge=1, le=10000)
     retry_count: int = Field(2, ge=0, le=5)
     quota_timeout: int = Field(30, ge=5, le=120)
     login_timeout: int = Field(180, ge=30, le=900)
@@ -289,6 +295,7 @@ class PublicReloginCheckReq(BaseModel):
     access_key: str = ""
     proxy_pool: str = ""
     concurrency: int = Field(0, ge=0, le=20)
+    auto_relogin_on_401: bool = False
 
 
 class PublicReloginReq(BaseModel):
@@ -298,9 +305,13 @@ class PublicReloginReq(BaseModel):
     concurrency: int = Field(0, ge=0, le=20)
 
 
-_quota_schedulers = {}
+_QuotaScheduler = tuple[threading.Event, threading.Thread, int, bool, float]
+_quota_schedulers_lock = threading.Lock()
+_quota_schedulers: dict[int, _QuotaScheduler] = {}
 _seat_auto_schedulers_lock = threading.Lock()
 _seat_auto_schedulers: dict[int, tuple[threading.Event, threading.Thread, float]] = {}
+_workspace_member_sync_lock = threading.Lock()
+_workspace_member_sync_running: set[int] = set()
 
 
 @app.get("/api/auth/status")
@@ -376,9 +387,93 @@ def _public_relogin_validate(account: dict, cfg: dict) -> tuple[dict | None, dic
     return normalized, None
 
 
+def _run_public_relogin_account(
+    account: dict,
+    normalized: dict,
+    cfg: dict,
+    proxy_leases: public_relogin.ProxyLeasePool,
+    *,
+    initial_exclude_proxy: str = "",
+) -> dict:
+    """执行单账号公开重登；巡检和手动重登共用同一套代理轮换规则。"""
+    account_proxy = str(account.get("proxy") or "").strip()
+    previous_proxy = initial_exclude_proxy
+    last_error = ""
+    for attempt in range(1, cfg["retry_count"] + 2):
+        if account_proxy:
+            proxy = account_proxy
+        else:
+            proxy, proxy_index, lease_count = proxy_leases.lease(
+                previous_proxy,
+                task_type="login",
+                task_detail="public_401_relogin",
+            )
+            if proxy:
+                logger.info(
+                    "公开401重登领取代理 account=%s attempt=%s pool_index=%s leased_count=%s",
+                    normalized.get("email", ""), attempt, proxy_index + 1, lease_count,
+                )
+
+        def switch_proxy(current_proxy: str, reason: str) -> str:
+            if account_proxy:
+                return account_proxy
+            replacement, replacement_index, replacement_count = proxy_leases.lease(
+                current_proxy,
+                task_type="login",
+                task_detail="public_401_relogin",
+            )
+            if replacement:
+                logger.warning(
+                    "公开401重登切换代理 account=%s attempt=%s pool_index=%s "
+                    "leased_count=%s reason=%s",
+                    normalized.get("email", ""), attempt, replacement_index + 1,
+                    replacement_count, reason,
+                )
+            return replacement
+
+        try:
+            refreshed = public_relogin.relogin_account(
+                normalized or account,
+                proxy=proxy,
+                login_timeout=cfg["login_timeout"],
+                on_proxy_switch=switch_proxy,
+            )
+            return {
+                "ok": True,
+                "status": "revived",
+                "attempt": attempt,
+                "email": refreshed.get("email", ""),
+                "workspace_id": refreshed.get("chatgpt_account_id", ""),
+                "account": refreshed,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            previous_proxy = proxy
+            if public_relogin._looks_deactivated(last_error):
+                return {
+                    "ok": False,
+                    "status": "deactivated",
+                    "attempt": attempt,
+                    "email": normalized.get("email", ""),
+                    "workspace_id": normalized.get("chatgpt_account_id", ""),
+                    "error": last_error[:500],
+                }
+            if attempt <= cfg["retry_count"]:
+                time.sleep(2)
+    return {
+        "ok": False,
+        "status": "failed",
+        "attempt": cfg["retry_count"] + 1,
+        "email": normalized.get("email", ""),
+        "workspace_id": normalized.get("chatgpt_account_id", ""),
+        "error": last_error[:500],
+    }
+
+
 @app.get("/api/settings/public-relogin")
 def api_get_public_relogin_settings():
     cfg = db.get_public_relogin_config()
+    public_relogin.configure_task_dispatchers(public_relogin.get_effective_config())
     auth_cfg = db.get_admin_auth_config()
     cfg["use_system_proxy_pool"] = str(cfg.get("use_system_proxy_pool") or "1").lower() in {"1", "true", "yes", "on"}
     return {
@@ -404,6 +499,7 @@ def api_save_public_relogin_settings(req: PublicReloginSettingsReq):
         db.save_admin_auth_config({"admin_password": req.admin_password.strip()})
         _ADMIN_SESSIONS.clear()
     cfg = db.get_public_relogin_config()
+    public_relogin.configure_task_dispatchers(public_relogin.get_effective_config())
     return {
         "ok": True,
         "config": {
@@ -431,11 +527,12 @@ def api_revoke_public_relogin_access_key(key_id: str):
 
 
 @app.post("/api/public-relogin/check")
-def api_public_relogin_check(req: PublicReloginCheckReq):
+async def api_public_relogin_check(req: PublicReloginCheckReq):
     cfg = public_relogin.get_effective_config()
     if not cfg["enabled"]:
         raise HTTPException(403, "公开 401 重登录页面未启用")
     _validate_public_relogin_access_key(req.access_key)
+    public_relogin.configure_task_dispatchers(cfg)
     accounts = req.accounts or []
     if not accounts:
         raise HTTPException(400, "请先导入账号")
@@ -443,7 +540,6 @@ def api_public_relogin_check(req: PublicReloginCheckReq):
         raise HTTPException(400, "单次最多检查 500 个账号")
     proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
     proxy_leases = public_relogin.ProxyLeasePool(proxies)
-    max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
     results: dict[str, dict] = {}
 
     def check_one(index: int, account: dict) -> tuple[str, dict]:
@@ -453,31 +549,85 @@ def api_public_relogin_check(req: PublicReloginCheckReq):
             return key, error
         proxy = str(account.get("proxy") or "").strip()
         if not proxy:
-            proxy, _, _ = proxy_leases.lease()
+            proxy, _, _ = proxy_leases.lease(
+                task_type="quota",
+                task_detail="public_quota",
+            )
         try:
             quota = public_relogin.fetch_quota(normalized or account, proxy=proxy, timeout=cfg["quota_timeout"])
             return key, {"ok": True, "status": "active", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "quota": quota}
         except public_relogin.PublicQuotaUnauthorized as exc:
+            if req.auto_relogin_on_401:
+                logger.warning(
+                    "公开定时巡检发现401，立即启动重登 account=%s",
+                    normalized.get("email", ""),
+                )
+                try:
+                    relogin_future = public_relogin.RELOGIN_TASKS.submit(
+                        lambda: _run_public_relogin_account(
+                            account,
+                            normalized,
+                            cfg,
+                            proxy_leases,
+                            initial_exclude_proxy=proxy,
+                        )
+                    )
+                except public_relogin.PublicTaskQueueFull as queue_error:
+                    return key, {
+                        "ok": False,
+                        "status": "queue_full",
+                        "detected_401": True,
+                        "email": normalized.get("email", ""),
+                        "workspace_id": normalized.get("chatgpt_account_id", ""),
+                        "error": str(queue_error),
+                    }
+                # 额度 worker 到这里立即返回并释放执行槽；HTTP 请求线程在下方
+                # 等待 relogin_future，不占用额度查询并发。
+                return key, {"_relogin_future": relogin_future}
             return key, {"ok": False, "status": "401", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
         except public_relogin.PublicAccountDeactivated as exc:
             return key, {"ok": False, "status": "deactivated", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
         except Exception as exc:
             return key, {"ok": False, "status": "error", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)[:500]}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(check_one, idx, account) for idx, account in enumerate(accounts)]
-        for future in as_completed(futures):
-            key, value = future.result()
-            results[key] = value
-    return {"ok": True, "results": results}
+    tasks = [
+        (lambda idx=idx, account=account: check_one(idx, account))
+        for idx, account in enumerate(accounts)
+    ]
+    try:
+        futures = public_relogin.QUOTA_TASKS.submit_many(tasks)
+    except public_relogin.PublicTaskQueueFull as exc:
+        raise HTTPException(429, str(exc))
+    completed = await asyncio.gather(*(asyncio.wrap_future(future) for future in futures))
+    for key, value in completed:
+        relogin_future = value.pop("_relogin_future", None)
+        if relogin_future is not None:
+            value = await asyncio.wrap_future(relogin_future)
+            value["detected_401"] = True
+        results[key] = value
+    return {
+        "ok": True,
+        "results": results,
+        "queues": public_relogin.task_queue_status(),
+    }
+
+
+@app.get("/api/public-relogin/queue-status")
+def api_public_relogin_queue_status():
+    cfg = public_relogin.get_effective_config()
+    if not cfg["enabled"]:
+        raise HTTPException(403, "公开 401 重登录页面未启用")
+    public_relogin.configure_task_dispatchers(cfg)
+    return {"ok": True, "queues": public_relogin.task_queue_status()}
 
 
 @app.post("/api/public-relogin/relogin")
-def api_public_relogin_relogin(req: PublicReloginReq):
+async def api_public_relogin_relogin(req: PublicReloginReq):
     cfg = public_relogin.get_effective_config()
     if not cfg["enabled"]:
         raise HTTPException(403, "公开 401 重登录页面未启用")
     _validate_public_relogin_access_key(req.access_key)
+    public_relogin.configure_task_dispatchers(cfg)
     accounts = req.accounts or []
     if not accounts:
         raise HTTPException(400, "请选择要重新登录的账号")
@@ -485,7 +635,6 @@ def api_public_relogin_relogin(req: PublicReloginReq):
         raise HTTPException(400, "单次最多重登 200 个账号")
     proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
     proxy_leases = public_relogin.ProxyLeasePool(proxies)
-    max_workers = min(int(req.concurrency or cfg["concurrency"]), cfg["concurrency"], max(1, len(accounts)))
     results: dict[str, dict] = {}
 
     def relogin_one(index: int, account: dict) -> tuple[str, dict]:
@@ -493,85 +642,25 @@ def api_public_relogin_relogin(req: PublicReloginReq):
         normalized, error = _public_relogin_validate(account, cfg)
         if error:
             return key, error
-        account_proxy = str(account.get("proxy") or "").strip()
-        previous_proxy = ""
-        last_error = ""
-        for attempt in range(1, cfg["retry_count"] + 2):
-            if account_proxy:
-                proxy = account_proxy
-            else:
-                proxy, proxy_index, lease_count = proxy_leases.lease(previous_proxy)
-                if proxy:
-                    logger.info(
-                        "公开401重登领取代理 account=%s attempt=%s pool_index=%s leased_count=%s",
-                        normalized.get("email", ""), attempt, proxy_index + 1, lease_count,
-                    )
+        return key, _run_public_relogin_account(account, normalized, cfg, proxy_leases)
 
-            def switch_proxy(current_proxy: str, reason: str) -> str:
-                if account_proxy:
-                    # 显式账号专属代理不能擅自改成系统池；同一 URL 重建会话仍可让
-                    # SID/动态代理切换出口。
-                    return account_proxy
-                replacement, replacement_index, replacement_count = proxy_leases.lease(
-                    current_proxy
-                )
-                if replacement:
-                    logger.warning(
-                        "公开401重登切换代理 account=%s attempt=%s pool_index=%s "
-                        "leased_count=%s reason=%s",
-                        normalized.get("email", ""), attempt, replacement_index + 1,
-                        replacement_count, reason,
-                    )
-                return replacement
-
-            try:
-                refreshed = public_relogin.relogin_account(
-                    normalized or account,
-                    proxy=proxy,
-                    login_timeout=cfg["login_timeout"],
-                    on_proxy_switch=switch_proxy,
-                )
-                return key, {
-                    "ok": True,
-                    "status": "revived",
-                    "attempt": attempt,
-                    "email": refreshed.get("email", ""),
-                    "workspace_id": refreshed.get("chatgpt_account_id", ""),
-                    "account": refreshed,
-                }
-            except Exception as exc:
-                last_error = str(exc)
-                previous_proxy = proxy
-                if public_relogin._looks_deactivated(last_error):
-                    return key, {
-                        "ok": False,
-                        "status": "deactivated",
-                        "attempt": attempt,
-                        "email": normalized.get("email", ""),
-                        "workspace_id": normalized.get("chatgpt_account_id", ""),
-                        "error": last_error[:500],
-                    }
-                if attempt <= cfg["retry_count"]:
-                    time.sleep(2)
-        return key, {
-            "ok": False,
-            "status": "failed",
-            "attempt": cfg["retry_count"] + 1,
-            "email": normalized.get("email", ""),
-            "workspace_id": normalized.get("chatgpt_account_id", ""),
-            "error": last_error[:500],
-        }
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(relogin_one, idx, account) for idx, account in enumerate(accounts)]
-        for future in as_completed(futures):
-            key, value = future.result()
-            results[key] = value
+    tasks = [
+        (lambda idx=idx, account=account: relogin_one(idx, account))
+        for idx, account in enumerate(accounts)
+    ]
+    try:
+        futures = public_relogin.RELOGIN_TASKS.submit_many(tasks)
+    except public_relogin.PublicTaskQueueFull as exc:
+        raise HTTPException(429, str(exc))
+    completed = await asyncio.gather(*(asyncio.wrap_future(future) for future in futures))
+    for key, value in completed:
+        results[key] = value
     return {
         "ok": True,
         "results": results,
-        "concurrency": max_workers,
+        "concurrency": cfg["concurrency"],
         "proxy_pool_usage": proxy_leases.snapshot(),
+        "queues": public_relogin.task_queue_status(),
     }
 
 def _is_codex_seat(value: object) -> bool:
@@ -583,6 +672,56 @@ def _workspace_settings_snapshot(workspace_id: int, overrides: dict | None = Non
     if overrides:
         cfg.update({k: v for k, v in overrides.items() if k != "workspace_id"})
     return cfg
+
+
+def _proxy_pool_values(value: object) -> list[str]:
+    return list(dict.fromkeys(
+        line.strip()
+        for line in str(value or "").splitlines()
+        if line.strip()
+    ))
+
+
+def _candidate_quota_proxy_pool(
+    proxy_pool: object,
+    *,
+    preferred_proxy: str = "",
+) -> public_relogin.ProxyLeasePool:
+    values = _proxy_pool_values(proxy_pool)
+    if not values:
+        raise ValueError("全局代理池为空，候选额度查询无法租取代理")
+    preferred = str(preferred_proxy or "").strip()
+    if preferred:
+        if preferred not in values:
+            raise ValueError("额度任务预选代理不属于当前全局代理池")
+        values = [preferred, *(proxy for proxy in values if proxy != preferred)]
+    return public_relogin.ProxyLeasePool(values)
+
+
+def _lease_candidate_quota_proxy(
+    leases: public_relogin.ProxyLeasePool,
+    *,
+    workspace_id: int,
+    email: str,
+    detail: str,
+    exclude_proxy: str = "",
+) -> str:
+    proxy, index, leased_count = leases.lease(
+        exclude_proxy,
+        task_type="quota",
+        task_detail=detail,
+    )
+    if not proxy:
+        raise ValueError("全局代理池为空，候选额度查询无法租取代理")
+    logging.getLogger("workspace_membership").info(
+        "候选额度查询领取全局代理 workspace=%s email=%s pool_index=%s leased_count=%s detail=%s",
+        workspace_id,
+        email,
+        index + 1,
+        leased_count,
+        detail,
+    )
+    return proxy
 
 def _is_zero_quota_payload(payload: dict) -> bool:
     if not isinstance(payload, dict) or payload.get("error_code"):
@@ -618,6 +757,7 @@ def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, a
         "workspace_db_id": workspace_id,
         "proxy_pool": proxy_pool,
         "proxy": "",
+        "proxy_usage_detail": "workspace_401_relogin",
         "concurrency": int(settings.get("concurrency", 1) or 1),
         "otp_timeout": int(settings.get("otp_timeout", 180) or 180),
         "want_access_token": True,
@@ -661,6 +801,21 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
                 and not _is_codex_seat(row.get("seat_type"))
             )
         ]
+        quota_leases = None
+        if candidates:
+            try:
+                quota_leases = _candidate_quota_proxy_pool(
+                    settings.get("proxy_pool"),
+                )
+            except ValueError as exc:
+                logging.getLogger("workspace_membership").error(
+                    "定时额度查询批次跳过 workspace=%s count=%s error=%s",
+                    workspace_id,
+                    len(candidates),
+                    exc,
+                )
+                stop.wait(interval * 60)
+                continue
         configured_concurrency = settings.get("concurrency", concurrency)
         worker_count = min(
             max(1, int(configured_concurrency or 1)),
@@ -679,8 +834,19 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
 
         def process_row(row: dict) -> None:
             email = row.get("email") or ""
+            quota_proxy = ""
             try:
-                quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+                quota_proxy = _lease_candidate_quota_proxy(
+                    quota_leases,
+                    workspace_id=workspace_id,
+                    email=email,
+                    detail="workspace_quota_scheduled",
+                )
+                quota = workspace_membership.fetch_candidate_quota(
+                    workspace_id,
+                    email,
+                    proxy=quota_proxy,
+                )
             except workspace_membership.QuotaUnauthorized:
                 quota_logger.warning(
                     "定时额度查询 401 workspace=%s email=%s",
@@ -688,15 +854,26 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
                     email,
                     exc_info=True,
                 )
-                if relogin_on_401 and proxy_pool:
+                if bool(settings.get("relogin_on_401", relogin_on_401)):
                     try:
                         if _wait_and_relogin_for_candidate(
                             workspace_id,
                             email,
                             settings,
-                            auto_export=auto_push,
+                            auto_export=bool(settings.get("auto_push", auto_push)),
                         ):
-                            quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+                            retry_proxy = _lease_candidate_quota_proxy(
+                                quota_leases,
+                                workspace_id=workspace_id,
+                                email=email,
+                                detail="workspace_quota_scheduled",
+                                exclude_proxy=quota_proxy,
+                            )
+                            quota = workspace_membership.fetch_candidate_quota(
+                                workspace_id,
+                                email,
+                                proxy=retry_proxy,
+                            )
                         else:
                             return
                     except Exception:
@@ -747,6 +924,117 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
         stop.wait(interval * 60)
 
 
+def _quota_schedule_request_from_settings(
+    workspace_id: int,
+    settings: dict,
+) -> WorkspaceQuotaScheduleReq:
+    """Validate persisted settings before using them to create a worker."""
+    return WorkspaceQuotaScheduleReq.model_validate(
+        {**dict(settings or {}), "workspace_id": int(workspace_id)}
+    )
+
+
+def _start_quota_scheduler(
+    workspace_id: int,
+    settings: dict,
+    *,
+    replace: bool = False,
+    source: str = "runtime",
+) -> tuple[_QuotaScheduler, bool]:
+    """Start one scheduler per workspace and return ``(item, started)``."""
+    req = _quota_schedule_request_from_settings(workspace_id, settings)
+    workspace_id = int(workspace_id)
+    with _quota_schedulers_lock:
+        current = _quota_schedulers.get(workspace_id)
+        if current and current[1].is_alive() and not replace:
+            return current, False
+        if current:
+            current[0].set()
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_quota_worker,
+            args=(
+                workspace_id,
+                req.interval_minutes,
+                stop,
+                req.relogin_on_401,
+                req.proxy_pool,
+                req.auto_push,
+                req.concurrency,
+                req.otp_timeout,
+                req.account_retry_count,
+                req.cool_down_seconds,
+            ),
+            daemon=True,
+            name=f"quota-scheduler-{workspace_id}",
+        )
+        next_at = time.time() + req.interval_minutes * 60
+        item: _QuotaScheduler = (
+            stop,
+            thread,
+            req.interval_minutes,
+            req.relogin_on_401,
+            next_at,
+        )
+        _quota_schedulers[workspace_id] = item
+        try:
+            thread.start()
+        except Exception:
+            if _quota_schedulers.get(workspace_id) is item:
+                _quota_schedulers.pop(workspace_id, None)
+            raise
+
+    logger.info(
+        "定时额度查询任务启动 workspace_db_id=%s interval_minutes=%s source=%s",
+        workspace_id,
+        req.interval_minutes,
+        source,
+    )
+    return item, True
+
+
+def _stop_quota_scheduler(workspace_id: int) -> _QuotaScheduler | None:
+    with _quota_schedulers_lock:
+        item = _quota_schedulers.pop(int(workspace_id), None)
+    if item:
+        item[0].set()
+    return item
+
+
+def _restore_quota_schedulers() -> int:
+    """Restore every persisted quota scheduler during application startup."""
+    restored = 0
+    offset = 0
+    page_size = 200
+    while True:
+        rows = db.list_workspace_masters(limit=page_size, offset=offset)
+        for row in rows:
+            workspace_id = int(row.get("id") or 0)
+            if not workspace_id:
+                continue
+            settings = db.get_workspace_settings(workspace_id)
+            if not settings.get("quota_enabled"):
+                continue
+            try:
+                _, started = _start_quota_scheduler(
+                    workspace_id,
+                    settings,
+                    source="startup",
+                )
+                restored += int(started)
+            except Exception:
+                logger.exception(
+                    "启动时恢复定时额度查询任务失败 workspace_db_id=%s",
+                    workspace_id,
+                )
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    logger.info("启动时恢复定时额度查询任务完成 restored=%s", restored)
+    return restored
+
+
 def _refresh_workspace_seat_info(workspace_id: int, retries: int = 3, delay_seconds: int = 5) -> dict | None:
     last_error: Exception | None = None
     for attempt in range(max(1, int(retries))):
@@ -768,13 +1056,18 @@ def _refresh_workspace_seat_info(workspace_id: int, retries: int = 3, delay_seco
     return None
 
 
-def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 200) -> int:
+def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 200) -> dict:
     """补齐当前空间里席位信息未知的候选人。
 
     这里的“未知”指本地没有有效 seat_type / seat_label / member_id 记录，
     但候选人已经处于 joined 且未入箱状态。刷新后会回写到候选表，供后续
     自动补标准席位、额度查询和导出直接复用。
     """
+    with _workspace_member_sync_lock:
+        if workspace_id in _workspace_member_sync_running:
+            raise RuntimeError("该母号的成员席位正在同步，请勿重复提交")
+        _workspace_member_sync_running.add(workspace_id)
+
     try:
         rows = db.list_workspace_candidate_options(
             workspace_id,
@@ -782,38 +1075,29 @@ def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 2
             join_status="joined",
             trash_status="active",
         )
-    except Exception:
-        logger.exception("未知席位候选列表加载失败 workspace_db_id=%s", workspace_id)
-        return 0
 
-    pending: list[dict] = []
-    for row in rows:
-        seat = workspace_membership._canonical_candidate_seat_type(
-            row.get("seat_type") or row.get("seat_label") or "",
-        )
-        gpt_seat = str(row.get("gpt_seat") or "").strip()
-        codex_seat = str(row.get("codex_seat") or "").strip()
-        member_id = str(row.get("member_id") or "").strip()
-        if seat in {"default", "usage_based"} and (gpt_seat or codex_seat) and member_id:
-            continue
-        pending.append(row)
-        if len(pending) >= max(1, int(limit)):
-            break
+        pending: list[dict] = []
+        for row in rows:
+            seat = workspace_membership._canonical_candidate_seat_type(
+                row.get("seat_type") or row.get("seat_label") or "",
+            )
+            gpt_seat = str(row.get("gpt_seat") or "").strip()
+            codex_seat = str(row.get("codex_seat") or "").strip()
+            member_id = str(row.get("member_id") or "").strip()
+            if seat in {"default", "usage_based"} and (gpt_seat or codex_seat) and member_id:
+                continue
+            pending.append(row)
 
-    if not pending:
-        return 0
-
-    refreshed = 0
-    for start in range(0, len(pending), 20):
-        batch = pending[start : start + 20]
-        emails = [str(row.get("email") or "").strip().lower() for row in batch if str(row.get("email") or "").strip()]
+        emails = [
+            str(row.get("email") or "").strip().lower()
+            for row in pending[:max(1, int(limit))]
+            if str(row.get("email") or "").strip()
+        ]
         if not emails:
-            continue
-        try:
-            snapshot = workspace_membership.fetch_candidate_seats(workspace_id, emails)
-        except Exception:
-            logger.exception("未知席位候选刷新失败 workspace_db_id=%s emails=%s", workspace_id, emails[:10])
-            continue
+            return {"requested": 0, "refreshed": 0, "missing": 0, "remaining": 0}
+
+        snapshot = workspace_membership.fetch_candidate_seats_bulk(workspace_id, emails)
+        refreshed = 0
         for email in emails:
             info = snapshot.get(email) or {}
             if not info:
@@ -830,15 +1114,25 @@ def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 2
                 info.get("member_id", ""),
                 info.get("raw_seat_type", ""),
             )
-            refreshed += 1
+            if info.get("member_id"):
+                refreshed += 1
 
-    if refreshed:
         logger.info(
-            "未知席位候选信息已刷新 workspace_db_id=%s refreshed=%s",
+            "成员席位独立同步完成 workspace_db_id=%s requested=%s refreshed=%s missing=%s",
             workspace_id,
+            len(emails),
             refreshed,
+            len(emails) - refreshed,
         )
-    return refreshed
+        return {
+            "requested": len(emails),
+            "refreshed": refreshed,
+            "missing": len(emails) - refreshed,
+            "remaining": max(0, len(pending) - refreshed),
+        }
+    finally:
+        with _workspace_member_sync_lock:
+            _workspace_member_sync_running.discard(workspace_id)
 
 
 def _workspace_auto_standard_candidates(workspace_id: int, seen: set[str] | None = None) -> list[dict]:
@@ -865,6 +1159,14 @@ def _workspace_auto_standard_candidates(workspace_id: int, seen: set[str] | None
             continue
         out.append(row)
     return out
+
+
+def _workspace_seat_protect_exhausted(settings: dict) -> bool:
+    if not settings.get("seat_protect_enabled"):
+        return False
+    threshold = max(1, int(settings.get("seat_protect_threshold") or 8))
+    used = max(0, int(settings.get("seat_protect_used_count") or 0))
+    return used >= threshold
 
 
 def _switch_candidate_to_default_and_verify(workspace_id: int, candidate: dict, settings: dict) -> dict:
@@ -982,6 +1284,7 @@ def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], setting
         "workspace_db_id": workspace_id,
         "proxy_pool": proxy_pool,
         "proxy": "",
+        "proxy_usage_detail": "workspace_credentials",
         "concurrency": int(settings.get("concurrency", 1) or 1),
         "otp_timeout": int(settings.get("otp_timeout", 180) or 180),
         "want_access_token": True,
@@ -1009,6 +1312,15 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
             if not settings.get("auto_standard_seat_enabled"):
                 logger.info("自动标准席位任务已关闭 workspace_db_id=%s", workspace_id)
                 return
+            if _workspace_seat_protect_exhausted(settings):
+                logger.info(
+                    "自动标准席位任务因席位保护跳过本轮 workspace_db_id=%s used=%s threshold=%s",
+                    workspace_id,
+                    int(settings.get("seat_protect_used_count") or 0),
+                    int(settings.get("seat_protect_threshold") or 8),
+                )
+                stop.wait(5 * 60)
+                continue
             seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
             if not seat_info:
                 stop.wait(5 * 60)
@@ -1017,7 +1329,10 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                 db.update_workspace_seat_info(workspace_id, **seat_info)
             except Exception:
                 logger.exception("自动标准席位刷新写回母号失败 workspace_db_id=%s", workspace_id)
-            _refresh_workspace_unknown_candidate_seats(workspace_id)
+            try:
+                _refresh_workspace_unknown_candidate_seats(workspace_id)
+            except Exception:
+                logger.exception("自动标准席位成员快照刷新失败 workspace_db_id=%s", workspace_id)
             entitled = int(seat_info.get("seats_entitled") or 0)
             current_default = int(seat_info.get("seats_default") or 0)
             if entitled <= 0 or current_default >= entitled:
@@ -1028,6 +1343,14 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
             attempted: set[str] = set()
             while not stop.is_set():
                 settings = _workspace_settings_snapshot(workspace_id)
+                if _workspace_seat_protect_exhausted(settings):
+                    logger.info(
+                        "自动标准席位任务达到席位保护阈值，停止本轮 workspace_db_id=%s used=%s threshold=%s",
+                        workspace_id,
+                        int(settings.get("seat_protect_used_count") or 0),
+                        int(settings.get("seat_protect_threshold") or 8),
+                    )
+                    break
                 seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
                 if not seat_info:
                     break
@@ -1035,7 +1358,6 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                     db.update_workspace_seat_info(workspace_id, **seat_info)
                 except Exception:
                     logger.exception("自动标准席位刷新写回母号失败 workspace_db_id=%s", workspace_id)
-                _refresh_workspace_unknown_candidate_seats(workspace_id)
                 entitled = int(seat_info.get("seats_entitled") or 0)
                 current_default = int(seat_info.get("seats_default") or 0)
                 deficit = max(0, entitled - current_default)
@@ -1066,6 +1388,13 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                         workspace_id,
                         email,
                     )
+                elif result.get("blocked_by_protect"):
+                    logger.info(
+                        "自动标准席位任务受到席位保护，停止本轮 workspace_db_id=%s email=%s",
+                        workspace_id,
+                        email,
+                    )
+                    break
                 else:
                     logger.warning(
                         "自动标准席位切换失败 workspace_db_id=%s email=%s error=%s",
@@ -1098,6 +1427,7 @@ _trash_sweeper_thread: threading.Thread | None = None
 def _trash_sweeper_worker():
     while not _trash_sweeper_stop.is_set():
         try:
+            quota_lease_pools: dict[int, public_relogin.ProxyLeasePool] = {}
             for row in db.list_workspace_candidate_trash_due():
                 if _trash_sweeper_stop.is_set():
                     break
@@ -1106,7 +1436,17 @@ def _trash_sweeper_worker():
                     continue
                 settings = _workspace_settings_snapshot(workspace_id)
                 try:
-                    _process_scheduled_trash_due(row, settings)
+                    quota_leases = quota_lease_pools.get(workspace_id)
+                    if quota_leases is None:
+                        try:
+                            quota_leases = _candidate_quota_proxy_pool(settings.get("proxy_pool"))
+                        except ValueError:
+                            # 交给单条处理函数统一记录失败并把复查时间后移，避免
+                            # 到期行每 30 秒被 sweeper 反复捞起。
+                            _process_scheduled_trash_due(row, settings)
+                            continue
+                        quota_lease_pools[workspace_id] = quota_leases
+                    _process_scheduled_trash_due(row, settings, quota_leases)
                 except Exception:
                     logger.exception(
                         "垃圾箱到期处理失败 workspace_db_id=%s email=%s",
@@ -1121,11 +1461,14 @@ def _trash_sweeper_worker():
 @app.on_event("startup")
 def _start_background_sweeper():
     global _trash_sweeper_thread
-    if _trash_sweeper_thread and _trash_sweeper_thread.is_alive():
-        return
-    _trash_sweeper_stop.clear()
-    _trash_sweeper_thread = threading.Thread(target=_trash_sweeper_worker, daemon=True, name="trash-sweeper")
-    _trash_sweeper_thread.start()
+    if not (_trash_sweeper_thread and _trash_sweeper_thread.is_alive()):
+        _trash_sweeper_stop.clear()
+        _trash_sweeper_thread = threading.Thread(target=_trash_sweeper_worker, daemon=True, name="trash-sweeper")
+        _trash_sweeper_thread.start()
+    try:
+        _restore_quota_schedulers()
+    except Exception:
+        logger.exception("启动时恢复定时额度查询任务失败")
     try:
         for row in db.list_workspace_masters(limit=200, offset=0):
             workspace_id = int(row.get("id") or 0)
@@ -1153,6 +1496,11 @@ def _start_background_sweeper():
 @app.on_event("shutdown")
 def _stop_background_sweeper():
     _trash_sweeper_stop.set()
+    with _quota_schedulers_lock:
+        quota_items = list(_quota_schedulers.values())
+        _quota_schedulers.clear()
+    for item in quota_items:
+        item[0].set()
 
 
 class RegisterReq(BaseModel):
@@ -1355,7 +1703,11 @@ def _wait_and_relogin_for_candidate(workspace_id: int, email: str, settings: dic
     return True
 
 
-def _process_scheduled_trash_due(row: dict, settings: dict) -> None:
+def _process_scheduled_trash_due(
+    row: dict,
+    settings: dict,
+    quota_leases: public_relogin.ProxyLeasePool | None = None,
+) -> None:
     workspace_id = int(row.get("workspace_master_id") or 0)
     email = str(row.get("email") or "").strip().lower()
     if not workspace_id or not email:
@@ -1363,12 +1715,36 @@ def _process_scheduled_trash_due(row: dict, settings: dict) -> None:
     if not _candidate_trash_enabled(workspace_id, settings):
         _clear_candidate_trash_timer(workspace_id, email)
         return
+    quota_proxy = ""
     try:
-        quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+        if quota_leases is None:
+            quota_leases = _candidate_quota_proxy_pool(settings.get("proxy_pool"))
+        quota_proxy = _lease_candidate_quota_proxy(
+            quota_leases,
+            workspace_id=workspace_id,
+            email=email,
+            detail="workspace_quota_trash_recheck",
+        )
+        quota = workspace_membership.fetch_candidate_quota(
+            workspace_id,
+            email,
+            proxy=quota_proxy,
+        )
     except workspace_membership.QuotaUnauthorized:
         try:
             if _wait_and_relogin_for_candidate(workspace_id, email, settings, auto_export=bool(settings.get("auto_push"))):
-                quota = workspace_membership.fetch_candidate_quota(workspace_id, email)
+                retry_proxy = _lease_candidate_quota_proxy(
+                    quota_leases,
+                    workspace_id=workspace_id,
+                    email=email,
+                    detail="workspace_quota_trash_recheck",
+                    exclude_proxy=quota_proxy,
+                )
+                quota = workspace_membership.fetch_candidate_quota(
+                    workspace_id,
+                    email,
+                    proxy=retry_proxy,
+                )
             else:
                 if not _candidate_trash_invalid_enabled(workspace_id, settings):
                     _clear_candidate_trash_timer(workspace_id, email)
@@ -1526,15 +1902,28 @@ def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
             len(req.emails),
         )
         time.sleep(_INVITE_STATUS_RECHECK_DELAY_SECONDS)
+    recheck_error = ""
     try:
-        states = workspace_membership.check_candidate_membership(req.workspace_id, req.emails)
-    except Exception:
+        states = workspace_membership.check_candidate_membership(
+            req.workspace_id,
+            req.emails,
+            prefer_invites=True,
+        )
+    except Exception as exc:
+        recheck_error = str(exc)
         logger.exception("候选邀请后状态校验失败 workspace_db_id=%s", req.workspace_id)
-        states = {email.lower(): "pending_invite" for email in req.emails}
-    for email in req.emails:
-        db.update_workspace_candidate_status(req.workspace_id, email, states.get(email.lower(), "not_invited"))
-    final_ok = not any(value == "not_invited" for value in states.values())
-    return {"ok": final_ok, "result": result if not invite_error else None, "states": states, "invite_error": invite_error}
+        states = {email.lower(): "unknown" for email in req.emails}
+    if not recheck_error:
+        for email in req.emails:
+            db.update_workspace_candidate_status(req.workspace_id, email, states.get(email.lower(), "not_invited"))
+    final_ok = not recheck_error and not any(value == "not_invited" for value in states.values())
+    return {
+        "ok": final_ok,
+        "result": result if not invite_error else None,
+        "states": states,
+        "invite_error": invite_error,
+        "recheck_error": recheck_error,
+    }
 
 
 @app.post("/api/workspace-candidates/request-join")
@@ -1547,16 +1936,19 @@ def api_request_workspace_join(req: WorkspaceCandidatesReq):
     rows = db.list_workspace_candidates(req.workspace_id)
     indexed = {r["email"]: r for r in rows}; results = []
     pool_values = [line.strip() for line in req.proxy_pool.splitlines() if line.strip()]
+    proxy_leases = public_relogin.ProxyLeasePool(pool_values)
     def run_one(item):
-        index, email = item
+        _index, email = item
         candidate = indexed.get(email.lower())
         if not candidate:
             return {"email": email, "ok": False, "error": "尚未划分到该母号空间"}
         try:
             proxy_value = req.proxy
             if not proxy_value and pool_values:
-                # 单次候选任务按全局池顺序分摊；自动任务的计数快照仍由 auto_loop 管理。
-                proxy_value = pool_values[index % len(pool_values)]
+                proxy_value, _, _ = proxy_leases.lease(
+                    task_type="candidate_join",
+                    task_detail="candidate_join",
+                )
             workspace_membership.request_join(req.workspace_id, candidate, proxy_value, seat_type=req.seat_type)
             db.update_workspace_candidate_status(req.workspace_id, email, "join_requested")
             return {"email": email, "ok": True}
@@ -1579,18 +1971,20 @@ def api_check_workspace_candidates(req: WorkspaceCandidatesReq):
     if not emails:
         raise HTTPException(400, "所选账号不是当前母号空间的候选人")
     try:
-        states = workspace_membership.check_candidate_membership(req.workspace_id, emails)
+        states, seats = workspace_membership.check_candidate_membership(
+            req.workspace_id,
+            emails,
+            include_seats=True,
+        )
     except Exception as e:
         logger.exception("候选状态校验失败 workspace_db_id=%s", req.workspace_id)
-        raise HTTPException(400, str(e))
+        status_code = 429 if getattr(e, "status_code", 0) == 429 else 400
+        raise HTTPException(status_code, str(e))
     for email, status in states.items():
         db.update_workspace_candidate_status(req.workspace_id, email, status)
-    try:
-        seats = workspace_membership.fetch_candidate_seats(req.workspace_id, emails)
-        for email, info in seats.items():
-            db.update_workspace_candidate_seats(req.workspace_id, email, info.get("codex_seat", ""), info.get("gpt_seat", ""))
-            db.update_workspace_candidate_member(req.workspace_id, email, info.get("member_id", ""), info.get("raw_seat_type", ""))
-    except Exception: logger.exception("候选席位查询失败 workspace_db_id=%s", req.workspace_id)
+    for email, info in seats.items():
+        db.update_workspace_candidate_seats(req.workspace_id, email, info.get("codex_seat", ""), info.get("gpt_seat", ""))
+        db.update_workspace_candidate_member(req.workspace_id, email, info.get("member_id", ""), info.get("raw_seat_type", ""))
     return {"ok": True, "states": states}
 
 
@@ -1686,7 +2080,17 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
 def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
     if not req.emails: raise HTTPException(400, "请选择候选人")
     _reject_trashed_candidates(req.workspace_id, req.emails)
-    settings = _workspace_settings_snapshot(req.workspace_id, req.model_dump())
+    setting_overrides = req.model_dump()
+    if not str(setting_overrides.get("proxy_pool") or "").strip():
+        setting_overrides.pop("proxy_pool", None)
+    settings = _workspace_settings_snapshot(req.workspace_id, setting_overrides)
+    try:
+        quota_leases = _candidate_quota_proxy_pool(
+            req.proxy_pool or settings.get("proxy_pool"),
+            preferred_proxy=req.quota_proxy,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     options = {
         r["email"] for r in db.list_workspace_candidate_options(req.workspace_id)
         if r.get("has_workspace_access_token")
@@ -1695,7 +2099,7 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
     }
     invalid_emails = db.list_registered_invalid_emails(req.emails)
     results = {}
-    logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(req.proxy_pool.strip()))
+    logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(req.proxy_pool.strip() or str(settings.get("proxy_pool") or "").strip()))
     trash_delay = _candidate_trash_delay_seconds(req.workspace_id, settings)
     for email in req.emails:
         key = email.lower()
@@ -1704,14 +2108,25 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
                 results[key] = {"ok": False, "error": "账号已永久失效"}
             continue
         quota = None
+        quota_proxy = ""
         try:
-            quota = workspace_membership.fetch_candidate_quota(req.workspace_id, email)
+            quota_proxy = _lease_candidate_quota_proxy(
+                quota_leases,
+                workspace_id=req.workspace_id,
+                email=key,
+                detail="workspace_quota_manual",
+            )
+            quota = workspace_membership.fetch_candidate_quota(
+                req.workspace_id,
+                email,
+                proxy=quota_proxy,
+            )
             results[key] = {"ok": True, "quota": quota}
         except Exception as e:
             results[key] = {"ok": False, "error": str(e)}
             is_401 = isinstance(e, workspace_membership.QuotaUnauthorized) or "HTTP 401" in str(e) or "401" in str(e)
             if req.relogin_on_401 and is_401:
-                if not req.proxy_pool:
+                if not str(settings.get("proxy_pool") or "").strip():
                     results[key]["relogin_error"] = "全局代理池为空，无法重新登录"
                     continue
                 try:
@@ -1726,7 +2141,18 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
                         if _candidate_trash_invalid_enabled(req.workspace_id, settings):
                             results[key]["trashed"] = True
                         continue
-                    quota = workspace_membership.fetch_candidate_quota(req.workspace_id, key)
+                    retry_proxy = _lease_candidate_quota_proxy(
+                        quota_leases,
+                        workspace_id=req.workspace_id,
+                        email=key,
+                        detail="workspace_quota_manual",
+                        exclude_proxy=quota_proxy,
+                    )
+                    quota = workspace_membership.fetch_candidate_quota(
+                        req.workspace_id,
+                        key,
+                        proxy=retry_proxy,
+                    )
                     results[key] = {"ok": True, "quota": quota, "relogin_started": True}
                 except Exception as relogin_exc:
                     results[key]["relogin_error"] = str(relogin_exc)
@@ -1750,29 +2176,40 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
 
 @app.post("/api/workspace-candidates/quota-schedule/start")
 def api_start_quota_schedule(req: WorkspaceQuotaScheduleReq):
-    old = _quota_schedulers.pop(req.workspace_id, None)
-    if old: old[0].set()
-    stop = threading.Event(); thread = threading.Thread(target=_quota_worker, args=(req.workspace_id, req.interval_minutes, stop, req.relogin_on_401, req.proxy_pool, req.auto_push, req.concurrency, req.otp_timeout, req.account_retry_count, req.cool_down_seconds), daemon=True)
-    next_at = time.time() + req.interval_minutes * 60
-    _quota_schedulers[req.workspace_id] = (stop, thread, req.interval_minutes, req.relogin_on_401, next_at); thread.start()
-    db.update_workspace_settings(req.workspace_id, {**req.model_dump(), "quota_enabled": True})
-    return {"ok": True, "running": True, "interval_minutes": req.interval_minutes, "relogin_on_401": req.relogin_on_401, "next_at": next_at}
+    try:
+        _candidate_quota_proxy_pool(req.proxy_pool)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    settings = {**req.model_dump(), "quota_enabled": True}
+    db.update_workspace_settings(req.workspace_id, settings)
+    item, _ = _start_quota_scheduler(
+        req.workspace_id,
+        settings,
+        replace=True,
+        source="api",
+    )
+    return {"ok": True, "running": True, "interval_minutes": item[2], "relogin_on_401": item[3], "next_at": item[4]}
 
 @app.post("/api/workspace-candidates/quota-schedule/stop")
 def api_stop_quota_schedule(req: WorkspaceQuotaScheduleReq):
-    item = _quota_schedulers.pop(req.workspace_id, None)
-    if item: item[0].set()
     db.update_workspace_settings(req.workspace_id, {"quota_enabled": False})
+    _stop_quota_scheduler(req.workspace_id)
     return {"ok": True, "running": False}
 
 @app.get("/api/workspace-candidates/quota-schedule")
 def api_quota_schedule_status(workspace_id: int):
-    item = _quota_schedulers.get(workspace_id)
     cfg = db.get_workspace_settings(workspace_id)
+    with _quota_schedulers_lock:
+        item = _quota_schedulers.get(workspace_id)
+        if item and not item[1].is_alive():
+            _quota_schedulers.pop(workspace_id, None)
+            item = None
     if not item and cfg.get("quota_enabled"):
-        stop = threading.Event(); args = (workspace_id, int(cfg.get("interval_minutes",30)), stop, bool(cfg.get("relogin_on_401")), str(cfg.get("proxy_pool", "")), bool(cfg.get("auto_push")), int(cfg.get("concurrency",1)), int(cfg.get("otp_timeout",180)), int(cfg.get("account_retry_count",1)), int(cfg.get("cool_down_seconds",0)))
-        thread = threading.Thread(target=_quota_worker, args=args, daemon=True); next_at = time.time() + args[1] * 60
-        item = (stop, thread, args[1], args[3], next_at); _quota_schedulers[workspace_id] = item; thread.start()
+        item, _ = _start_quota_scheduler(
+            workspace_id,
+            cfg,
+            source="status",
+        )
     return {"ok": True, "running": bool(item and item[1].is_alive()), "interval_minutes": item[2] if item else int(cfg.get("interval_minutes",30)), "relogin_on_401": item[3] if item else bool(cfg.get("relogin_on_401")), "next_at": item[4] if item else 0, "settings": cfg}
 
 
@@ -1881,7 +2318,12 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
         else:
             need_check.append(email)
     if need_check:
-        states = workspace_membership.check_candidate_membership(req.workspace_id, need_check)
+        try:
+            states = workspace_membership.check_candidate_membership(req.workspace_id, need_check)
+        except Exception as exc:
+            logger.exception("空间凭证任务候选状态校验失败 workspace_db_id=%s", req.workspace_id)
+            status_code = 429 if getattr(exc, "status_code", 0) == 429 else 400
+            raise HTTPException(status_code, str(exc))
         for email, status in states.items():
             db.update_workspace_candidate_status(req.workspace_id, email, status)
             if status == "pending_request":
@@ -1905,7 +2347,8 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
     result = login_controller_for(workspace_db_id=req.workspace_id, workspace_id=master["workspace_id"]).start({
         "login_only": True, "login_emails": eligible, "group_name": "__all__",
         "workspace_id": master["workspace_id"], "workspace_db_id": req.workspace_id, "proxy_pool": proxy_pool,
-        "proxy": "", "concurrency": req.concurrency, "otp_timeout": req.otp_timeout,
+        "proxy": "", "proxy_usage_detail": "workspace_credentials",
+        "concurrency": req.concurrency, "otp_timeout": req.otp_timeout,
         "want_access_token": True, "want_session_token": True, "want_refresh_token": True,
         "want_password": False, "want_2fa": False, "allow_existing_login": True,
         "cool_down_seconds": req.cool_down_seconds, "account_retry_count": req.account_retry_count, "auto_export": req.auto_push,
@@ -1918,11 +2361,28 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
 
 @app.post("/api/workspaces/{workspace_id}/sync")
 def api_sync_workspace(workspace_id: int):
-    try: values = workspace_membership.sync_seat_info(workspace_id)
-    except Exception as e: raise HTTPException(400, str(e))
+    try:
+        values = workspace_membership.sync_seat_info(workspace_id)
+    except workspace_membership.UpstreamHttpError as exc:
+        status_code = 429 if exc.status_code == 429 else 400
+        raise HTTPException(status_code, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
     db.update_workspace_seat_info(workspace_id, **values)
-    _refresh_workspace_unknown_candidate_seats(workspace_id)
     return {"ok": True, "data": values}
+
+
+@app.post("/api/workspaces/{workspace_id}/sync-members")
+def api_sync_workspace_members(workspace_id: int):
+    try:
+        result = _refresh_workspace_unknown_candidate_seats(workspace_id)
+    except workspace_membership.UpstreamHttpError as exc:
+        status_code = 429 if exc.status_code == 429 else 400
+        raise HTTPException(status_code, str(exc)) from exc
+    except RuntimeError as exc:
+        status_code = 409 if "正在同步" in str(exc) else 400
+        raise HTTPException(status_code, str(exc)) from exc
+    return {"ok": True, **result}
 
 
 @app.get("/api/accounts")
@@ -2066,6 +2526,18 @@ def api_stats():
 
 
 # ──────────────────────── 代理连通性测试 ────────────────────────
+
+
+@app.get("/api/proxy/usage")
+def api_proxy_usage():
+    """返回所有真实代理池租借的持久化累计计数。"""
+    return {"ok": True, "usage": proxy_usage.snapshot()}
+
+
+@app.post("/api/proxy/usage/reset")
+def api_reset_proxy_usage():
+    """只清空租借统计，不修改浏览器中的代理池配置。"""
+    return {"ok": True, "usage": proxy_usage.reset()}
 
 
 class ProxyTestReq(BaseModel):
