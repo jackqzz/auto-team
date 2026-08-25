@@ -5020,6 +5020,18 @@ class AuthFlow:
         except ImportError as exc:  # pragma: no cover - 由运行环境决定
             raise RuntimeError("Camoufox 注册需要安装 camoufox") from exc
 
+        # ── 全局超时：防止注册线程永久挂起 ──
+        # 默认 480s（8 分钟）；可通过环境变量调整。正常注册流程约 2-4 分钟，
+        # 8 分钟足够应对网络抖动和重试，但不会让僵尸线程无限存活。
+        _camoufox_timeout = int(
+            self._get_env("OPENAI_CAMOUFOX_TIMEOUT", "480") or "480"
+        )
+        _camoufox_deadline = time.time() + _camoufox_timeout
+        logger.info(
+            "[camoufox] 全局超时设置 timeout=%ss deadline=%.0f",
+            _camoufox_timeout, _camoufox_deadline,
+        )
+
         email = mail_provider.create_mailbox()
         self.result.email = email
         # 重试场景由 registrar 预先注入已落盘密码；此时这是登录密码，
@@ -5161,10 +5173,22 @@ class AuthFlow:
                 )[:500]
             return ""
 
+        def _check_deadline(label: str = "") -> None:
+            """检查全局超时，超时则抛出 RuntimeError 强制退出。"""
+            if time.time() >= _camoufox_deadline:
+                elapsed = int(time.time() - (_camoufox_deadline - _camoufox_timeout))
+                msg = (
+                    f"Camoufox 全局超时 ({elapsed}s/{_camoufox_timeout}s)"
+                    + (f" at={label}" if label else "")
+                )
+                logger.error("[camoufox] %s", msg)
+                raise RuntimeError(msg)
+
         def _wait_titles(page, titles, *, interval_ms: int = 1000, attempts: int = 60) -> bool:
             wanted = {str(item) for item in titles}
             last_title = ""
             for index in range(max(1, attempts)):
+                _check_deadline("_wait_titles")
                 try:
                     title = str(page.title() or "")
                 except Exception:
@@ -5327,6 +5351,7 @@ class AuthFlow:
             except Exception as exc:
                 logger.warning("[camoufox] 浏览器事件监听器安装失败: %s", exc)
             _page_state(page, "before_initial_register_goto")
+            _check_deadline("initial_goto")
             goto_with_timeout(
                 page,
                 "https://auth.openai.com/create-account",
@@ -5388,6 +5413,7 @@ class AuthFlow:
                 _page_screenshot(page, "welcome_back_timeout")
                 _page_text(page, "welcome_back_timeout")
                 raise RuntimeError("Camoufox 未进入 Welcome back 登录页")
+            _check_deadline("second_goto_create_account")
             goto_with_timeout(
                 page,
                 "https://auth.openai.com/create-account",
@@ -5417,6 +5443,7 @@ class AuthFlow:
                 _page_state(page, "email_input_missing")
                 raise RuntimeError("Camoufox 注册页面未找到邮箱输入框")
             logger.info("[camoufox] 找到邮箱输入框，提交邮箱（地址已隐藏）")
+            _check_deadline("email_fill")
             email_input.fill(email)
             try:
                 email_input.press("Tab")
@@ -5597,6 +5624,7 @@ class AuthFlow:
             for attempt in range(3):
                 if _skip_otp:
                     break
+                _check_deadline("otp_loop")
                 try:
                     page.wait_for_timeout(600)
                 except Exception:
@@ -5772,6 +5800,7 @@ class AuthFlow:
 
                 logger.info("[camoufox] profile_submit_poll title=%s (waiting...)", str(page.title() or "")[:120])
                 for _wait_index in range(60):
+                    _check_deadline("profile_poll")
                     try:
                         current_title = str(page.title() or "")
                     except Exception:
@@ -5811,6 +5840,7 @@ class AuthFlow:
                             _safety_error[:200],
                         )
                         for _safety_i in range(5):
+                            _check_deadline("safety_net_retry")
                             try:
                                 page.wait_for_timeout(2_000)
                             except Exception:
@@ -5864,6 +5894,7 @@ class AuthFlow:
             # 让 NextAuth 在浏览器侧主动写入 session cookie；随后协议请求
             # /api/auth/session 可直接读取 accessToken 和 sessionToken。
             session_response = None
+            _check_deadline("session_fetch")
             try:
                 session_response = goto_with_timeout(
                     page,
@@ -5912,6 +5943,7 @@ class AuthFlow:
         # 现有 session 提取、2FA hook、OAuth RT 均从这里继续，保证落库格式一致。
         # 浏览器 JSON 已有凭证时，HTTP 端点只用于补齐/刷新；某些部署返回空
         # JSON，此时 get_auth_session 仍会按 cookie 兜底。
+        _check_deadline("post_browser")
         try:
             self.get_auth_session()
         except Exception as exc:
@@ -5929,6 +5961,7 @@ class AuthFlow:
             and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0")
             and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1")
         ):
+            _check_deadline("oauth_rt_exchange")
             self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             self.get_auth_session()
         if not self.result.is_valid():

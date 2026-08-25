@@ -137,6 +137,7 @@ _NETWORK_ERROR_PATTERNS = [
     "remote disconnected", "connection reset", "connection aborted",
     "max retries exceeded",
     "invalid_state",
+    "全局超时",
 ]
 
 # 这些是账号本身失效的明确特征。它们与 Cloudflare/代理造成的普通 403
