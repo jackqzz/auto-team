@@ -2814,6 +2814,43 @@ def list_proxy_lease_usage() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def proxy_lease_counts_since(
+    proxies: list[str],
+    since: float,
+    task_type: str = "",
+) -> dict[str, int]:
+    """返回 *proxies* 中每个代理自 *since* 以来的累计租借次数。
+
+    如果 task_type 非空，只统计该类型的记录；否则统计所有类型。
+    不在 proxies 列表中的代理不会被返回。
+    """
+    if not proxies:
+        return {}
+    con = _conn()
+    # 为保证 SQL 注入安全，用参数占位符
+    placeholders = ",".join("?" for _ in proxies)
+    params: list = list(proxies)
+    type_clause = ""
+    if task_type:
+        type_clause = " AND task_type = ?"
+        params.append(task_type)
+    params.append(since)
+    rows = con.execute(
+        f"""SELECT proxy, SUM(leased_count) AS total
+           FROM proxy_lease_usage
+           WHERE proxy IN ({placeholders}){type_clause}
+             AND last_leased_at >= ?
+           GROUP BY proxy""",
+        params,
+    ).fetchall()
+    result = {p: 0 for p in proxies}
+    for row in rows:
+        p = str(row["proxy"])
+        if p in result:
+            result[p] = int(row["total"])
+    return result
+
+
 def reset_proxy_lease_usage() -> float:
     """清空全局累计统计，返回新统计周期的开始时间。"""
     started_at = time.time()

@@ -3,7 +3,7 @@
 设计：
   - 主控线程 manage_loop：监听 stop/pause、根据 concurrency 启停 worker
   - 多个 worker 线程：claim_next() → 注册 → 完成 → 继续
-  - 代理池：每个任务优先领取当前租取次数最少的代理
+  - 代理池：基于近期历史租借计数（LRU 式）挑选使用次数最少的代理
   - 状态机：stopped → running → paused → running / stopped
   - 优雅暂停/停止：当前 worker 跑完才退出，不强杀
   - 复用 registrar.start_registration：每个号开一个 run，由 worker 等其结束
@@ -247,8 +247,26 @@ class AutoLoopController:
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
             pool_text = self._options.get("proxy_pool") or ""
             self._proxy_pool = _parse_proxy_pool(pool_text)
-            # 计数只属于本次自动任务，任务重新启动时建立全新的快照。
-            self._proxy_usage = [0] * len(self._proxy_pool)
+            # 基于近期历史的租借计数（LRU 式），而非从零开始的快照。
+            # 默认统计最近 3 小时内的租借记录。
+            self._proxy_history_window = float(
+                self._options.get("proxy_history_window") or 10800
+            )
+            if self._proxy_pool:
+                since = time.time() - self._proxy_history_window
+                historical = db.proxy_lease_counts_since(
+                    self._proxy_pool, since,
+                )
+                self._proxy_usage = [
+                    historical.get(p, 0) for p in self._proxy_pool
+                ]
+                logger.info(
+                    "[auto-loop] 代理池已加载历史计数 (window=%.0fs): %s",
+                    self._proxy_history_window,
+                    list(zip(self._proxy_pool, self._proxy_usage)),
+                )
+            else:
+                self._proxy_usage = []
             self._single_proxy_usage = 0
             # 每个账号独立的失败重试次数；1 表示首次失败后再尝试一次。
             self._account_retry_count = max(
@@ -532,8 +550,8 @@ class AutoLoopController:
     ) -> str:
         """为新任务领取当前租取次数最少的代理。
 
-        选择和计数递增在同一把锁内完成，避免并发 worker 同时拿到同一个
-        最小计数。计数快照仅在本次自动任务生命周期内有效。
+        初始计数基于近期历史（LRU 式），选择和计数递增在同一把锁内完成，
+        避免并发 worker 同时拿到同一个最小计数。
         """
         leased_from_pool = False
         should_record = False
@@ -1002,7 +1020,7 @@ class AutoLoopController:
                 continue
 
             # 每个任务开始时重新领取代理；不要在 worker 循环外固定一次。
-            # 领取逻辑会优先选择本次任务快照中租取次数最少的代理。
+            # 领取逻辑基于近期历史计数，优先选择租取次数最少的代理。
             lease_detail = str(
                 account.get("_proxy_usage_detail")
                 or self._options.get("proxy_usage_detail")
