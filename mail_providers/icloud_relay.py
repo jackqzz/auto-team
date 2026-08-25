@@ -2,7 +2,12 @@
 
 主人手上的形态：
     邮箱      任意邮箱地址（兼容 iCloud 隐藏邮箱、Gmail 等）
+    OpenAI密码（补齐2FA必填）
     中转链接  https://mail.ai1998.xyz/messages/<token>/<email>
+
+导入格式兼容：
+    email----OTP中转链接
+    email----OpenAI密码----OTP中转链接
 
 中转站是第三方部署的 HTML 页面，**没有 JSON 接口**（试过 ?format=json，
 还是吐 HTML），所以取码只能从 HTML 里抠。
@@ -672,9 +677,10 @@ class ICloudRelayProvider(MailProvider):
     # 每个号的中转链接都不一样（token 和地址都嵌在 URL 里），
     # 所以链接必须跟着号走，不能放全局配置。
     line_segments = 2
-    import_hint = "任意邮箱----OTP 中转链接"
+    import_segments_label = "2 或 3"
+    import_hint = "任意邮箱----OpenAI密码----OTP 中转链接（也兼容邮箱----中转链接）"
     import_placeholder = (
-        "ferrarieddie78729@gmail.com----https://gapi.mailsapi.com/api/get-code?uid=s72603dfa6ca0a9640e"
+        "ferrarieddie78729@gmail.com----OpenAI密码----https://gapi.mailsapi.com/api/get-code?uid=s72603dfa6ca0a9640e"
     )
 
     # 号池型 provider 不需要全局配置 —— 凭证全在每一行导入数据里。
@@ -685,7 +691,7 @@ class ICloudRelayProvider(MailProvider):
     # OpenAI 走 passwordless_login 照样能拿 token，不该当失败处理。
     # registrar.classify_error 会读这个标志（默认 False，不影响其他 provider）。
     accepts_existing_account = True
-    # 通用 OTP 导入用于创建可长期登录的账号；不接受静默回退到无密码流程。
+    # 通用 OTP 导入用于已有账号登录/补齐2FA；不接受静默回退到无密码流程。
     requires_password = True
 
     def __init__(self, email: str, relay_url: str, timeout: int = 20):
@@ -1139,22 +1145,35 @@ class ICloudRelayProvider(MailProvider):
 
     @classmethod
     def parse_line(cls, line: str) -> dict:
-        """email----relay_url
+        """email----relay_url 或 email----OpenAI密码----relay_url。
+
+        补齐 2FA 不会再创建密码，因此外部已注册账号若要参与该任务，
+        必须同时导入已有的 OpenAI 密码。两段格式仍保留兼容性，供历史
+        数据导入使用；这类账号会被“补齐2FA”任务跳过。
 
         pooled=False 时用不到，但先写好：主人以后有一批中转链接，
         把 pooled 改成 True 就能直接走号池导入。
         """
         parts = [p.strip() for p in (line or "").split("----")]
-        if len(parts) != 2:
+        if len(parts) not in (2, 3):
             raise ValueError(
-                f"需要 2 段（邮箱----OTP 中转链接），实际 {len(parts)} 段"
+                f"需要 2 段（邮箱----OTP 中转链接）或 3 段（邮箱----OpenAI密码----OTP 中转链接），实际 {len(parts)} 段"
             )
-        email, relay = parts
+        if len(parts) == 2:
+            email, relay = parts
+            password = ""
+        else:
+            email, password, relay = parts
+            if not password:
+                raise ValueError("第 2 段 OpenAI 密码不能为空")
         validate_email(email)
         if not relay.lower().startswith(("http://", "https://")):
-            raise ValueError("第 2 段必须是 http(s):// 开头的中转链接")
+            raise ValueError(
+                f"第 {3 if len(parts) == 3 else 2} 段必须是 http(s):// 开头的中转链接"
+            )
         return {
             "email": email.lower(),
+            "password": password,
             "kind": cls.kind,
             "relay_url": relay,
         }

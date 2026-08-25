@@ -198,6 +198,9 @@ class MailProvider(ABC):
 
     # ── 导入格式 ─────────────────────────────────────────
     line_segments: int = 0               # ---- 分隔的段数；0 = 不支持导入
+    # 展示给 WebUI 的格式说明；默认与 line_segments 一致，支持多个格式的
+    # provider 可覆盖（例如通用 OTP 同时兼容 2 段和 3 段）。
+    import_segments_label: str = ""
     import_hint: str = ""                # WebUI 导入页的格式提示
     import_placeholder: str = ""         # 输入框 placeholder 示例
 
@@ -413,6 +416,9 @@ def list_providers() -> list[dict]:
             "pooled": c.pooled,
             "ephemeral": c.ephemeral,
             "line_segments": c.line_segments,
+            "import_segments_label": c.import_segments_label or (
+                f"{c.line_segments}" if c.line_segments > 0 else ""
+            ),
             "import_hint": c.import_hint,
             "import_placeholder": c.import_placeholder,
             "config_fields": [f.to_dict() for f in c.config_fields],

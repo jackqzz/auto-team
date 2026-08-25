@@ -511,7 +511,7 @@ async function reloginSelected() {
   try {
     await ElMessageBox.confirm(
       `将选中的 ${emails.length} 个已注册账号投入重登录。\n` +
-      '仅登录会自动补齐本地缺失的密码和 2FA（已有项不会重复修改）；遇到可重试错误会重新尝试，页面会按账号统计最终成功、最终失败和重试次数。继续？',
+      '仅登录开启“补齐2FA”时，只会为已有密码但缺少 TOTP 的账号绑定 2FA；不会创建密码，通用 OTP 账号必须有中转链接。遇到可重试错误会重新尝试，页面会按账号统计最终成功、最终失败和重试次数。继续？',
       '重登录选中账号',
       { type: 'warning', confirmButtonText: '开始重登录', cancelButtonText: '取消', customClass: 'confirm-multiline' },
     )

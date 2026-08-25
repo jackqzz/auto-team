@@ -6,7 +6,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listAccounts, deleteAccount, bulkDeleteAccounts, resetFailed,
   resetAccount, bulkResetAccounts, releaseStale, setAccountsGroup,
-  createAccountGroup, renameAccountGroup, deleteAccountGroup,
+  createAccountGroup, renameAccountGroup, deleteAccountGroup, updateAccountPassword,
 } from '@/api/accounts'
 import { getMailProviders } from '@/api/settings'
 import { useStatsStore } from '@/stores/stats'
@@ -183,6 +183,28 @@ async function deleteOne(email) {
   try { await deleteAccount(email); ElMessage.success('已删除'); afterMutate() }
   catch (e) { ElMessage.error(e.message) }
 }
+async function enterPassword(row) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `为 ${row.email} 录入 OpenAI 登录密码。该操作只修改本地记录，不会修改远端账号密码。`,
+      '录入账号密码',
+      {
+        inputType: 'password',
+        inputValue: '',
+        inputPlaceholder: '请输入网页版已经创建好的密码',
+        confirmButtonText: '保存',
+        cancelButtonText: '取消',
+        inputValidator: (v) => String(v || '').trim().length > 0 || '密码不能为空',
+      },
+    )
+    await updateAccountPassword(row.email, String(value || '').trim())
+    ElMessage.success('密码已录入')
+    await load(false)
+    statsStore.refresh()
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  }
+}
 
 watch(page, () => load())
 watch(dataVersion, () => load())
@@ -287,9 +309,10 @@ loadProviders()
           </template>
         </el-table-column>
         <el-table-column prop="fail_reason" label="失败原因" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text @click="useAccount(row.email)">使用</el-button>
+            <el-button size="small" text type="primary" @click="enterPassword(row)">录入密码</el-button>
             <el-button
               v-if="row.status === 'done' || row.status === 'failed'"
               size="small" text type="primary" @click="resetOne(row.email)"

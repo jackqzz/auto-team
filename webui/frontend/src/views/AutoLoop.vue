@@ -82,6 +82,8 @@ async function start() {
       want_session_token: true,
       want_refresh_token: form.value.autoWantOauthRt,
       add_phone_mode: form.value.autoAddPhoneMode,
+      register_mode: form.value.autoRegisterMode,
+      debug_mode: form.value.autoDebugMode,
       want_password: form.value.autoWantPassword,
       login_only: form.value.autoLoginOnly,
       ensure_credentials: form.value.autoEnsureCredentials,
@@ -120,7 +122,7 @@ async function call(fn, name) {
           <span>仅登录</span>
         </div>
         <div class="hint" style="margin-top: 6px">
-          开启后投送所选分组内的注册结果；“补齐缺失的密码和 2FA”开关打开时，还会把仅有邮箱 OTP 接码凭证、尚未出现在注册结果里的外部账号送入补齐流程。优先使用已有密码和 2FA，缺失时再使用邮箱 OTP。
+          开启后投送所选分组内的注册结果；“补齐2FA”开关打开时，只处理已有 OpenAI 密码、但缺少 TOTP 的账号。通用 OTP 外部账号还必须带 OTP 中转链接，不会创建密码。
         </div>
       </el-form-item>
       <el-form-item v-if="form.autoLoginOnly" label="过滤条件">
@@ -132,15 +134,15 @@ async function call(fn, name) {
           开启后仅从注册结果里挑选 refresh_token 为空的账号执行，仅影响“仅登录”任务。
         </div>
       </el-form-item>
-      <el-form-item label="凭证补齐">
+      <el-form-item label="补齐2FA">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
           <el-switch v-model="form.autoEnsureCredentials" />
-          <span>{{ form.autoLoginOnly ? '补齐缺失的密码和 2FA（TOTP）' : '已有账号时补齐缺失的密码和 2FA（TOTP）' }}</span>
+          <span>{{ form.autoLoginOnly ? '补齐缺失的 2FA（TOTP）' : '已有账号时补齐缺失的 2FA（TOTP）' }}</span>
         </div>
         <div class="hint" style="margin-top: 6px; line-height: 1.5">
           {{ form.autoLoginOnly
-            ? '开启后仅对本地没有的项目操作：无密码账号先用邮箱 OTP 建立登录态；缺两项时先绑定 TOTP，再设置随机密码。已有密码或 2FA 不会重复修改。2FA secret 只下发一次，请及时备份。'
-            : '开启后普通注册遇到服务端已存在的邮箱会切换为登录流程，只补齐本地缺少的项目；新邮箱仍按正常注册执行。关闭后已有账号不会进入补齐。' }}
+            ? '开启后只对已有 OpenAI 密码、但本地缺少 TOTP 的账号操作；绑定过程会再次使用邮箱 OTP，因此通用 OTP 导入必须带中转链接。系统不会创建密码，2FA secret 只下发一次，请及时备份。'
+            : '开启后普通注册遇到服务端已存在的邮箱会切换为密码登录并补绑缺失的 2FA；新邮箱仍按正常注册执行。没有密码的已有账号会跳过并提示。' }}
         </div>
       </el-form-item>
 
@@ -203,6 +205,25 @@ async function call(fn, name) {
           仅在任务命中 add-phone 验证分支时使用；默认走接口模式。Linux 无桌面环境可改为 Camoufox。
         </div>
       </el-form-item>
+      <el-form-item v-if="!form.autoLoginOnly" label="注册流程">
+        <el-select v-model="form.autoRegisterMode" style="width: 220px">
+          <el-option label="协议直连" value="protocol" />
+          <el-option label="Camoufox 浏览器" value="camoufox" />
+        </el-select>
+        <div class="hint" style="margin-top: 6px">
+          Camoufox 浏览器注册；仅登录任务始终使用协议登录流程。
+        </div>
+      </el-form-item>
+
+      <el-form-item v-if="!form.autoLoginOnly" label="调试模式">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
+          <el-switch v-model="form.autoDebugMode" />
+          <span>失败时保存 Camoufox 页面截图</span>
+        </div>
+        <div class="hint" style="margin-top: 6px">
+          仅在 Camoufox 注册遇到页面超时或提交失败时截图；默认关闭。截图保存在服务端 logs/camoufox_screenshots 目录。
+        </div>
+      </el-form-item>
 
       <el-form-item v-if="!form.autoLoginOnly" label="密码">
         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
@@ -210,7 +231,7 @@ async function call(fn, name) {
           <span>强制创建账号密码</span>
         </div>
         <div class="hint" style="margin-top: 6px">
-          新邮箱开启时要求创建长期密码；若服务端发现邮箱已注册，会在“凭证补齐”开启时切换为已有账号登录并补设缺失密码。关闭后新号可保留为无密码 OTP 账号。
+          新邮箱开启时要求创建长期密码；该选项只影响新账号注册。已有账号的“补齐2FA”不会创建或修改密码。
         </div>
       </el-form-item>
 

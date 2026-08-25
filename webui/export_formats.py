@@ -145,6 +145,14 @@ def _mailbox_info(row: dict) -> tuple[dict, str]:
     client_id = _s(row, "mail_client_id")
     mail_rt = _s(row, "mail_refresh_token")
     pickup = relay_url or mail_password
+    if relay_url and kind == "icloud_relay" and mail_password:
+        # 通用 OTP 的 password 列现在保存 OpenAI 登录密码；导出时保留三段
+        # 导入格式，确保重新导入后仍可参与“补齐2FA”。
+        source_line = f"{email}----{mail_password}----{relay_url}"
+    elif relay_url:
+        source_line = f"{email}----{relay_url}"
+    else:
+        source_line = f"{email}----{mail_password}----{client_id}----{mail_rt}"
     mailbox = {
         "bind_email": email,
         "primary_email": email,
@@ -152,10 +160,7 @@ def _mailbox_info(row: dict) -> tuple[dict, str]:
         "client_id": client_id,
         "refresh_token": mail_rt,
         "pickup_password": pickup,
-        "source_line": (
-            f"{email}----{relay_url}" if relay_url
-            else f"{email}----{mail_password}----{client_id}----{mail_rt}"
-        ),
+        "source_line": source_line,
     }
     if relay_url:
         mailbox["relay_url"] = relay_url

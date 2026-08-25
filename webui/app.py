@@ -1524,13 +1524,16 @@ class RegisterReq(BaseModel):
     want_access_token: bool = True
     want_session_token: bool = True
     want_refresh_token: bool = True
-    want_password: bool = True  # 通用 OTP 是否强制创建可长期登录的密码
+    want_password: bool = True  # 新账号是否强制创建可长期登录的密码
     proxy: str = ""
+    proxy_pool: str = Field("", description="系统代理池；单次注册未指定 proxy 时按最少租用次数选择")
     otp_timeout: int = 10
     add_phone_mode: str = Field("api", description="add-phone 验证模式：api / camoufox")
+    register_mode: str = Field("protocol", description="注册流程：protocol / camoufox")
+    debug_mode: bool = Field(False, description="Camoufox 调试模式：失败时保存页面截图")
     allow_existing_login: bool = True
-    # 服务端识别邮箱已存在时，是否切换到登录并补齐缺失密码/2FA；留空时
-    # 跟随 want_password / want_2fa 两个页面开关推导。
+    # 服务端识别邮箱已存在时，是否切换到登录并补齐缺失 2FA；留空时
+    # 跟随 want_2fa 页面开关推导。已有账号必须已有密码，系统不会创建密码。
     ensure_credentials: Optional[bool] = None
     # 注册成功后自动绑定 TOTP 2FA。前端两个页面都**默认开**（主人要求每个号都绑）。
     # 这里的 default 保持 False —— 它只在「调用方没传这个字段」时生效，是给旧前端
@@ -1688,11 +1691,20 @@ def _clear_candidate_trash_timer(workspace_id: int, email: str) -> bool:
 
 
 def _apply_candidate_trash(workspace_id: int, email: str, reason: str = "quota_zero") -> dict:
-    try:
-        return workspace_membership.trash_workspace_candidate(workspace_id, email, reason=reason)
-    except Exception:
-        logger.exception("候选人入垃圾箱失败 workspace_db_id=%s email=%s", workspace_id, email)
-        raise
+    result = workspace_membership.trash_workspace_candidate(workspace_id, email, reason=reason)
+    if not result.get("ok") and result.get("pending_seat"):
+        db.update_workspace_candidate_trash(
+            workspace_id,
+            email,
+            status="scheduled",
+            due_at=time.time() + 10 * 60,
+            reason="seat_retry",
+        )
+        logger.warning(
+            "垃圾箱席位切换已延期 workspace_db_id=%s email=%s retry_at=10m",
+            workspace_id, email,
+        )
+    return result
 
 
 def _wait_and_relogin_for_candidate(workspace_id: int, email: str, settings: dict, *, auto_export: bool = False) -> bool:
@@ -1794,7 +1806,17 @@ def _process_scheduled_trash_due(
         )
         return
     if _is_zero_quota_payload(quota):
-        _apply_candidate_trash(workspace_id, email, reason="quota_zero")
+        try:
+            _apply_candidate_trash(workspace_id, email, reason="quota_zero")
+        except Exception:
+            logger.exception("垃圾箱入箱执行失败，将在 10 分钟后重试 workspace_db_id=%s email=%s", workspace_id, email)
+            db.update_workspace_candidate_trash(
+                workspace_id,
+                email,
+                status="scheduled",
+                due_at=time.time() + 10 * 60,
+                reason="trash_retry",
+            )
     else:
         _clear_candidate_trash_timer(workspace_id, email)
 
@@ -2445,6 +2467,31 @@ class SetGroupReq(BaseModel):
     group_name: str = Field("", max_length=64)
 
 
+class AccountPasswordReq(BaseModel):
+    email: str = Field(..., min_length=1, description="要录入密码的邮箱")
+    password: str = Field(..., min_length=1, description="OpenAI 登录密码")
+
+
+@app.post("/api/accounts/update_password")
+def api_update_account_password(req: AccountPasswordReq):
+    """从邮箱列表手动录入 OpenAI 登录密码。
+
+    已有注册结果的账号更新 registered；尚未注册的账号更新号池行，后续
+    仅登录/补齐 2FA 快照会读取该密码。只保存本地记录，不会修改远端密码。
+    """
+    email = str(req.email or "").strip().lower()
+    password = str(req.password or "").strip()
+    if not email:
+        raise HTTPException(400, "email 不能为空")
+    if not password:
+        raise HTTPException(400, "密码不能为空")
+    target = db.update_account_password(email, password)
+    if not target:
+        raise HTTPException(404, f"未找到邮箱: {email}")
+    logger.info("[accounts] 手动录入密码 email=%s target=%s", email, target)
+    return {"ok": True, "email": email, "target": target}
+
+
 @app.post("/api/accounts/set_group")
 def api_set_accounts_group(req: SetGroupReq):
     try:
@@ -2674,22 +2721,39 @@ def api_register(req: RegisterReq):
                 f"{group_label}没有 available 的 {provider_cls.display_name} 账号；请先批量导入",
             )
 
+    # 单次注册也必须接入系统代理池。前端 proxy 为空时，从本次任务快照中
+    # 领取租用次数最少的代理；显式填写 proxy 则保留用户指定值。
+    effective_proxy = str(req.proxy or "").strip()
+    if not effective_proxy and str(req.proxy_pool or "").strip():
+        pool_values = [line.strip() for line in str(req.proxy_pool).splitlines() if line.strip()]
+        pool = public_relogin.ProxyLeasePool(pool_values)
+        effective_proxy, pool_index, leased_count = pool.lease(
+            task_type="register",
+            task_detail=f"single_{req.register_mode or 'protocol'}",
+        )
+        logger.info(
+            "单次注册领取系统代理 register_mode=%s pool_index=%s leased_count=%s",
+            req.register_mode or "protocol", pool_index + 1, leased_count,
+        )
+
     options = {
         "want_access_token": req.want_access_token,
         "want_session_token": req.want_session_token,
         "want_refresh_token": req.want_refresh_token,
         "want_password": req.want_password,
-        "proxy": req.proxy,
+        "proxy": effective_proxy,
         "otp_timeout": int(req.otp_timeout),
         "add_phone_mode": req.add_phone_mode,
+        "register_mode": req.register_mode if req.register_mode in {"protocol", "camoufox"} else "protocol",
+        "debug_mode": bool(req.debug_mode),
         "allow_existing_login": req.allow_existing_login,
         "want_2fa": req.want_2fa,
-        # 普通注册若服务端把邮箱识别为已有账号，就按两个页面开关只补齐
-        # 缺失项；新账号不会进入该后处理分支。
+        # 普通注册若服务端把邮箱识别为已有账号，只按 2FA 开关进入补齐2FA；
+        # want_password 仅控制新账号注册密码，不会触发已有账号密码创建。
         "ensure_credentials": (
             bool(req.ensure_credentials)
             if req.ensure_credentials is not None
-            else bool(req.want_password or req.want_2fa)
+            else bool(req.want_2fa)
         ),
     }
     run_id = registrar.start_registration(account, options)
@@ -3459,9 +3523,9 @@ class AutoLoopStartReq(BaseModel):
     want_access_token: bool = True
     want_session_token: bool = True
     want_refresh_token: bool = True
-    want_password: bool = True  # 通用 OTP 是否强制创建密码
+    want_password: bool = True  # 新账号是否强制创建密码（不影响已有账号补齐2FA）
     login_only: bool = False    # 仅投送当前分组已有注册结果，刷新登录凭证
-    # 仅登录时补齐缺失凭证；普通注册遇到已有邮箱时也复用该开关。
+    # 仅登录时补齐缺失 2FA；普通注册遇到已有邮箱时也复用该开关。
     ensure_credentials: bool = True
     login_no_rt_only: bool = False  # 仅对无 RT 的注册结果执行
     login_emails: Optional[list[str]] = None  # 仅登录时限定指定账号（注册结果页重登录）
@@ -3472,6 +3536,8 @@ class AutoLoopStartReq(BaseModel):
     concurrency: int = 1         # 并发 worker 数（1-20）
     otp_timeout: int = 10
     add_phone_mode: str = Field("api", description="add-phone 验证模式：api / camoufox")
+    register_mode: str = Field("protocol", description="注册流程：protocol / camoufox")
+    debug_mode: bool = Field(False, description="Camoufox 调试模式：失败时保存页面截图")
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
     target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）

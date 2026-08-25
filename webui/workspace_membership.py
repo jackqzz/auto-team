@@ -123,6 +123,7 @@ def _workspace_admin_request(
     *,
     request_interval: float = WORKSPACE_ADMIN_REQUEST_INTERVAL_SECONDS,
     max_429_retries: int = WORKSPACE_ADMIN_MAX_429_RETRIES,
+    network_retries: int = 2,
     **kwargs,
 ):
     """串行并节流同一母号的管理 API 请求，并对 429 做共享退避。"""
@@ -145,6 +146,25 @@ def _workspace_admin_request(
 
             try:
                 response = request(url, **kwargs)
+            except Exception as exc:
+                text = str(exc).lower()
+                retryable = any(marker in text for marker in (
+                    "failed to connect", "could not connect", "connection", "timed out", "timeout",
+                ))
+                if retryable and attempt < max(0, int(network_retries or 0)):
+                    delay = min(10.0, 1.0 + float(attempt))
+                    logger.warning(
+                        "母号管理请求网络异常，将重试 workspace_db_id=%s method=%s attempt=%s/%s wait=%.1fs error=%s",
+                        key, str(method).upper(), attempt + 1,
+                        max(1, int(network_retries or 0) + 1), delay, str(exc)[:180],
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(
+                    "母号专属代理不可用 workspace_db_id=%s method=%s proxy_source=workspace_masters.proxy_url error=%s",
+                    key, str(method).upper(), str(exc)[:240],
+                )
+                raise
             finally:
                 with _workspace_admin_state_lock:
                     _workspace_admin_last_completed[key] = time.monotonic()
@@ -689,7 +709,14 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
         reason=reason or "manual",
         due_at=0,
     )
-    seat = _ensure_candidate_usage_based(workspace_db_id, email, row=row, retries=retries)
+    try:
+        seat = _ensure_candidate_usage_based(workspace_db_id, email, row=row, retries=retries)
+    except Exception as exc:
+        logger.warning(
+            "候选人已入垃圾箱但席位切换待重试 workspace_db_id=%s email=%s error=%s",
+            workspace_db_id, email, str(exc)[:240],
+        )
+        return {"ok": False, "pending_seat": True, "error": str(exc)}
     return {"ok": True, "seat": seat}
 
 

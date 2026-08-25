@@ -156,13 +156,13 @@ async function doImport() {
           </div>
           <div class="hint" style="margin-top: 6px">
             已存在的邮箱再次导入时，也会移动到本次选择的分组。
-            外部已注册账号只需导入邮箱和 OTP 中转链接，之后在“批量仅登录”中开启“补齐缺失的密码和 2FA”即可参与。
+            “补齐2FA”要求已有 OpenAI 密码；通用 OTP 外部账号请导入“邮箱----OpenAI密码----OTP 中转链接”，旧的两段格式仍可导入但会被补齐任务跳过。
           </div>
         </el-form-item>
       </el-form>
 
       <p class="hint" v-if="current">
-        每行一个，{{ current.line_segments }} 段（用 <code>----</code> 分隔）：<br />
+        每行一个（用 <code>----</code> 分隔，支持 {{ current.import_segments_label || current.line_segments }} 段）：<br />
         <code>{{ current.import_hint || '' }}</code>
       </p>
 

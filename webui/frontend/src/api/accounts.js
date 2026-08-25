@@ -17,6 +17,11 @@ export const listAccountGroups = () => http.get('/api/accounts/groups')
 export const setAccountsGroup = (emails, groupName) =>
   http.post('/api/accounts/set_group', { emails, group_name: groupName })
 
+// 邮箱列表手动录入 OpenAI 登录密码；已注册账号写入 registered，
+// 尚未注册账号写回号池，供后续仅登录/补齐 2FA 使用。
+export const updateAccountPassword = (email, password) =>
+  http.post('/api/accounts/update_password', { email, password })
+
 export const createAccountGroup = (name) => http.post('/api/accounts/groups', { name })
 
 export const renameAccountGroup = (oldName, newName) =>

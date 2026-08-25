@@ -19,7 +19,7 @@ const defaults = {
   autoGroupName: '',
   autoLoginOnly: false,
   autoLoginNoRtOnly: false,
-  // 仅登录时把本地缺少的账号密码 / TOTP secret 补齐；只对缺失项操作。
+  // 仅登录时把本地缺少的 TOTP secret 补齐；账号必须已有 OpenAI 密码。
   autoEnsureCredentials: true,
   // 注册后自动绑 2FA。单次 / 批量都**默认 true**：每个号都要 2FA。
   // 仍然拆成两个字段（而不是共用一个）：单次页是验 bug / 试流程的测试台，
@@ -38,6 +38,12 @@ const defaults = {
   // camoufox = 走浏览器驱动路径
   addPhoneMode: 'api',
   autoAddPhoneMode: 'api',
+  // 注册主流程：协议直连或 Camoufox 浏览器；仅登录始终走协议。
+  registerMode: 'protocol',
+  autoRegisterMode: 'protocol',
+  // Camoufox 失败时保存页面截图，默认关闭，避免批量任务产生大量文件。
+  debugMode: false,
+  autoDebugMode: false,
   // 本次自动任务完成后是否推送到已启用的 CPA / SUB2API。
   autoExport: true,
   autoExportRefreshOauth: false,

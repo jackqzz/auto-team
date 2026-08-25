@@ -136,7 +136,7 @@ load()
               {{ current.ephemeral ? '每次新地址' : '固定地址' }}
             </el-tag>
             <el-tag v-if="current.line_segments > 0" size="small" type="info">
-              导入格式 {{ current.line_segments }} 段
+              导入格式 {{ current.import_segments_label || current.line_segments }} 段
             </el-tag>
           </div>
         </el-form-item>

@@ -43,7 +43,7 @@ def _login_context_key(options: dict) -> str:
     """登录任务按空间和凭证策略划分上下文。
 
     ``ensure_credentials`` 会改变任务的副作用：公开“仅登录”任务可以为
-    passwordless/无 TOTP 的账号补齐安全凭证，而空间凭证刷新任务必须只刷新
+    已有密码、但缺少 TOTP 的账号补齐 2FA；空间凭证刷新任务必须只刷新
     token。两者不能共用同一条队列，否则后到的请求可能被并入前一个任务并沿用
     错误的策略。把策略编码进 key，既保留同一策略的队列合并，也让两类任务
     可以在不同控制器中独立排队。
@@ -156,9 +156,12 @@ class AutoLoopController:
                     self._login_queue = db.list_login_candidates(
                         self._options.get("group_name", ""),
                         filter_rt=("no_rt" if self._options.get("login_no_rt_only") else "all"),
-                        # 只有开启凭证补齐时，才把尚未落到 registered 表的
-                        # 外部 OTP 号池行纳入仅登录快照。
+                        # 只有开启“补齐2FA”时，才把外部 OTP 号池行纳入仅登录
+                        # 快照；该模式还要求已有 OpenAI 密码和可用 OTP 链接。
                         include_mailbox_only=bool(
+                            self._options.get("ensure_credentials", True)
+                        ),
+                        require_2fa_inputs=bool(
                             self._options.get("ensure_credentials", True)
                         ),
                     )
@@ -185,8 +188,8 @@ class AutoLoopController:
                     return {
                         "ok": False,
                         "error": (
-                            "当前分组没有可登录/补齐的账号；"
-                            "开启凭证补齐后，可导入只有邮箱 OTP 中转链接的外部账号"
+                            "当前分组没有可登录的账号；补齐2FA要求账号已有 OpenAI 密码，"
+                            "通用 OTP 导入还必须带 OTP 中转链接"
                         ),
                     }
                 self._login_candidate_count = len(self._login_queue)
@@ -280,6 +283,9 @@ class AutoLoopController:
                 options.get("group_name", ""),
                 filter_rt=("no_rt" if options.get("login_no_rt_only") else "all"),
                 include_mailbox_only=bool(
+                    options.get("ensure_credentials", True)
+                ),
+                require_2fa_inputs=bool(
                     options.get("ensure_credentials", True)
                 ),
             )

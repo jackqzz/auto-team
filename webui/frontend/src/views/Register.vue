@@ -50,13 +50,16 @@ async function run() {
       email: regEmail.value.trim() || null,
       group_name: form.value.groupName,
       proxy: proxyText(form.value),
+      proxy_pool: proxyList.value.join('\n'),
       otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
       add_phone_mode: form.value.addPhoneMode,
+      register_mode: form.value.registerMode,
       want_access_token: true,
       want_session_token: true,
       want_refresh_token: form.value.wantOauthRt,
       want_password: form.value.wantPassword,
       want_2fa: form.value.want2fa,
+      debug_mode: form.value.debugMode,
     })
     runtime.addLog(`[client] 启动注册 run_id=${r.run_id} email=${r.email}`, 'evt')
     runtime.streamRun(r.run_id)
@@ -133,6 +136,24 @@ async function copyField(email, field) {
                 默认走原有接口流程；只有命中 add-phone 验证时才会生效。Linux 无桌面环境下可切到 Camoufox。
               </div>
             </el-form-item>
+            <el-form-item label="注册流程">
+              <el-select v-model="form.registerMode" style="width: 220px">
+                <el-option label="协议直连" value="protocol" />
+                <el-option label="Camoufox 浏览器" value="camoufox" />
+              </el-select>
+              <div class="hint" style="margin-top: 6px">
+                Camoufox 只负责注册页面交互；邮箱、验证码、密码保存、2FA 和凭证获取仍由系统接管。仅登录不会使用浏览器注册分支。
+              </div>
+            </el-form-item>
+            <el-form-item label="调试模式">
+              <div style="display: flex; align-items: center; gap: 10px">
+                <el-switch v-model="form.debugMode" />
+                <span>失败时保存 Camoufox 页面截图</span>
+              </div>
+              <div class="hint" style="margin-top: 6px">
+                仅在 Camoufox 注册遇到页面超时或提交失败时截图；默认关闭。截图保存在服务端 logs/camoufox_screenshots 目录。
+              </div>
+            </el-form-item>
             <el-form-item>
               <div style="display: flex; align-items: center; gap: 10px">
                 <el-switch v-model="form.wantPassword" />
@@ -151,7 +172,7 @@ async function copyField(email, field) {
                 默认开。绑定不可逆、即刻生效：<b>之后该号所有登录都需 6 位动态码</b>；
                 secret 仅在绑定时下发<b>一次</b>、服务端取不回，
                 请在下方结果或「注册结果」页<b>立刻复制导出</b>并录入验证器，丢失 = 该号 2FA 永久锁死。
-                新号和已有账号都适用；已有账号缺密码时会先用邮箱 OTP 登录并补设密码，再绑定 2FA。
+          新号和已有账号都适用；已有账号必须先在本地录入可用的 OpenAI 密码，绑定过程中会再次使用邮箱 OTP；没有密码的账号不会创建密码。
               </div>
             </el-form-item>
             <el-button type="primary" :loading="starting || runningSingle" @click="run">

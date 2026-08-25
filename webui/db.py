@@ -52,6 +52,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS outlook_accounts (
             email           TEXT PRIMARY KEY,
             password        TEXT,
+            login_password  TEXT,       -- 手动录入的 OpenAI 登录密码（不覆盖邮箱收件密码）
             client_id       TEXT,
             refresh_token   TEXT,
             relay_url       TEXT,       -- 中转取码 URL（icloud 类用，其余留空）
@@ -265,6 +266,11 @@ def init_db():
         con.commit()
     if "relay_url" not in acc_cols:
         con.execute("ALTER TABLE outlook_accounts ADD COLUMN relay_url TEXT")
+        con.commit()
+    if "login_password" not in acc_cols:
+        # 手动录入的 OpenAI 密码与 Outlook/Gmail 收件箱密码分开保存，避免
+        # 在邮箱列表录入账号密码时破坏接码 provider 的登录凭证。
+        con.execute("ALTER TABLE outlook_accounts ADD COLUMN login_password TEXT")
         con.commit()
     if "group_name" not in acc_cols:
         con.execute("ALTER TABLE outlook_accounts ADD COLUMN group_name TEXT NOT NULL DEFAULT ''")
@@ -1290,7 +1296,7 @@ def import_accounts(
             relay = r.get("relay_url", "") or ""
 
             cur = con.execute(
-                "SELECT refresh_token, relay_url, kind, group_name "
+                "SELECT password, refresh_token, relay_url, kind, group_name "
                 "FROM outlook_accounts WHERE email=?",
                 (r["email"],),
             )
@@ -1309,6 +1315,8 @@ def import_accounts(
                 continue
 
             credentials_changed = (
+                (existing["password"] or "") != password
+                or
                 (existing["refresh_token"] or "") != refresh
                 or (existing["relay_url"] or "") != relay
                 or (existing["kind"] or "") != row_kind
@@ -1406,6 +1414,35 @@ def list_accounts(
     return [dict(r) for r in con.execute(sql, args).fetchall()]
 
 
+def update_account_password(email: str, password: str) -> str | None:
+    """手动录入邮箱列表账号的 OpenAI 密码。
+
+    已有注册结果时，密码应写入 ``registered``（那里才是 OpenAI 登录密码）；
+    尚未产生注册结果的账号则写回号池行的 ``login_password``。该列与邮箱
+    provider 的收件箱密码分开，避免 Outlook/Gmail 账号录入 OpenAI 密码时
+    破坏原有收件凭证；通用 OTP 旧格式仍会继续从 ``password`` 兼容读取。
+
+    返回 ``registered`` 或 ``pool`` 表示实际更新位置，邮箱不存在返回 None。
+    """
+    key = str(email or "").strip().lower()
+    value = str(password or "").strip()
+    if not key or not value:
+        return None
+    with _lock:
+        con = _conn()
+        reg = con.execute("SELECT email FROM registered WHERE email=?", (key,)).fetchone()
+        if reg:
+            con.execute("UPDATE registered SET password=? WHERE email=?", (value, key))
+            con.commit()
+            return "registered"
+        pool = con.execute("SELECT email FROM outlook_accounts WHERE email=?", (key,)).fetchone()
+        if not pool:
+            return None
+        con.execute("UPDATE outlook_accounts SET login_password=? WHERE email=?", (value, key))
+        con.commit()
+        return "pool"
+
+
 def stats_by_kind() -> dict:
     """按邮箱类型分组统计，给 WebUI 顶部展示"每种邮箱各有多少号"。"""
     con = _conn()
@@ -1437,7 +1474,10 @@ def list_groups() -> list[dict]:
         "(SELECT COUNT(*) FROM outlook_accounts a "
         " LEFT JOIN registered r ON r.email=a.email "
         " WHERE a.group_name=g.name AND r.email IS NULL "
-        " AND a.status IN ('available', 'done', 'failed')) AS mailbox_only_total "
+        " AND a.status IN ('available', 'done', 'failed') "
+        " AND a.kind='icloud_relay' "
+        " AND length(trim(COALESCE(a.password, ''))) > 0 "
+        " AND length(trim(COALESCE(a.relay_url, ''))) > 0) AS mailbox_only_total "
         "FROM account_groups g ORDER BY g.name COLLATE NOCASE"
     ).fetchall()
     return [
@@ -1447,8 +1487,8 @@ def list_groups() -> list[dict]:
             "available": row["available"] or 0,
             "registered_total": row["registered_total"] or 0,
             "active_registered_total": row["active_registered_total"] or 0,
-            # 这些是已经导入 OTP 收件凭证、但尚未在本地注册结果表落库的
-            # 外部账号。开启“补齐凭证”时，它们也属于可投送对象。
+            # 这些是已经导入 OpenAI 密码 + OTP 收件凭证、但尚未在本地
+            # 注册结果表落库的外部账号。开启“补齐2FA”时，它们才属于可投送对象。
             "mailbox_only_total": row["mailbox_only_total"] or 0,
         }
         for row in rows
@@ -1781,7 +1821,7 @@ def save_registered(d: dict) -> None:
     with _lock:
         con = _conn()
         pool_row = con.execute(
-            "SELECT group_name, kind FROM outlook_accounts WHERE email=?", (email,)
+            "SELECT group_name, kind, password FROM outlook_accounts WHERE email=?", (email,)
         ).fetchone()
         existing_row = con.execute(
             "SELECT password, totp_secret, totp_factor_id, group_name, mail_kind, account_status "
@@ -1822,6 +1862,14 @@ def save_registered(d: dict) -> None:
                 totp_secret = existing_row["totp_secret"]
                 # factor_id 跟着 secret 走：本轮没绑就沿用旧的
                 totp_factor_id = totp_factor_id or (existing_row["totp_factor_id"] or "")
+        # 通用 OTP 旧两段导入没有 OpenAI 密码列。账号后续通过正常注册/登录
+        # 已经拿到密码时，把它回写到池行，之后“补齐2FA”即可判断该账号具备
+        # 密码前置条件；不会覆盖用户重新导入的非空密码。
+        if pool_row and pool_row["kind"] == "icloud_relay" and password and not (pool_row["password"] or "").strip():
+            con.execute(
+                "UPDATE outlook_accounts SET password=? WHERE email=?",
+                (password, email),
+            )
         con.execute(
             "INSERT OR REPLACE INTO registered "
             "(email, group_name, mail_kind, password, access_token, session_token, refresh_token, "
@@ -2367,13 +2415,15 @@ def list_login_candidates(
     filter_rt: str = "all",
     *,
     include_mailbox_only: bool = False,
+    require_2fa_inputs: bool = False,
 ) -> list[dict]:
     """为一次“仅登录”任务生成稳定快照。
 
     默认只返回 ``registered`` 里的账号，保持旧的“刷新已有结果”语义。
-    开启凭证补齐时，额外把**只有邮箱 OTP 收件凭证、尚未写入
-    ``registered``** 的号池行也加入快照。这样外部已经注册好的账号可以直接
-    用 ``email----中转链接`` 导入后进入补齐流程，而不必先伪造一条注册结果。
+    开启“补齐2FA”时，额外把带有 OpenAI 密码和 OTP 收件凭证、尚未写入
+    ``registered`` 的号池行也加入快照。通用 OTP 外部账号建议用
+    ``email----OpenAI密码----中转链接`` 导入；没有密码的历史两段格式不会
+    被送入登录队列。
 
     号池行不会在这里 claim：仅登录任务本来就不应改变邮箱池状态；成功后由
     ``save_registered`` 写入结果表，下一次快照自然会走已注册分支并去重。
@@ -2393,26 +2443,36 @@ def list_login_candidates(
     rows = con.execute(
         "SELECT r.email, r.password AS login_password, r.totp_secret, "
         "r.group_name, r.mail_kind, "
-        "a.password AS mail_password, a.client_id, a.refresh_token, "
+        "a.password AS mail_password, a.login_password AS pool_login_password, "
+        "a.client_id, a.refresh_token, "
         "a.relay_url, a.kind AS pool_kind "
         "FROM registered r LEFT JOIN outlook_accounts a ON a.email=r.email "
         f"{where} ORDER BY r.created_at ASC",
         args,
     ).fetchall()
-    candidates = [
-        {
+    candidates = []
+    for row in rows:
+        kind = row["pool_kind"] or row["mail_kind"] or "outlook"
+        login_password = str(row["login_password"] or "").strip()
+        relay_url = str(row["relay_url"] or "").strip()
+        # “补齐2FA”不再创建密码。通用 OTP 账号还必须保留自己的中转链接，
+        # 因为慢路径绑定 2FA 时服务端会再次发送邮箱 OTP。Outlook 等原生
+        # 邮箱 provider 仍沿用其 refresh/IMAP 凭证取码，不要求 relay_url。
+        if require_2fa_inputs and not login_password:
+            continue
+        if require_2fa_inputs and kind == "icloud_relay" and not relay_url:
+            continue
+        candidates.append({
             "email": row["email"],
             "password": row["mail_password"] or "",
             "client_id": row["client_id"] or "",
             "refresh_token": row["refresh_token"] or "",
-            "relay_url": row["relay_url"] or "",
-            "kind": row["pool_kind"] or row["mail_kind"] or "outlook",
-            "login_password": row["login_password"] or "",
+            "relay_url": relay_url,
+            "kind": kind,
+            "login_password": login_password,
             "totp_secret": row["totp_secret"] or "",
             "group_name": row["group_name"] or "",
-        }
-        for row in rows
-    ]
+        })
 
     if not include_mailbox_only:
         return candidates
@@ -2434,7 +2494,8 @@ def list_login_candidates(
         pool_conditions.append("a.group_name=?")
         pool_args.append(_normalize_group_name(group_name))
     pool_rows = con.execute(
-        "SELECT a.email, a.password, a.client_id, a.refresh_token, "
+        "SELECT a.email, a.password, a.login_password AS pool_login_password, "
+        "a.client_id, a.refresh_token, "
         "a.relay_url, a.kind, a.group_name, a.imported_at "
         "FROM outlook_accounts a WHERE "
         + " AND ".join(pool_conditions)
@@ -2450,16 +2511,32 @@ def list_login_candidates(
         email = str(row["email"] or "").strip().lower()
         if not email or email in existing_emails:
             continue
+        kind = row["kind"] or "outlook"
+        relay_url = str(row["relay_url"] or "").strip()
+        # 外部导入账号参与“补齐2FA”必须同时带 OpenAI 密码和 OTP 中转链接。
+        # 对通用 OTP provider 而言，2 段历史格式没有 OpenAI 密码，不能再
+        # 走 passwordless 登录，也不能在任务中偷偷创建新密码。
+        # 三段通用 OTP 导入的旧数据把 OpenAI 密码放在 password；邮箱列表
+        # 手动录入则放在独立 login_password，优先取后者，兼容两种来源。
+        if kind == "icloud_relay":
+            login_password = str(
+                row["pool_login_password"] or row["password"] or ""
+            ).strip()
+        else:
+            login_password = str(row["pool_login_password"] or "").strip()
+        if require_2fa_inputs and (not login_password or not relay_url):
+            continue
         # ``password`` here is邮箱收件箱密码（若有），不是 OpenAI 密码；
-        # ``login_password`` 明确留空，registrar 才会优先走邮箱 OTP。
+        # 通用 OTP 的 3 段导入例外：该列承载 OpenAI 密码，provider 本身只
+        # 使用 relay_url 取码。没有密码的历史两段数据会在上面被过滤。
         candidates.append({
             "email": email,
             "password": row["password"] or "",
             "client_id": row["client_id"] or "",
             "refresh_token": row["refresh_token"] or "",
-            "relay_url": row["relay_url"] or "",
-            "kind": row["kind"] or "outlook",
-            "login_password": "",
+            "relay_url": relay_url,
+            "kind": kind,
+            "login_password": login_password,
             "totp_secret": "",
             "group_name": row["group_name"] or "",
             "_login_source": "mailbox_only",

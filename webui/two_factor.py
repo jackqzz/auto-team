@@ -125,16 +125,17 @@ def totp_is_enabled(flow: AuthFlow, access_token: str = "") -> bool | None:
             }
         if not isinstance(factors, dict):
             factors = {}
-        # 不同版本响应有时只给 mfa_enabled，有时在 factors.totp 下给对象/布尔值。
+        # ``mfa_enabled`` 只是通用 MFA 开关，部分版本即使没有返回 factors
+        # 也会给 true，不能据此断言 TOTP 已启用。只有明确存在 factors.totp
+        # 才返回 True；否则返回 False/None 交给调用方区分未知状态。
+        if _totp_factor_present(info):
+            return True
         enabled_flag = (
             _mfa_enabled_flag(info.get("mfa_enabled"))
             or _mfa_enabled_flag(info.get("mfa_enabled_v2"))
         )
-        if enabled_flag:
-            if not factors or _totp_factor_present(info):
-                return True
-        if _totp_factor_present(info):
-            return True
+        if enabled_flag and not factors:
+            return None
         return False
     except Exception as exc:  # noqa: BLE001 - 查询失败交给调用方决定
         logger.warning("[2fa] mfa_info 查询异常: %s", exc)
@@ -443,8 +444,8 @@ def bind_totp_2fa(
                 # wrong_email_otp_code（kickoff_otp_delivery 里写得很清楚的坑）。
                 if not flow.kickoff_otp_delivery("existing_bind_2fa"):
                     flow.send_otp(referer="https://auth.openai.com/email-verification")
-                otp_code = mail_provider.wait_for_otp(
-                    email, timeout=otp_timeout, issued_after=chain_started_at,
+                otp_code = flow.wait_for_email_otp(
+                    mail_provider, email, timeout=otp_timeout, issued_after=chain_started_at,
                 )
             otp_resp = flow.verify_otp(otp_code)
             page_type = flow._extract_page_type(otp_resp)
