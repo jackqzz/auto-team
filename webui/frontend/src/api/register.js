@@ -23,6 +23,9 @@ export const updateCredentials = (payload) =>
 export const importSub2Api = (text, group_name = '') =>
   http.post('/api/registered/import_sub2api', { text, group_name })
 
+export const import2FA = (text, group_name = '') =>
+  http.post('/api/registered/import_2fa', { text, group_name })
+
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
 

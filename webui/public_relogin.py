@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 import uuid
@@ -50,7 +51,7 @@ class BoundedTaskDispatcher:
 
     def configure(self, *, concurrency: int, capacity: int) -> None:
         with self._condition:
-            self._concurrency = max(1, min(20, int(concurrency or 1)))
+            self._concurrency = max(1, min(100, int(concurrency or 1)))
             self._capacity = max(1, int(capacity or 1))
             while len(self._workers) < self._concurrency:
                 index = len(self._workers)
@@ -125,7 +126,7 @@ RELOGIN_TASKS = BoundedTaskDispatcher("401重登录", 128)
 
 
 def configure_task_dispatchers(cfg: dict) -> None:
-    concurrency = max(1, min(20, int(cfg.get("concurrency") or 1)))
+    concurrency = max(1, min(100, int(cfg.get("concurrency") or 1)))
     QUOTA_TASKS.configure(
         concurrency=concurrency,
         capacity=max(1, int(cfg.get("quota_queue_capacity") or 512)),
@@ -144,12 +145,22 @@ def task_queue_status() -> dict:
 
 
 class ProxyLeasePool:
-    """公开重登单次请求内的代理租取计数快照。"""
+    """代理租取池，基于近期全局历史计数选取最少使用的代理（LRU 式）。
 
-    def __init__(self, proxies: list[str]):
+    每次创建都会从 proxy_lease_usage 表加载近期历史，即使逐请求创建
+    也能正确选取全局最少使用的代理，避免每次都选中同一条。
+    """
+
+    def __init__(self, proxies: list[str], *, history_window: float = 10800):
         # 去重后再计数，否则同一 URL 重复出现会伪装成不同代理。
         self._proxies = list(dict.fromkeys(str(p or "").strip() for p in proxies if str(p or "").strip()))
-        self._usage = [0] * len(self._proxies)
+        # 基于近期历史的租借计数（LRU 式），默认统计最近 3 小时。
+        if self._proxies:
+            since = time.time() - max(60, history_window)
+            historical = db.proxy_lease_counts_since(self._proxies, since)
+            self._usage = [historical.get(p, 0) for p in self._proxies]
+        else:
+            self._usage = []
         self._lock = threading.Lock()
 
     def lease(
@@ -208,6 +219,28 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _object(value: Any) -> dict:
+    """将导入数据中的对象（包括 JSON 字符串）规范为 dict。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _field(sources: list[dict], *names: str) -> Any:
+    for source in sources:
+        for name in names:
+            value = source.get(name)
+            if value not in (None, ""):
+                return value
+    return ""
+
+
 def _lower_email(value: Any) -> str:
     return _text(value).lower()
 
@@ -221,81 +254,81 @@ def _jwt_profile(access_token: str) -> dict:
 
 
 def account_workspace_id(account: dict) -> str:
-    credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else account
-    extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
-    token = _text(credentials.get("access_token"))
+    raw = _object(account)
+    credentials = _object(raw.get("credentials"))
+    data = _object(raw.get("data"))
+    extra = _object(raw.get("extra"))
+    sources = [credentials, data, raw, extra]
+    token = _text(_field(sources, "access_token", "accessToken", "access-token", "token"))
     auth = _jwt_auth(token)
+    workspace_id = _field(sources, "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId")
     return _text(
-        credentials.get("chatgpt_account_id")
-        or credentials.get("workspace_id")
-        or credentials.get("account_id")
-        or extra.get("workspace_id")
+        workspace_id
         or extra.get("chatgpt_account_id")
         or auth.get("chatgpt_account_id")
         or auth.get("account_id")
+        or _field(sources, "account_id", "accountId")
     )
 
 
 def normalized_account(raw: dict) -> dict:
-    credentials = raw.get("credentials") if isinstance(raw.get("credentials"), dict) else raw
-    extra = raw.get("extra") if isinstance(raw.get("extra"), dict) else {}
-    access_token = _text(credentials.get("access_token"))
+    raw = _object(raw)
+    credentials = _object(raw.get("credentials"))
+    data = _object(raw.get("data"))
+    extra = _object(raw.get("extra"))
+    sources = [credentials, data, raw, extra]
+    access_token = _text(_field(sources, "access_token", "accessToken", "access-token", "token"))
     auth = _jwt_auth(access_token)
     profile = _jwt_profile(access_token)
     email = _lower_email(
-        credentials.get("email")
-        or raw.get("email")
-        or raw.get("name")
-        or extra.get("email")
+        _field(sources, "email", "mail", "username", "name")
         or profile.get("email")
     )
     workspace_id = _text(
-        credentials.get("chatgpt_account_id")
-        or credentials.get("workspace_id")
-        or credentials.get("account_id")
-        or extra.get("workspace_id")
+        _field(sources, "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId")
         or auth.get("chatgpt_account_id")
         or auth.get("account_id")
+        or _field(sources, "account_id", "accountId")
     )
     user_id = _text(
-        credentials.get("chatgpt_user_id")
-        or credentials.get("user_id")
+        _field(sources, "chatgpt_user_id", "chatgptUserId", "user_id", "userId")
         or auth.get("chatgpt_user_id")
         or auth.get("user_id")
     )
-    plan_type = _text(credentials.get("plan_type") or auth.get("chatgpt_plan_type") or "team")
+    plan_type = _text(_field(sources, "plan_type", "planType") or auth.get("chatgpt_plan_type") or "team")
     return {
         "email": email,
         "access_token": access_token,
-        "refresh_token": _text(credentials.get("refresh_token")),
-        "id_token": _text(credentials.get("id_token")),
-        "session_token": _text(credentials.get("session_token") or raw.get("session_token")),
-        "password": _text(credentials.get("password") or raw.get("password")),
+        "refresh_token": _text(_field(sources, "refresh_token", "refreshToken")),
+        "id_token": _text(_field(sources, "id_token", "idToken")),
+        "session_token": _text(_field(sources, "session_token", "sessionToken")),
+        "password": _text(_field(sources, "password", "passwd")),
         "totp_secret": _text(
-            credentials.get("totp_secret")
-            or credentials.get("two_factor_secret")
-            or credentials.get("2fa")
-            or raw.get("totp_secret")
+            _field(sources, "totp_secret", "totpSecret", "two_factor_secret", "twoFactorSecret", "2fa")
         ),
         "chatgpt_account_id": workspace_id,
         "chatgpt_user_id": user_id,
-        "client_id": _text(credentials.get("client_id") or exporter.CODEX_CLIENT_ID),
+        "client_id": _text(_field(sources, "client_id", "clientId") or exporter.CODEX_CLIENT_ID),
         "plan_type": plan_type or "team",
     }
 
 
-def _headers(token: str, account_id: str) -> dict:
-    return {
+def _headers(token: str, account_id: str, email: str = "") -> dict:
+    headers = {
         "Authorization": f"Bearer {token}",
-        "chatgpt-account-id": account_id,
-        "ChatGPT-Account-Id": account_id,
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Origin": BASE,
         "Referer": f"{BASE}/",
         "User-Agent": "codex-cli",
-        "oai-device-id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"public-relogin:{account_id}")),
+        "oai-device-id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"public-relogin:{account_id or email or 'personal'}")),
     }
+    # 个人账号的 Sub2API 导出通常没有 chatgpt_account_id；不发送空的
+    # ChatGPT-Account-Id，让上游按 token 对应的个人账号处理。
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+        headers["ChatGPT-Account-Id"] = account_id
+    return headers
 
 
 def _looks_deactivated(text: str) -> bool:
@@ -320,12 +353,10 @@ def fetch_quota(account: dict, *, proxy: str = "", timeout: int = 30) -> dict:
     workspace_id = cred["chatgpt_account_id"]
     if not token:
         raise ValueError("缺少 access_token")
-    if not workspace_id:
-        raise ValueError("无法解析 workspace_id/chatgpt_account_id")
     session = create_http_session(proxy=proxy or None)
     response = session.get(
         f"{BASE}/backend-api/wham/usage",
-        headers=_headers(token, workspace_id),
+        headers=_headers(token, workspace_id, cred.get("email", "")),
         timeout=max(5, int(timeout or 30)),
     )
     if response.status_code >= 300:
@@ -375,8 +406,6 @@ def relogin_account(
     workspace_id = cred["chatgpt_account_id"]
     if not email:
         raise ValueError("缺少 email")
-    if not workspace_id:
-        raise ValueError("无法解析 workspace_id/chatgpt_account_id")
     if not password:
         raise ValueError("缺少 password，无法执行密码登录")
     if not totp_secret:
@@ -411,7 +440,7 @@ def relogin_account(
 
     refreshed = normalized_account({**cred, **data})
     refreshed_workspace = refreshed.get("chatgpt_account_id") or workspace_id
-    if refreshed_workspace != workspace_id:
+    if workspace_id and refreshed_workspace != workspace_id:
         raise RuntimeError(f"重登后 workspace 不匹配: {refreshed_workspace} != {workspace_id}")
     return refreshed
 
@@ -422,7 +451,7 @@ def get_effective_config() -> dict:
         "enabled": str(cfg.get("enabled") or "0") in ("1", "true", "yes", "on"),
         "proxy_pool": cfg.get("proxy_pool") or "",
         "use_system_proxy_pool": str(cfg.get("use_system_proxy_pool") or "1").lower() in {"1", "true", "yes", "on"},
-        "concurrency": max(1, min(20, int(cfg.get("concurrency") or 3))),
+        "concurrency": max(1, min(100, int(cfg.get("concurrency") or 3))),
         "quota_queue_capacity": max(1, min(10000, int(cfg.get("quota_queue_capacity") or 512))),
         "relogin_queue_capacity": max(1, min(10000, int(cfg.get("relogin_queue_capacity") or 128))),
         "retry_count": max(0, min(5, int(cfg.get("retry_count") or 2))),

@@ -162,7 +162,7 @@ onActivated(() => load())
 
         <div class="grid">
           <el-form-item label="全局最大并发">
-            <el-input-number v-model="form.concurrency" :min="1" :max="20" />
+            <el-input-number v-model="form.concurrency" :min="1" :max="100" />
           </el-form-item>
           <el-form-item label="额度查询等待队列">
             <el-input-number v-model="form.quotaQueueCapacity" :min="1" :max="10000" />

@@ -6,7 +6,7 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
-  importSub2Api, pushRegisteredToCpa,
+  importSub2Api, import2FA, pushRegisteredToCpa,
   autoStart,
 } from '@/api/register'
 import {
@@ -46,6 +46,11 @@ const importingSub2Api = ref(false)
 const sub2apiInput = ref(null)
 const pushingCpa = ref(false)
 const relogging = ref(false)
+const import2faVisible = ref(false)
+const import2faText = ref('')
+const importing2fa = ref(false)
+const import2faResult = ref('')
+const import2faErrors = ref([])
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
@@ -479,6 +484,40 @@ async function onSub2ApiFile(event) {
   } finally { importingSub2Api.value = false }
 }
 
+const import2faLineCount = computed(
+  () => import2faText.value.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).length,
+)
+
+async function doImport2FA() {
+  if (!import2faText.value.trim()) {
+    ElMessage.warning('请输入要导入的账号')
+    return
+  }
+  importing2fa.value = true
+  import2faResult.value = ''
+  import2faErrors.value = []
+  try {
+    const grp = groupFilter.value === '__all__' ? '' : groupFilter.value
+    const r = await import2FA(import2faText.value.trim(), grp)
+    const groupLabel = grp || '未分组'
+    import2faResult.value = `导入到"${groupLabel}"：共 ${r.total} 行，新增 ${r.imported}，更新 ${r.updated}`
+    ElMessage.success('2FA 导入完成')
+    import2faText.value = ''
+    await load(true)
+    runtime.bumpData()
+  } catch (e) {
+    const detail = e.response?.data?.detail
+    if (detail && typeof detail === 'object' && detail.errors?.length) {
+      import2faErrors.value = detail.errors
+      import2faResult.value = `有 ${detail.errors.length} 行不合法，已全部拒绝，一个都没导入`
+      ElMessage.error('导入被拒绝，请修正后重试')
+    } else {
+      import2faResult.value = '导入失败: ' + (typeof detail === 'string' ? detail : (detail?.message || e.message))
+      ElMessage.error(typeof detail === 'string' ? detail : e.message)
+    }
+  } finally { importing2fa.value = false }
+}
+
 async function pushSelectedToCpa() {
   const emails = selected.value.map((row) => row.email).filter(Boolean)
   if (!emails.length) return
@@ -562,6 +601,7 @@ onActivated(() => load())
         <el-button type="primary" plain @click="selectAllFiltered">全选当前筛选</el-button>
         <input ref="sub2apiInput" type="file" accept=".json,application/json" hidden @change="onSub2ApiFile" />
         <el-button :loading="importingSub2Api" @click="chooseSub2ApiFile">导入 Sub2API 账号</el-button>
+        <el-button @click="import2faVisible = true">导入 2FA 账号</el-button>
         <el-select v-model="filter" style="width: 130px" @change="load(true)">
           <el-option label="全部" value="all" />
           <el-option label="已获取 AT" value="has_at" />
@@ -867,6 +907,46 @@ onActivated(() => load())
           <template #empty><el-empty description="还没有自定义分组" :image-size="54" /></template>
         </el-table>
       </el-dialog>
+
+      <!-- 导入 2FA 账号弹窗 -->
+      <el-dialog v-model="import2faVisible" title="导入 2FA 账号" width="680px" top="8vh">
+        <el-alert
+          type="info" :closable="false" show-icon
+          style="margin-bottom: 16px"
+          title="将已在外部注册好的账号直接导入注册结果表"
+          description="每行一个，用 ---- 分隔。支持 2 段（邮箱----密码）或 3 段（邮箱----密码----2FA）。空行和 # 开头的注释行自动跳过。导入后账号状态标记为 active。"
+        />
+        <p class="hint" style="margin-bottom: 8px">
+          格式：<code>邮箱----密码----2FA</code>（2FA 可选，支持 base32、otpauth:// 链接）
+        </p>
+        <el-input
+          v-model="import2faText"
+          type="textarea"
+          :rows="10"
+          class="mono"
+          placeholder="user@example.com----MyP@ssw0rd----JBSWY3DPEHPK3PXP&#10;user2@example.com----Pass1234"
+        />
+        <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px">
+          <el-button type="primary" :loading="importing2fa" @click="doImport2FA">导入</el-button>
+          <span class="hint" v-if="import2faLineCount">待导入 {{ import2faLineCount }} 行</span>
+          <span class="hint">{{ import2faResult }}</span>
+        </div>
+        <el-alert
+          v-if="import2faErrors.length"
+          type="error"
+          :closable="true"
+          show-icon
+          style="margin-top: 12px"
+          title="以下行不合法，整批已拒绝（注册结果表未被改动）"
+          @close="import2faErrors = []"
+        >
+          <ul class="err-list">
+            <li v-for="e in import2faErrors" :key="e.line">
+              <b>第 {{ e.line }} 行</b>：{{ e.error }}
+            </li>
+          </ul>
+        </el-alert>
+      </el-dialog>
     </el-card>
   </div>
 </template>
@@ -893,6 +973,13 @@ onActivated(() => load())
   transition: opacity 0.12s;
 }
 :deep(.cell-copy:hover .ico) { opacity: 0.65; }
+.err-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.7;
+}
 </style>
 
 <!-- 非 scoped：ElMessageBox 是挂到 body 上的，不在本组件的 scope 属性范围内，

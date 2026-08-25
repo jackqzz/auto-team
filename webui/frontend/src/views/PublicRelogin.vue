@@ -8,6 +8,7 @@ import {
 } from '@/api/publicRelogin'
 import { useProxyStore } from '@/stores/proxy'
 import {
+  decodeJwtPayload,
   pushToCpa,
   pushToSub2Api,
   testCpaConnection,
@@ -24,6 +25,9 @@ const accounts = ref([])
 const lastResults = ref({})
 const checkProgress = ref({ done: 0, total: 0 })
 const reloginProgress = ref({ done: 0, total: 0 })
+const import2faVisible = ref(false)
+const import2faText = ref('')
+const import2faErrors = ref([])
 const ACCESS_KEY_CACHE = 'gpt_auto_register_public_relogin_access_key'
 const INSPECTION_SETTINGS_CACHE = 'gpt_auto_register_public_relogin_inspection'
 const POOL_PUSH_CONFIG_CACHE = 'gpt_auto_register_public_relogin_pool_push'
@@ -86,6 +90,60 @@ const poolPushConfigIssue = computed(() => {
 })
 
 const openFile = () => fileInput.value?.click()
+
+const import2faLineCount = computed(
+  () => import2faText.value.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).length,
+)
+
+function doImport2FA() {
+  const text = import2faText.value.trim()
+  if (!text) return ElMessage.warning('请输入要导入的账号')
+  import2faErrors.value = []
+  const lines = text.split('\n')
+  const prepared = []
+  const errors = []
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx].trim()
+    if (!line || line.startsWith('#')) continue
+    const parts = line.split('----')
+    if (parts.length < 2 || parts.length > 3) {
+      errors.push({ line: idx + 1, error: `需要 2~3 段（邮箱----密码 或 邮箱----密码----2FA），实际 ${parts.length} 段` })
+      continue
+    }
+    const email = parts[0].trim().toLowerCase()
+    const password = parts[1].trim()
+    const secret = parts.length === 3 ? parts[2].trim() : ''
+    if (!email || !email.includes('@')) {
+      errors.push({ line: idx + 1, error: '邮箱格式不对' })
+      continue
+    }
+    if (!password) {
+      errors.push({ line: idx + 1, error: '密码不能为空' })
+      continue
+    }
+    prepared.push({ email, password, totp_secret: secret })
+  }
+  if (errors.length) {
+    import2faErrors.value = errors
+    ElMessage.error(`有 ${errors.length} 行不合法，请修正后重试`)
+    return
+  }
+  if (!prepared.length) {
+    ElMessage.warning('没有有效行可导入')
+    return
+  }
+  // 将解析结果合并到 accounts 列表（和 JSON 导入一样，纯前端，不写库）
+  const newAccounts = prepared.map((item, idx) => normalizeAccount({
+    email: item.email,
+    password: item.password,
+    totp_secret: item.totp_secret,
+  }, `2fa-${accounts.value.length + idx}`))
+  accounts.value = [...accounts.value, ...newAccounts]
+  lastResults.value = {}
+  ElMessage.success(`已导入 ${prepared.length} 个 2FA 账号`)
+  import2faText.value = ''
+  import2faVisible.value = false
+}
 
 async function loadQueueStatus() {
   try {
@@ -281,29 +339,59 @@ function poolPushStatusFor(row, target) {
   return poolPushResults.value[`${row.id}:${target}`] || null
 }
 
+const asObject = (value) => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch (_) { return {} }
+  }
+  return {}
+}
+
 const normalizeAccount = (item, idx) => {
-  const credentials = item?.credentials && typeof item.credentials === 'object' ? item.credentials : item
-  const extra = item?.extra && typeof item.extra === 'object' ? item.extra : {}
-  const email = String(credentials?.email || item?.email || item?.name || extra?.email || '').trim().toLowerCase()
-  const accessToken = String(credentials?.access_token || item?.access_token || '').trim()
-  const refreshToken = String(credentials?.refresh_token || item?.refresh_token || '').trim()
-  const idToken = String(credentials?.id_token || item?.id_token || '').trim()
-  const password = String(credentials?.password || item?.password || '').trim()
-  const totpSecret = String(credentials?.totp_secret || item?.totp_secret || '').trim()
+  const raw = asObject(item)
+  const credentials = asObject(raw.credentials)
+  const data = asObject(raw.data)
+  const extra = asObject(raw.extra)
+  const sources = [credentials, data, raw, extra]
+  const first = (...keys) => {
+    for (const source of sources) {
+      for (const key of keys) {
+        if (source[key] !== undefined && source[key] !== null && String(source[key]).trim()) return source[key]
+      }
+    }
+    return ''
+  }
+  const accessToken = String(first('access_token', 'accessToken', 'access-token', 'token')).trim()
+  const tokenPayload = decodeJwtPayload(accessToken)
+  const tokenAuth = tokenPayload?.['https://api.openai.com/auth'] || {}
+  const tokenProfile = tokenPayload?.['https://api.openai.com/profile'] || {}
+  const email = String(first('email', 'mail', 'username', 'name') || tokenProfile.email || '').trim().toLowerCase()
+  const refreshToken = String(first('refresh_token', 'refreshToken')).trim()
+  const idToken = String(first('id_token', 'idToken')).trim()
+  const idTokenAuth = decodeJwtPayload(idToken)?.['https://api.openai.com/auth'] || {}
+  const password = String(first('password', 'passwd')).trim()
+  const totpSecret = String(first('totp_secret', 'totpSecret', 'two_factor_secret', 'twoFactorSecret', '2fa')).trim()
   const workspaceId = String(
-    credentials?.chatgpt_account_id
-      || item?.chatgpt_account_id
-      || credentials?.workspace_id
-      || item?.workspace_id
-      || credentials?.account_id
-      || item?.account_id
-      || extra?.workspace_id
+    first('chatgpt_account_id', 'chatgptAccountId', 'workspace_id', 'workspaceId')
+      || tokenAuth.chatgpt_account_id
+      || tokenAuth.account_id
+      || idTokenAuth.chatgpt_account_id
+      || idTokenAuth.account_id
+      || first('account_id', 'accountId')
       || '',
   ).trim()
-  const userId = String(credentials?.chatgpt_user_id || item?.chatgpt_user_id || '').trim()
-  const clientId = String(credentials?.client_id || item?.client_id || '').trim()
-  const planType = String(credentials?.plan_type || item?.plan_type || 'team').trim()
-  const proxy = String(item?.proxy || extra?.proxy || '').trim()
+  const userId = String(
+    first('chatgpt_user_id', 'chatgptUserId', 'user_id', 'userId')
+      || tokenAuth.chatgpt_user_id
+      || tokenAuth.user_id
+      || '',
+  ).trim()
+  const clientId = String(first('client_id', 'clientId')).trim()
+  const planType = String(first('plan_type', 'planType') || tokenAuth.chatgpt_plan_type || 'team').trim()
+  const proxy = String(first('proxy') || '').trim()
   return {
     id: `${workspaceId || 'ws'}:${email || idx}`,
     email,
@@ -321,27 +409,22 @@ const normalizeAccount = (item, idx) => {
     quota: null,
     error: '',
     last_checked_at: 0,
-    account: item,
   }
 }
 
 const parsePayload = (payload) => {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error('JSON 格式不正确')
-  }
-  if (payload.type === 'sub2api-data') {
-    return Array.isArray(payload.accounts) ? payload.accounts.map((a, idx) => normalizeAccount(a, idx)) : []
-  }
-  if (payload.platform === 'openai' && payload.type === 'oauth') {
-    return [normalizeAccount(payload, 0)]
-  }
-  if (payload.type === 'codex' || payload.access_token || payload.refresh_token) {
-    return [normalizeAccount(payload, 0)]
-  }
-  if (Array.isArray(payload.accounts)) {
-    return payload.accounts.map((a, idx) => normalizeAccount(a, idx))
-  }
-  throw new Error('不支持的导入格式，只接受 sub2api-data / cpa 类 JSON')
+  const root = asObject(payload)
+  const nestedData = asObject(root.data)
+  let rows = []
+  if (Array.isArray(payload)) rows = payload
+  else if (Array.isArray(root.accounts)) rows = root.accounts
+  else if (Array.isArray(root.items)) rows = root.items
+  else if (Array.isArray(root.data)) rows = root.data
+  else if (Array.isArray(nestedData.accounts)) rows = nestedData.accounts
+  else if (nestedData.credentials || nestedData.access_token || nestedData.accessToken || nestedData.refresh_token || nestedData.refreshToken) rows = [nestedData]
+  else if (root.credentials || root.access_token || root.accessToken || root.refresh_token || root.refreshToken || root.type === 'codex') rows = [root]
+  if (!rows.length) throw new Error('不支持的导入格式，未找到账号列表（accounts / items / data）')
+  return rows.map((a, idx) => normalizeAccount(a, idx))
 }
 
 const handleFile = async (event) => {
@@ -355,7 +438,12 @@ const handleFile = async (event) => {
     accounts.value = parsePayload(payload)
     lastResults.value = {}
     stopInspection(false)
-    ElMessage.success(`已导入 ${accounts.value.length} 个账号`)
+    const missingTokenCount = accounts.value.filter((item) => !item.access_token).length
+    if (missingTokenCount) {
+      ElMessage.warning(`已导入 ${accounts.value.length} 个账号，其中 ${missingTokenCount} 个缺少 access_token，无法查询额度`)
+    } else {
+      ElMessage.success(`已导入 ${accounts.value.length} 个账号，已解析 access_token`)
+    }
   } catch (e) {
     ElMessage.error(e.message || '导入失败')
   } finally {
@@ -408,32 +496,73 @@ const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => 
   }))
   const checkedAt = Date.now()
   try {
-    // 一批账号放在同一个请求里，后端才能在该批次内正确轮换代理。
-    const res = await checkPublicRelogin({
-      accounts: items,
-      access_key: key,
-      concurrency: 0,
-      proxy_pool: proxyStore.text,
-      auto_relogin_on_401: autoReloginOn401,
+    // 每个账号单独提交一个 HTTP 请求；后端的全局额度队列负责并发执行。
+    // 这样不会让数百条账号共用一个请求生命周期，也能逐账号显示真实错误。
+    const plainItems = JSON.parse(JSON.stringify(items)).map((item) => {
+      const { account: _unusedAccount, ...rest } = item
+      return rest
     })
-    for (const item of items) {
-      const result = res.results?.[item.id] || {
-        ok: false,
-        status: 'error',
-        email: item.email,
-        workspace_id: item.workspace_id,
-        error: '服务器未返回该账号的巡检结果',
-      }
-      applyCheckResult(item, result, checkedAt)
-      checkProgress.value = { ...checkProgress.value, done: checkProgress.value.done + 1 }
+    console.debug('[public-relogin] submit per-account quota checks', {
+      count: plainItems.length,
+      withAccessToken: plainItems.filter((item) => Boolean(item.access_token)).length,
+    })
+    let queueFullCount = 0
+    let errorCount = 0
+    let firstError = null
+    const processResult = (original, result, queues) => {
+      // 单个请求一返回就立即更新对应行，不等待其它账号。
+      applyCheckResult(original, result, checkedAt)
+      if (queues) queueStatus.value = queues
+      if (result?.status === 'queue_full') queueFullCount += 1
+      if (result?.status === 'error' || result?.status === 'failed') errorCount += 1
     }
-    const queueFullCount = Object.values(res.results || {}).filter(
-      (result) => result?.status === 'queue_full',
-    ).length
+    const responses = await Promise.all(plainItems.map(async (plainItem, index) => {
+      const original = items[index]
+      try {
+        const response = await checkPublicRelogin({
+          accounts: [plainItem],
+          access_key: key,
+          concurrency: 0,
+          proxy_pool: proxyStore.text,
+          auto_relogin_on_401: autoReloginOn401,
+        })
+        const result = response.results?.[plainItem.id]
+          || Object.values(response.results || {})[0]
+          || {
+            ok: false,
+            status: 'error',
+            email: original.email,
+            workspace_id: original.workspace_id,
+            error: '服务器未返回该账号的巡检结果',
+          }
+        processResult(original, result, response.queues)
+        return { original, result, queues: response.queues }
+      } catch (error) {
+        handleAuthError(error)
+        const result = {
+          ok: false,
+          status: error.status === 401 ? '401' : error.status === 429 ? 'queue_full' : 'error',
+          email: original.email,
+          workspace_id: original.workspace_id,
+          error: error.message || '额度检查失败',
+        }
+        if (!firstError && error.status !== 429) firstError = error
+        processResult(original, result)
+        return {
+          original,
+          result,
+          error,
+        }
+      } finally {
+        checkProgress.value = { ...checkProgress.value, done: checkProgress.value.done + 1 }
+      }
+    }))
     if (queueFullCount) {
       ElMessage.warning(`${queueFullCount} 个账号未能进入 401 重登录队列，请稍后重试`)
     }
-    queueStatus.value = res.queues || queueStatus.value
+    if (firstError && notify && errorCount === items.length) {
+      ElMessage.error(firstError.message || '额度检查失败')
+    }
     if (notify) ElMessage.success(`额度检查完成，共 ${items.length} 个`)
     return true
   } catch (e) {
@@ -547,7 +676,6 @@ const doRelogin = async (onlyRevived = true) => {
   relogining.value = true
   reloginProgress.value = { done: 0, total: list.length }
   const targetIds = new Set(list.map((item) => item.id))
-  const previousStates = new Map(list.map((item) => [item.id, item.status]))
   let revived = 0
   accounts.value = accounts.value.map((item) => (
     targetIds.has(item.id)
@@ -555,65 +683,71 @@ const doRelogin = async (onlyRevived = true) => {
       : item
   ))
   try {
-    // 同一次任务必须批量提交，后端才能为整批账号建立统一的代理计数快照。
-    const res = await runPublicRelogin({
-      accounts: list,
-      access_key: key,
-      // 0 表示不覆盖后台“公开重登配置”的并发数。
-      concurrency: 0,
-      proxy_pool: proxyStore.text,
+    // 将 Vue 响应式代理转为纯 JS 对象，避免序列化异常
+    const plainList = JSON.parse(JSON.stringify(list))
+    // 每个账号单独提交一个 HTTP 请求；后端的全局重登队列负责并发执行。
+    // 这样每个账号完成时立即更新 UI，不用等所有账号跑完。
+    console.debug('[public-relogin] submit per-account relogin', {
+      count: plainList.length,
     })
-    for (const item of list) {
+    const applyReloginResult = (item, result) => {
+      lastResults.value = { ...lastResults.value, [item.id]: result }
+      if (result.status === 'revived' && result.account) {
+        revived += 1
+        const refreshed = normalizeAccount(result.account, 0)
+        const revivedAccount = {
+          ...refreshed,
+          id: item.id,
+          proxy: item.proxy || refreshed.proxy,
+          status: 'revived',
+          error: '',
+        }
+        updateOne(item.id, revivedAccount)
+        autoPushRevived(revivedAccount)
+      } else {
+        updateOne(item.id, {
+          status: result.status || 'failed',
+          error: result.error || '',
+        })
+      }
+    }
+    await Promise.all(plainList.map(async (plainItem, index) => {
+      const original = list[index]
       try {
-        const result = res.results?.[item.id] || Object.values(res.results || {})[0]
-        if (!result) {
-          throw new Error('服务器未返回重登录结果')
-        }
-        lastResults.value = { ...lastResults.value, [item.id]: result }
-        if (result.status === 'revived' && result.account) {
-          revived += 1
-          const refreshed = normalizeAccount(result.account, 0)
-          const revivedAccount = {
-            ...refreshed,
-            id: item.id,
-            proxy: item.proxy || refreshed.proxy,
-            status: 'revived',
-            error: '',
+        const res = await runPublicRelogin({
+          accounts: [plainItem],
+          access_key: key,
+          concurrency: 0,
+          proxy_pool: proxyStore.text,
+        })
+        const result = res.results?.[plainItem.id]
+          || Object.values(res.results || {})[0]
+          || {
+            ok: false,
+            status: 'failed',
+            email: original.email,
+            workspace_id: original.workspace_id,
+            error: '服务器未返回重登录结果',
           }
-          updateOne(item.id, revivedAccount)
-          autoPushRevived(revivedAccount)
-        } else {
-          updateOne(item.id, {
-            status: result.status || 'failed',
-            error: result.error || '',
-          })
-        }
+        applyReloginResult(original, result)
+        if (res.queues) queueStatus.value = res.queues
       } catch (e) {
         handleAuthError(e)
         const result = {
           ok: false,
-          status: e.status === 401 ? '401' : 'failed',
-          email: item.email,
-          workspace_id: item.workspace_id,
+          status: e.status === 401 ? '401' : e.status === 429 ? 'queue_full' : 'failed',
+          email: original.email,
+          workspace_id: original.workspace_id,
           error: e.message || '重登录失败',
         }
-        lastResults.value = { ...lastResults.value, [item.id]: result }
-        updateOne(item.id, { status: result.status, error: result.error })
+        applyReloginResult(original, result)
       } finally {
         reloginProgress.value = { ...reloginProgress.value, done: reloginProgress.value.done + 1 }
       }
-    }
-    queueStatus.value = res.queues || queueStatus.value
+    }))
     ElMessage.success(`重登完成，成功 ${revived} 个`)
   } catch (e) {
-    for (const item of list) {
-      updateOne(item.id, {
-        status: previousStates.get(item.id) || '401',
-        error: e.message || '401 重登录队列已满，请稍后重试',
-      })
-    }
-    if (e.status === 429) ElMessage.warning(e.message || '401 重登录队列已满，请稍后重试')
-    else ElMessage.error(e.message)
+    ElMessage.error(e.message)
   } finally {
     relogining.value = false
     loadQueueStatus()
@@ -734,6 +868,7 @@ onBeforeUnmount(() => {
       <div class="toolbar">
         <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="handleFile" />
         <el-button :loading="loading" @click="openFile">导入 JSON</el-button>
+        <el-button type="warning" @click="import2faVisible = true">导入 2FA 账号</el-button>
         <el-button :loading="checking" type="primary" @click="doCheck">检查额度 / 401</el-button>
         <el-button :loading="relogining" type="success" @click="doRelogin(true)">一键重新登录</el-button>
         <el-button @click="poolPushDrawerVisible = true">
@@ -1015,6 +1150,34 @@ onBeforeUnmount(() => {
         >推送当前复活项</el-button>
       </div>
     </el-drawer>
+
+    <!-- 导入 2FA 账号对话框 -->
+    <el-dialog v-model="import2faVisible" title="导入 2FA 账号" width="600px" destroy-on-close>
+      <el-alert type="info" show-icon :closable="false" style="margin-bottom:12px">
+        <template #title>每行一个，格式：<code>邮箱----密码----2FA</code>（2FA 可选）</template>
+        <p style="margin:0">以 <code>#</code> 开头的行视为注释。如有任何一行格式不对，全部拒绝。</p>
+      </el-alert>
+      <el-input
+        v-model="import2faText"
+        type="textarea"
+        :rows="10"
+        placeholder="user@example.com----P@ssw0rd----JBSWY3DPEHPK3PXP"
+      />
+      <div style="text-align:right;margin-top:4px;color:var(--el-text-color-secondary);font-size:12px">
+        有效行：{{ import2faLineCount }}
+      </div>
+      <div v-if="import2faErrors.length" style="margin-top:8px">
+        <el-alert type="error" :closable="false" show-icon title="以下行不合法">
+          <ul class="err-list">
+            <li v-for="e in import2faErrors" :key="e.line">第 {{ e.line }} 行：{{ e.error }}</li>
+          </ul>
+        </el-alert>
+      </div>
+      <template #footer>
+        <el-button @click="import2faVisible = false">取消</el-button>
+        <el-button type="primary" @click="doImport2FA">导入</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -1104,5 +1267,12 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 8px;
   padding-top: 18px;
+}
+.err-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  max-height: 160px;
+  overflow-y: auto;
 }
 </style>

@@ -203,6 +203,11 @@ class Sub2APIImportReq(BaseModel):
     group_name: str = Field("", description="导入账号分组")
 
 
+class Import2FAReq(BaseModel):
+    text: str = Field(..., description="每行一个：邮箱----密码----2FA（2FA 可选）")
+    group_name: str = Field("", description="导入账号分组")
+
+
 class WorkspaceSessionImportReq(BaseModel):
     text: str = Field(..., description="母号 Session；支持 account----session、纯 session 或 JSON")
     proxy: str = Field("", description="本批母号的专属代理；每行/JSON 内代理可覆盖")
@@ -275,7 +280,7 @@ class PublicReloginSettingsReq(BaseModel):
     public_relogin_enabled: bool = False
     proxy_pool: str = ""
     use_system_proxy_pool: bool = True
-    concurrency: int = Field(3, ge=1, le=20)
+    concurrency: int = Field(3, ge=1, le=100)
     quota_queue_capacity: int = Field(512, ge=1, le=10000)
     relogin_queue_capacity: int = Field(128, ge=1, le=10000)
     retry_count: int = Field(2, ge=0, le=5)
@@ -528,6 +533,10 @@ def api_revoke_public_relogin_access_key(key_id: str):
 
 @app.post("/api/public-relogin/check")
 async def api_public_relogin_check(req: PublicReloginCheckReq):
+    logger.info(
+        "公开额度检查请求收到 accounts=%s proxy_pool_chars=%s auto_relogin=%s",
+        len(req.accounts or []), len(str(req.proxy_pool or "")), bool(req.auto_relogin_on_401),
+    )
     cfg = public_relogin.get_effective_config()
     if not cfg["enabled"]:
         raise HTTPException(403, "公开 401 重登录页面未启用")
@@ -554,7 +563,41 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
                 task_detail="public_quota",
             )
         try:
-            quota = public_relogin.fetch_quota(normalized or account, proxy=proxy, timeout=cfg["quota_timeout"])
+            # 额度查询也可能遇到失效/超时代理。网络类异常换下一条代理
+            # 重试，避免一个坏出口直接把账号标成错误；401/403 等账号响应
+            # 不换代理，交给下面的账号状态分支处理。
+            quota = None
+            last_network_error = None
+            for quota_attempt in range(1, 4):
+                try:
+                    quota = public_relogin.fetch_quota(
+                        normalized or account,
+                        proxy=proxy,
+                        timeout=cfg["quota_timeout"],
+                    )
+                    break
+                except (public_relogin.PublicQuotaUnauthorized, public_relogin.PublicAccountDeactivated):
+                    raise
+                except Exception as exc:
+                    last_network_error = exc
+                    account_proxy = str(account.get("proxy") or "").strip()
+                    if account_proxy or quota_attempt >= 3:
+                        raise
+                    replacement, _, _ = proxy_leases.lease(
+                        exclude_proxy=proxy,
+                        task_type="quota",
+                        task_detail="public_quota_retry",
+                    )
+                    if not replacement or replacement == proxy:
+                        raise
+                    logger.warning(
+                        "公开额度查询切换代理 account=%s attempt=%s reason=%s",
+                        normalized.get("email", ""), quota_attempt,
+                        str(exc)[:180],
+                    )
+                    proxy = replacement
+            if quota is None and last_network_error is not None:
+                raise last_network_error
             return key, {"ok": True, "status": "active", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "quota": quota}
         except public_relogin.PublicQuotaUnauthorized as exc:
             if req.auto_relogin_on_401:
@@ -588,6 +631,13 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
         except public_relogin.PublicAccountDeactivated as exc:
             return key, {"ok": False, "status": "deactivated", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
         except Exception as exc:
+            logger.warning(
+                "公开额度查询失败 account=%s workspace=%s proxy=%s error=%s",
+                normalized.get("email", ""),
+                normalized.get("chatgpt_account_id", ""),
+                "configured" if proxy else "direct",
+                str(exc)[:300],
+            )
             return key, {"ok": False, "status": "error", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)[:500]}
 
     tasks = [
@@ -1579,6 +1629,20 @@ def api_import_sub2api(req: Sub2APIImportReq):
         result = db.import_sub2api_registered(payload, group_name=req.group_name)
     except json.JSONDecodeError as e:
         raise HTTPException(400, f"JSON 解析失败: {e}")
+    except ValueError as e:
+        try:
+            detail = json.loads(str(e))
+        except Exception:
+            detail = str(e)
+        raise HTTPException(400, detail)
+    return {"ok": True, **result}
+
+
+@app.post("/api/registered/import_2fa")
+def api_import_2fa(req: Import2FAReq):
+    """导入 邮箱----密码----2FA 格式的已注册账号，直接写入注册结果表。"""
+    try:
+        result = db.import_2fa_registered(req.text, group_name=req.group_name)
     except ValueError as e:
         try:
             detail = json.loads(str(e))

@@ -2052,6 +2052,92 @@ def import_sub2api_registered(payload: object, group_name: str = "") -> dict:
     return {"imported": len(prepared), "skipped": 0}
 
 
+def import_2fa_registered(text: str, group_name: str = "") -> dict:
+    """导入 邮箱----密码----2FA 格式的已注册账号。
+
+    这些账号已经在外部注册过了，直接写进 registered 表标记为 active。
+    格式：每行一个，用 ---- 分隔，支持 2 段（邮箱----密码）或 3 段（邮箱----密码----2FA）。
+    空行和 # 开头的注释行自动跳过。
+
+    **全对才写**：只要有一行不合法就整批拒绝，一个都不写库。
+    """
+    lines = text.strip().splitlines()
+    prepared = []
+    errors = []
+    for idx, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("----")
+        if len(parts) < 2 or len(parts) > 3:
+            errors.append({"line": idx, "error": f"需要 2~3 段（邮箱----密码 或 邮箱----密码----2FA），实际 {len(parts)} 段"})
+            continue
+        email = parts[0].strip().lower()
+        password = parts[1].strip()
+        secret = parts[2].strip() if len(parts) == 3 else ""
+        if not email or "@" not in email:
+            errors.append({"line": idx, "error": "邮箱格式不对"})
+            continue
+        if not password:
+            errors.append({"line": idx, "error": "密码不能为空"})
+            continue
+        if secret:
+            try:
+                secret = normalize_totp_secret(secret)
+            except ValueError as e:
+                errors.append({"line": idx, "error": f"{email}: {e}"})
+                continue
+        prepared.append({"email": email, "password": password, "totp_secret": secret})
+    if errors:
+        raise ValueError(json.dumps(
+            {"message": "2FA 导入校验失败", "errors": errors},
+            ensure_ascii=False,
+        ))
+    if not prepared:
+        raise ValueError("没有有效行可导入")
+
+    with _lock:
+        con = _conn()
+        imported = 0
+        updated = 0
+        for item in prepared:
+            old = con.execute(
+                "SELECT * FROM registered WHERE email=?", (item["email"],)
+            ).fetchone()
+
+            def keep(new, key):
+                return new if new else ((old[key] or "") if old else "")
+
+            grp = group_name if group_name else ((old["group_name"] or "") if old else "")
+            account_status = ((old["account_status"] or "active") if old else "active")
+            con.execute(
+                "INSERT OR REPLACE INTO registered "
+                "(email, group_name, mail_kind, password, access_token, session_token, refresh_token, "
+                "id_token, device_id, csrf_token, cookie_header, totp_secret, totp_factor_id, "
+                "account_status, extra_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item["email"], grp,
+                    ((old["mail_kind"] or "") if old else ""),
+                    item["password"],
+                    keep("", "access_token"), keep("", "session_token"),
+                    keep("", "refresh_token"), keep("", "id_token"),
+                    keep("", "device_id"), keep("", "csrf_token"),
+                    keep("", "cookie_header"), keep(item["totp_secret"], "totp_secret"),
+                    keep("", "totp_factor_id"),
+                    account_status,
+                    json.dumps({"import_2fa": True}, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+            if old:
+                updated += 1
+            else:
+                imported += 1
+        con.commit()
+    return {"imported": imported, "updated": updated, "total": len(prepared)}
+
+
 def save_password_early(email: str, password: str) -> None:
     """密码一在 OpenAI 侧生效就落盘，不等整个注册流程跑完。
 
