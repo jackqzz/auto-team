@@ -5,6 +5,7 @@ webui/webui.db-shm
 webui/webui.db-wal
 webui/webui.db-journal
 webui/logs/
+/logs/
 # ⚠️ 2026-08-04 补：手动备份的 *.db.bak 之前没被拦住，
 #    `git add .` 会把整个号池（含已注册凭证）传上 GitHub。
 *.db.bak
