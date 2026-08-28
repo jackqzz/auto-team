@@ -3,11 +3,10 @@
 参考 zc-zhangchen/any-auto-register 的 platforms/chatgpt/cpa_upload.py 和 sub2api_upload.py。
 
 核心改造：
-  ★ 导出前先用 refresh_token 调 https://auth.openai.com/oauth/token 换新的 Codex
-    风格 access_token（client_id=app_EMoamEEZ73f0CkXaXp7hrann）。
-    主项目 run_register 末尾会用 get_auth_session() 把 Codex access_token 覆盖
-    成 ChatGPT 网页 NextAuth 风格，但 NextAuth 风格的 token 在 CPA/SUB2API 不可用，
-    所以这里单独刷新。
+  ★ 可选地在导出前用 refresh_token 调 https://auth.openai.com/oauth/token 换新的
+    Codex 风格 access_token（client_id=app_EMoamEEZ73f0CkXaXp7hrann）。
+    新版流程会保存同源的 Codex AT/ID，因此默认直接导出即可；历史混合凭证可打开
+    刷新开关，刷新成功后会把滚动后的 AT/RT/ID 回写数据库。
 
 两种导出目标：
   1. CPA：multipart 文件上传 → POST /v0/management/auth-files
@@ -600,9 +599,8 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
                         skip_token_refresh: bool = False) -> dict:
     """SUB2API x-api-key 直连上传（无登录流程）。
 
-    自动用 refresh_token 换取 Codex 风格 access_token——
-    因为 DB 存储的 access_token 是 NextAuth 风格（被 get_auth_session() 覆盖），
-    在 SUB2API 会返回 401。
+    当 cfg['refresh_oauth'] 为真时，用 refresh_token 换取新的 Codex 风格
+    access_token；关闭时只使用现有凭证并做 AT/ID 一致性校验，不访问 OAuth 接口。
 
     skip_token_refresh: 当调用方（如 run_exports）已经完成刷新时置 True，避免重复刷新。
     """
@@ -615,11 +613,17 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     if not api_key:
         raise RuntimeError("SUB2API 未配置 API Key")
 
-    # ── 自动刷新 Codex token ────────────────────────
-    # DB 中存储的 access_token 是 NextAuth 风格（get_auth_session 覆盖），
-    # SUB2API 需要 Codex 风格。用 refresh_token 换取新的 Codex access_token。
+    # ── 可选刷新 Codex token ────────────────────────
+    # 全局设置默认关闭；缺少该字段的调用也按关闭处理，避免在用户未打开
+    # 开关时意外请求 OAuth。需要修复历史混合凭证时显式传 refresh_oauth=True。
+    refresh_setting = cfg.get("refresh_oauth")
+    if isinstance(refresh_setting, str):
+        refresh_enabled = refresh_setting.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        refresh_enabled = False if refresh_setting is None else bool(refresh_setting)
+    refresh_oauth = refresh_enabled and not skip_token_refresh
     rt = str(cred.get("refresh_token") or "").strip()
-    if not skip_token_refresh and rt:
+    if refresh_oauth and rt:
         try:
             refresh_timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
             proxy_text = str(cfg.get("proxy") or "").strip()
@@ -662,7 +666,10 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
             cred.get("access_token", ""),
             cred.get("id_token", ""),
         )
-        log("[SUB2API] 缺少 refresh_token，使用现有 access_token（已通过 AT/ID 一致性校验）", "warn")
+        if refresh_oauth and not rt:
+            log("[SUB2API] 已开启 OAuth 刷新但账号缺少 refresh_token，改用现有 access_token", "warn")
+        else:
+            log("[SUB2API] 未启用 OAuth 刷新，使用现有 access_token（已通过 AT/ID 一致性校验）", "info")
 
     group_ids = _parse_group_ids(cfg.get("sub2api_group_ids"))
     timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
@@ -818,14 +825,14 @@ def run_exports(cred: dict, *,
                   sub2api_cfg: Optional[dict] = None,
                   log_fn: Optional[Callable[[str, str], None]] = None,
                   on_tokens_refreshed: Optional[Callable[[dict], None]] = None,
-                  refresh_oauth: bool = False) -> dict:
+                  refresh_oauth: Optional[bool] = None) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
       1. 检查两个目标是否有任一启用，全部未启用直接返回
-      2. 用 cred['refresh_token'] 刷新一次拿新的 Codex access_token / id_token
-         （主项目最终保存的 access_token 是 NextAuth 风格的，CPA/SUB2API 不接受）
-      3. 用刷新后的 cred 走 CPA / SUB2API 导出
+      2. 按 refresh_oauth（未显式传入时跟随 sub2api_cfg）决定是否刷新一次
+         Codex access_token / id_token
+      3. 用当前或刷新后的 cred 走 CPA / SUB2API 导出
 
     返回：
         {"cpa": {...} 或 None, "sub2api": {...} 或 None, "any_attempted": bool}
@@ -838,12 +845,24 @@ def run_exports(cred: dict, *,
     if not (cpa_on or sub2_on):
         return out
 
+    # 调用方显式传入时优先（例如自动任务的任务级开关）；普通手动调用则
+    # 跟随全局 Sub2API 导出设置。CPA 单独导出永远不会因为该设置刷新 token。
+    if refresh_oauth is not None:
+        refresh_requested = bool(refresh_oauth)
+    else:
+        configured_refresh = (sub2api_cfg or {}).get("refresh_oauth")
+        if isinstance(configured_refresh, str):
+            refresh_requested = configured_refresh.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            refresh_requested = bool(configured_refresh)
+    should_refresh = sub2_on and refresh_requested
+
     # 可选：用 refresh_token 换 Codex 风格 access_token。默认不刷新，
     # 直接使用注册结果中已有的 access_token，避免额外请求和地区限制。
-    if refresh_oauth:
+    if should_refresh and str(cred.get("refresh_token") or "").strip():
       try:
         log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
-        refresh_cfg = cpa_cfg or sub2api_cfg or {}
+        refresh_cfg = sub2api_cfg or cpa_cfg or {}
         refresh_timeout = (
             refresh_cfg.get("cpa_timeout")
             or refresh_cfg.get("sub2api_timeout")
@@ -853,6 +872,7 @@ def run_exports(cred: dict, *,
             cred.get("refresh_token", ""),
             timeout=int(refresh_timeout),
             proxy=str(refresh_cfg.get("proxy") or ""),
+            client_id=CODEX_CLIENT_ID,
         )
         cred = {
             **cred,
@@ -880,6 +900,8 @@ def run_exports(cred: dict, *,
             out["any_attempted"] = True
             out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
         return out
+    elif should_refresh:
+        log("[exporter] 已开启 OAuth 刷新，但账号缺少 refresh_token，跳过刷新并继续导出", "warn")
     else:
         log("[exporter] 已关闭 OAuth 刷新，直接使用现有 access_token", "info")
 
@@ -894,11 +916,15 @@ def run_exports(cred: dict, *,
     if sub2_on:
         out["any_attempted"] = True
         try:
+            # 把解析后的最终开关写入本次调用副本，避免调用方显式传 False
+            # 时被 cfg 中的全局 True 再次触发内部刷新。
+            sub2_export_cfg = dict(sub2api_cfg or {})
+            sub2_export_cfg["refresh_oauth"] = should_refresh
             out["sub2api"] = export_to_sub2api(
-                cred, sub2api_cfg, log_fn=log,
+                cred, sub2_export_cfg, log_fn=log,
                 on_tokens_refreshed=on_tokens_refreshed,
-                # refresh_oauth=True 时上面已经刷新过了，skip 避免重复刷新
-                skip_token_refresh=refresh_oauth,
+                # should_refresh=True 时上面已经刷新过了，skip 避免重复刷新
+                skip_token_refresh=should_refresh,
             )
         except Exception as e:
             log(f"[SUB2API] 导出异常: {e}", "error")

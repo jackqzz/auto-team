@@ -34,6 +34,7 @@ class CandidateExportCredentialTests(unittest.TestCase):
             emails=["candidate@example.com"],
             workspace_id=2,
             proxy_pool="socks5://proxy.example:1080",
+            refresh_oauth=True,
         )
         with (
             patch.object(app.db, "list_workspace_credentials_by_emails", return_value=workspace),
@@ -69,6 +70,7 @@ class CandidateExportCredentialTests(unittest.TestCase):
             format="sub2api",
             emails=["candidate@example.com"],
             workspace_id=2,
+            refresh_oauth=True,
         )
         from webui import exporter
 
@@ -83,6 +85,33 @@ class CandidateExportCredentialTests(unittest.TestCase):
         self.assertEqual(getattr(caught.exception, "status_code", None), 502)
         self.assertIn("refresh_token 刷新失败", str(getattr(caught.exception, "detail", caught.exception)))
         render.assert_not_called()
+
+    def test_workspace_sub2_export_can_skip_refresh_and_use_existing_pair(self):
+        from webui import exporter
+
+        access = "access-token"
+        identity = self._jwt({"at_hash": exporter._oidc_at_hash(access)})
+        workspace = [{
+            "email": "candidate@example.com",
+            "access_token": access,
+            "refresh_token": "old-refresh",
+            "id_token": identity,
+        }]
+        request = app.ExportRegisteredReq(
+            format="sub2api",
+            emails=["candidate@example.com"],
+            workspace_id=2,
+            refresh_oauth=False,
+        )
+        with (
+            patch.object(app.db, "list_workspace_credentials_by_emails", return_value=workspace),
+            patch.object(exporter, "refresh_codex_token") as refresh,
+            patch.object(app.export_formats, "render_bytes", return_value=b"{}") as render,
+        ):
+            app.api_export_registered(request)
+
+        refresh.assert_not_called()
+        self.assertEqual(render.call_args.args[0][0]["access_token"], access)
 
     def test_text_credentials_use_registered_rows_with_workspace_id(self):
         registered = [{

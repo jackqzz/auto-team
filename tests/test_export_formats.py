@@ -53,7 +53,11 @@ class ExportFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "已停止导出"):
                 exporter.export_to_sub2api(
                     _row(),
-                    {"sub2api_url": "https://sub2.example", "sub2api_api_key": "key"},
+                    {
+                        "sub2api_url": "https://sub2.example",
+                        "sub2api_api_key": "key",
+                        "refresh_oauth": True,
+                    },
                 )
 
     def test_sub2_rejects_mismatched_access_and_id_tokens(self):

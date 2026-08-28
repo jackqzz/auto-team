@@ -906,7 +906,6 @@ def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, a
         "cool_down_seconds": int(settings.get("cool_down_seconds", 0) or 0),
         "account_retry_count": int(settings.get("account_retry_count", 1) or 1),
         "auto_export": bool(auto_export or settings.get("auto_push")),
-        "export_refresh_oauth": False,
         "target_count": 0,
     }
 
@@ -1441,7 +1440,6 @@ def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], setting
         "cool_down_seconds": int(settings.get("cool_down_seconds", 0) or 0),
         "account_retry_count": int(settings.get("account_retry_count", 1) or 1),
         "auto_export": bool(settings.get("auto_push")),
-        "export_refresh_oauth": False,
         "target_count": 0,
     })
     if not result.get("ok") and "已经在跑了" not in str(result.get("error") or ""):
@@ -2707,7 +2705,7 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
         "want_access_token": True, "want_session_token": True, "want_refresh_token": True,
         "want_password": False, "want_2fa": False, "allow_existing_login": True,
         "cool_down_seconds": req.cool_down_seconds, "account_retry_count": req.account_retry_count, "auto_export": req.auto_push,
-        "export_refresh_oauth": False, "target_count": 0,
+        "target_count": 0,
     })
     if not result.get("ok"):
         raise HTTPException(400, result.get("error", "空间凭证任务启动失败"))
@@ -2782,7 +2780,7 @@ def api_workspace_login_only(req: WorkspaceCandidatesReq):
         "want_access_token": False, "want_session_token": True, "want_refresh_token": False,
         "want_password": False, "want_2fa": False, "allow_existing_login": True,
         "cool_down_seconds": req.cool_down_seconds, "account_retry_count": req.account_retry_count, "auto_export": False,
-        "export_refresh_oauth": False, "target_count": 0,
+        "target_count": 0,
     })
     if not result.get("ok"):
         raise HTTPException(400, result.get("error", "仅登录任务启动失败"))
@@ -3254,6 +3252,10 @@ class ExportRegisteredReq(BaseModel):
     all: bool = Field(False, description="true = 导出全部（跨页），忽略 emails")
     workspace_id: Optional[int] = Field(None, description="按指定 Team 空间导出其独立凭证")
     proxy_pool: str = Field("", description="刷新 Sub2 OAuth token 使用的代理池")
+    refresh_oauth: Optional[bool] = Field(
+        None,
+        description="Sub2 导出前是否用 refresh_token 刷新；留空跟随全局导出设置",
+    )
 
 
 @app.post("/api/registered/export")
@@ -3281,15 +3283,24 @@ def api_export_registered(req: ExportRegisteredReq):
         raise HTTPException(400, "需要 emails 或 all=true")
 
     # 不跳行：勾了几个号就几行 / 几个文件，字段为空也照样出。
-    # CPA 不做 refresh_token 刷新；SUB2API 需要刷新（DB 中是 NextAuth AT，401）。
+    # CPA 不做 refresh_token 刷新。Sub2 是否刷新由请求级开关覆盖全局设置；
+    # 关闭时仅校验现有 AT/ID 是否同源，不访问 /oauth/token。
     if fmt.id == "sub2api":
         from . import exporter as _exp
-        refresh_proxies = _public_relogin_proxy_pool(req.proxy_pool, "")
-        refresh_leases = public_relogin.ProxyLeasePool(refresh_proxies)
+        export_cfg = db.get_export_internal_config().get("sub2api", {})
+        refresh_oauth = (
+            bool(req.refresh_oauth)
+            if req.refresh_oauth is not None
+            else bool(export_cfg.get("refresh_oauth"))
+        )
+        refresh_leases = None
+        if refresh_oauth:
+            refresh_proxies = _public_relogin_proxy_pool(req.proxy_pool, "")
+            refresh_leases = public_relogin.ProxyLeasePool(refresh_proxies)
         refreshed_rows = []
         for r in rows:
             rt = str(r.get("refresh_token") or "").strip()
-            if rt:
+            if refresh_oauth and rt:
                 try:
                     refresh_proxy, _, _ = refresh_leases.lease(
                         task_type="other",
@@ -3601,6 +3612,7 @@ class SaveExportConfigReq(BaseModel):
     sub2api_api_key: Optional[str] = None   # '***' 不修改
     sub2api_group_ids: Optional[str] = None  # 逗号分隔，例 "2" 或 "1,2,3"
     sub2api_timeout: Optional[str] = None
+    sub2api_refresh_oauth: Optional[str] = None  # "0" / "1"
 
 
 @app.get("/api/settings/export")
@@ -3640,6 +3652,10 @@ class ManualExportReq(BaseModel):
     email: str = Field(..., description="要导出的已注册账号邮箱")
     targets: list[str] = Field(default_factory=lambda: ["cpa", "sub2api"],
                                 description="选择导出目标：cpa / sub2api")
+    refresh_oauth: Optional[bool] = Field(
+        None,
+        description="Sub2 导出前是否用 refresh_token 刷新；留空跟随全局导出设置",
+    )
 
 
 class BulkCpaPushReq(BaseModel):
@@ -3674,6 +3690,8 @@ def api_manual_export_to_panel(req: ManualExportReq):
     if "sub2api" in targets:
         sub2api_cfg = dict(cfg["sub2api"])
         sub2api_cfg["enabled"] = True
+        if req.refresh_oauth is not None:
+            sub2api_cfg["refresh_oauth"] = bool(req.refresh_oauth)
         try:
             out["sub2api"] = exporter.export_to_sub2api(
                 cred, sub2api_cfg,

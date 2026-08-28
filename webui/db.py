@@ -3342,6 +3342,10 @@ def get_export_config() -> dict:
         "sub2api_api_key":    "***" if get_setting("export_sub2api_api_key") else "",
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
+        # 是否在 Sub2API 导出前用 refresh_token 换一组新的 Codex AT/ID。
+        # 默认关闭：新流程保存的 AT/ID 已经同源，直接导出更快；历史混合凭证
+        # 可临时打开一次进行修复。
+        "sub2api_refresh_oauth": get_setting("export_sub2api_refresh_oauth", "0"),
     }
 
 
@@ -3351,6 +3355,7 @@ def save_export_config(data: dict) -> None:
     for key_in, key_out in (
         ("cpa_enabled",     "export_cpa_enabled"),
         ("sub2api_enabled", "export_sub2api_enabled"),
+        ("sub2api_refresh_oauth", "export_sub2api_refresh_oauth"),
     ):
         if key_in in data:
             v = data[key_in]
@@ -3393,6 +3398,7 @@ def get_export_internal_config() -> dict:
         "sub2api_api_key":    get_setting("export_sub2api_api_key", ""),
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
+        "refresh_oauth":      get_setting("export_sub2api_refresh_oauth", "0") in ("1", "true"),
     }
     return {"cpa": cpa, "sub2api": sub2api}
 

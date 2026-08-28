@@ -9,7 +9,7 @@ import {
 import FooterToolbar from '@/components/FooterToolbar.vue'
 
 const cpa = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴 CPA 管理密钥', timeout: 30 })
-const sub = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴面板里生成的 x-api-key', groupIds: '2', timeout: 30 })
+const sub = reactive({ enabled: false, refreshOauth: false, url: '', key: '', keyPh: '粘贴面板里生成的 x-api-key', groupIds: '2', timeout: 30 })
 const saving = ref(false)
 const testingCpa = ref(false)
 const testingSub = ref(false)
@@ -23,6 +23,7 @@ async function load() {
     cpa.keyPh = config.cpa_mgmt_key === '***' ? '已设置（留空不修改）' : '粘贴 CPA 管理密钥'
     cpa.timeout = Number(config.cpa_timeout || 30)
     sub.enabled = config.sub2api_enabled === '1'
+    sub.refreshOauth = config.sub2api_refresh_oauth === '1'
     sub.url = config.sub2api_url || ''
     sub.key = ''
     sub.keyPh = config.sub2api_api_key === '***' ? '已设置（留空不修改）' : '粘贴面板里生成的 x-api-key'
@@ -40,6 +41,7 @@ async function save() {
       cpa_mgmt_key: cpa.key.trim() || '***',
       cpa_timeout: String(cpa.timeout || 30),
       sub2api_enabled: sub.enabled ? '1' : '0',
+      sub2api_refresh_oauth: sub.refreshOauth ? '1' : '0',
       sub2api_url: sub.url.trim(),
       sub2api_api_key: sub.key.trim() || '***',
       sub2api_group_ids: sub.groupIds.trim() || '2',
@@ -67,11 +69,11 @@ onActivated(() => load())
     <el-card shadow="never" style="max-width: 760px">
       <template #header>
         <span class="section-title" style="margin: 0">注册完成后自动导出</span>
-        <el-tag type="danger" size="small" effect="dark" style="margin-left: 8px">仅带 RT 的账号可用</el-tag>
+        <el-tag type="info" size="small" effect="plain" style="margin-left: 8px">Sub2 需同源 AT / ID</el-tag>
       </template>
       <p class="hint">勾选启用后，每次注册成功落库会导出到对应面板。没勾选完全不执行，导出失败只记日志、不影响注册。</p>
-      <p class="hint" style="color: var(--el-color-danger); font-weight: 600">
-        注意：只有带 <b>RT（refresh_token）</b>的账号，导出后才能正常使用。没有 RT 的号推过去面板也用不了 —— 想拿到 RT 需要<b>配置接码</b>。
+      <p class="hint" style="color: var(--el-color-warning); font-weight: 600">
+        注意：Sub2API 导出要求 access_token 与 id_token 属于同一组 Codex OAuth 凭证。RT（refresh_token）不是直接导出的必需字段；只有开启上面的刷新开关时才会用到 RT。
       </p>
 
       <el-form label-position="top">
@@ -93,6 +95,14 @@ onActivated(() => load())
         <el-divider content-position="left">SUB2API 面板</el-divider>
         <el-form-item>
           <el-checkbox v-model="sub.enabled">启用 SUB2API 自动导出（POST /api/v1/admin/accounts）</el-checkbox>
+        </el-form-item>
+        <el-form-item label="OAuth 凭证刷新">
+          <el-checkbox v-model="sub.refreshOauth">导出前使用 refresh_token 刷新 Codex access_token / id_token</el-checkbox>
+          <div class="hint" style="margin-top: 6px; line-height: 1.5">
+            关闭时直接使用当前已保存的同源 AT/ID，速度更快且不会请求 OAuth；开启后会先用 RT 换取新的一组 AT/RT/ID 并回写数据库。
+            如果历史账号导出提示 AT/ID 不匹配，可临时开启一次修复后再关闭。
+            自动跑号页若单独设置“推送前刷新 OAuth”，以任务级开关为准。
+          </div>
         </el-form-item>
         <el-form-item label="SUB2API URL">
           <el-input v-model="sub.url" placeholder="https://sub2api.example.com" />

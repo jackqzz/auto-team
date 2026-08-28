@@ -986,6 +986,15 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
             id_token=fresh_cred.get("id_token", ""),
         )
 
+    # 任务级设置存在时优先；普通单次注册/系统自动任务未提供该字段时，
+    # 由 exporter 跟随全局 Sub2API 导出设置。这样新增的全局开关不会被
+    # 历史 options 默认值 False 意外覆盖。
+    refresh_override = None
+    if options is not None and "export_refresh_oauth" in options:
+        value = options.get("export_refresh_oauth")
+        if value is not None:
+            refresh_override = bool(value)
+
     try:
         results = exporter.run_exports(
             cred,
@@ -993,7 +1002,7 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
             sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
             log_fn=_log,
             on_tokens_refreshed=_persist_refreshed_tokens,
-            refresh_oauth=bool((options or {}).get("export_refresh_oauth", False)),
+            refresh_oauth=refresh_override,
         )
     except Exception as e:
         _log(f"导出整体异常: {e}", "error")

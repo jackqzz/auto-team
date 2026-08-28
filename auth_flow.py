@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 # URL 和 locator 为主，只保留稳定的 consent 标题作为辅助信号。
 CAMOUFOX_LOCALE = "en-US"
 CODEX_CONSENT_TITLE = "Sign in with ChatGPT - OpenAI"
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 
 def goto_with_timeout(page, url: str, config: Any = None, **kwargs):
@@ -334,6 +335,12 @@ class AuthFlow:
         self._captured_login_verifier = ""
         self._oauth_client_secret = (os.getenv("OAUTH_CLIENT_SECRET", "") or "").strip()
         self._codex_exchange_error_code = ""
+        # Web/NextAuth 与 Codex OAuth 是两套不同 token family。注册过程中
+        # get_auth_session() 会拿到 Web access_token，而 Codex 授权交换会拿到
+        # 另一套 access/id/refresh；不能再让后续 session 刷新互相覆盖。
+        self._web_access_token = ""
+        self._codex_access_token = ""
+        self._codex_id_token = ""
 
         self._oauth_client_id = "YOUR_OPENAI_WEB_CLIENT_ID"
         self._oauth_redirect_uri = "https://chatgpt.com/api/auth/callback/openai"
@@ -743,9 +750,35 @@ class AuthFlow:
             self.result.refresh_token = refresh
         acc = (found.get("access_token", "") or "").strip()
         if acc:
-            self.result.access_token = acc
+            # dump 里出现的 token 可能来自 Web NextAuth，也可能已经是
+            # Codex OAuth token。根据 JWT 的 client_id 归档到对应 token
+            # family，避免后续 get_auth_session 把 Codex token 当 Web token。
+            try:
+                token_part = acc.split(".")[1]
+                token_part += "=" * (-len(token_part) % 4)
+                token_payload = json.loads(
+                    base64.urlsafe_b64decode(token_part.encode("utf-8"))
+                )
+                if not isinstance(token_payload, dict):
+                    token_payload = {}
+            except Exception:
+                token_payload = {}
+            token_client_id = str(token_payload.get("client_id") or "").strip()
+            if token_client_id == CODEX_OAUTH_CLIENT_ID or refresh:
+                self._codex_access_token = acc
+                self.result.access_token = acc
+            else:
+                self._web_access_token = acc
+                if not getattr(self, "_codex_access_token", ""):
+                    self.result.access_token = acc
+                else:
+                    logger.debug(
+                        "client_auth_session_dump 返回 Web token，保留已有 Codex access_token"
+                    )
         idt = (found.get("id_token", "") or "").strip()
         if idt:
+            if getattr(self, "_codex_access_token", ""):
+                self._codex_id_token = idt
             self.result.id_token = idt
 
         logger.debug(
@@ -886,6 +919,16 @@ class AuthFlow:
         # 调用点全是 self._env_flag(...)，签名不变。
         return self._get_env(name, default).lower() in ("1", "true", "yes", "on")
 
+    def _restore_codex_token_family(self) -> None:
+        """在流程返回前恢复 Codex AT/ID，防止 Web session 刷新覆盖主字段。"""
+        codex_access = str(getattr(self, "_codex_access_token", "") or "").strip()
+        if not codex_access:
+            return
+        self.result.access_token = codex_access
+        codex_id = str(getattr(self, "_codex_id_token", "") or "").strip()
+        if codex_id:
+            self.result.id_token = codex_id
+
     @staticmethod
     def _b64url_no_pad(raw: bytes) -> str:
         return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
@@ -921,7 +964,7 @@ class AuthFlow:
         构建用于获取 refresh_token 的 Codex OAuth 授权 URL。
         参考 any-auto-register 的实现：独立 client_id + redirect_uri + 可控 PKCE。
         """
-        client_id = (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip() or "app_EMoamEEZ73f0CkXaXp7hrann"
+        client_id = (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip() or CODEX_OAUTH_CLIENT_ID
         redirect_uri = (os.getenv("OAUTH_CODEX_REDIRECT_URI", "") or "").strip() or "http://localhost:1455/auth/callback"
         scope = (os.getenv("OAUTH_CODEX_SCOPE", "") or "").strip() or "openid email profile offline_access"
         state = self._b64url_no_pad(secrets.token_bytes(24))
@@ -1107,9 +1150,17 @@ class AuthFlow:
             return False
         self._codex_exchange_error_code = ""
         data = resp.json() if resp is not None else {}
-        self.result.id_token = data.get("id_token", self.result.id_token)
-        self.result.access_token = data.get("access_token", self.result.access_token)
-        self.result.refresh_token = data.get("refresh_token", self.result.refresh_token)
+        codex_access = str(data.get("access_token") or "").strip()
+        codex_id = str(data.get("id_token") or "").strip()
+        codex_refresh = str(data.get("refresh_token") or "").strip()
+        if codex_access:
+            self._codex_access_token = codex_access
+            self.result.access_token = codex_access
+        if codex_id:
+            self._codex_id_token = codex_id
+            self.result.id_token = codex_id
+        if codex_refresh:
+            self.result.refresh_token = codex_refresh
         logger.info(
             "Codex OAuth 交换成功: access=%s refresh=%s",
             "有" if self.result.access_token else "无",
@@ -4860,14 +4911,19 @@ class AuthFlow:
         except Exception:
             return ""
 
-    def get_auth_session(self) -> tuple[str, str]:
+    def get_auth_session(self, *, preserve_codex_access: bool = True) -> tuple[str, str]:
         """获取 session_token 和 access_token。
 
         session_token 三路兜底（按优先级）：
           1. cookie `__Secure-next-auth.session-token`（NextAuth 数据库 session 策略）
           2. JSON 响应里的 `sessionToken` 字段（NextAuth JWT session 策略，某些路径）
           3. 兼容大小写 / 下划线变体
-        access_token 取 JSON 响应里的 `accessToken`。
+        access_token 取 JSON 响应里的 `accessToken`。如果当前 flow 已经完成
+        Codex OAuth 交换，默认只更新 Web token 的内部副本，不覆盖
+        ``result.access_token`` 中的 Codex token，避免最终落库形成混合 token 对。
+
+        ``preserve_codex_access=False`` 仅用于明确需要把主字段切回 Web token
+        的旧调用方；正常注册/登录流程不应关闭保护。
         """
         first_call = not getattr(self, "_auth_session_fetched", False)
         self._auth_session_fetched = True
@@ -4912,7 +4968,13 @@ class AuthFlow:
             except Exception:
                 pass
         if access_token:
-            self.result.access_token = access_token
+            self._web_access_token = access_token
+            if not (preserve_codex_access and getattr(self, "_codex_access_token", "")):
+                self.result.access_token = access_token
+            else:
+                logger.debug(
+                    "保留 Codex access_token，未被 get_auth_session 的 Web token 覆盖"
+                )
         self.result.cookie_header = self._build_chatgpt_cookie_header()
 
         _log = logger.info if first_call else logger.debug
@@ -5064,9 +5126,34 @@ class AuthFlow:
             self._trace_http(f"oauth_token_exchange_{mode}", resp, extra_request=extra_request)
             if resp.status_code == 200:
                 data = resp.json()
-                self.result.id_token = data.get("id_token", "")
-                self.result.access_token = data.get("access_token", self.result.access_token)
-                self.result.refresh_token = data.get("refresh_token", "")
+                codex_access = str(data.get("access_token") or "").strip()
+                codex_id = str(data.get("id_token") or "").strip()
+                codex_refresh = str(data.get("refresh_token") or "").strip()
+                try:
+                    access_part = codex_access.split(".")[1]
+                    access_part += "=" * (-len(access_part) % 4)
+                    access_claims = json.loads(
+                        base64.urlsafe_b64decode(access_part.encode("utf-8"))
+                    )
+                except Exception:
+                    access_claims = {}
+                token_client_id = str(
+                    access_claims.get("client_id") or form.get("client_id") or ""
+                ).strip()
+                is_codex_token = token_client_id == CODEX_OAUTH_CLIENT_ID
+                if codex_access and is_codex_token:
+                    self._codex_access_token = codex_access
+                    self.result.access_token = codex_access
+                elif codex_access:
+                    self._web_access_token = codex_access
+                    self.result.access_token = codex_access
+                if codex_id and is_codex_token:
+                    self._codex_id_token = codex_id
+                    self.result.id_token = codex_id
+                elif codex_id:
+                    self.result.id_token = codex_id
+                if codex_refresh:
+                    self.result.refresh_token = codex_refresh
                 logger.info(
                     "Token 交换成功(mode=%s): refresh_token=%s",
                     mode,
@@ -7337,13 +7424,17 @@ class AuthFlow:
                 logger.warning("Camoufox session_ready 回调失败（不影响注册）: %s", exc)
         if (
             want_refresh_token
-            and not self.result.refresh_token
+            and not (
+                getattr(self, "_codex_access_token", "")
+                and self.result.refresh_token
+            )
             and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0")
             and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1")
         ):
             _check_deadline("oauth_rt_exchange")
             self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             self.get_auth_session()
+        self._restore_codex_token_family()
         if not self.result.is_valid():
             raise RuntimeError("Camoufox 注册完成但未获取有效 access/session token")
         logger.info("[camoufox] 注册流程完成 email=%s", email)
@@ -7747,7 +7838,10 @@ class AuthFlow:
             #    跳过后 Codex 落到后面那个调用点（get_auth_session 之后），顺序才是
             #    创建账户 → 重定向链 → 拿 session → 绑 2FA → Codex 授权 → 接码。
             if (
-                (not self.result.refresh_token)
+                not (
+                    getattr(self, "_codex_access_token", "")
+                    and self.result.refresh_token
+                )
                 and self._on_session_ready is None
                 and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1")
             ):
@@ -7802,14 +7896,23 @@ class AuthFlow:
             if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0") \
                     and not self._env_flag("SKIP_OAUTH_TOKEN_EXCHANGE", "0"):
                 self.oauth_token_exchange(callback_url or "", continue_url or "")
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
+            if not (
+                getattr(self, "_codex_access_token", "")
+                and self.result.refresh_token
+            ) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
+            if not (
+                getattr(self, "_codex_access_token", "")
+                and self.result.refresh_token
+            ) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
                 self.oauth_secondary_authorize_exchange()
-            # 最终再拉一次 session（Codex 流程可能更新 cookie/access_token）
+            # 最终再拉一次 session，只更新 Web session/cookie；get_auth_session
+            # 会保护已经交换出的 Codex access_token，避免再次混用 token family。
             if not refresh_only_mode:
+                # 仅同步 NextAuth session/cookie，不覆盖已经获得的 Codex AT。
                 self.get_auth_session()
 
+        self._restore_codex_token_family()
         if refresh_only_mode:
             if not (self.result.refresh_token or self.result.access_token):
                 raise RuntimeError("流程完成但未获取 refresh_token/access_token")
@@ -8119,7 +8222,10 @@ class AuthFlow:
         callback_url = ""
         if continue_url:
             continue_url = self._normalize_continue_url(continue_url)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
+            if not (
+                getattr(self, "_codex_access_token", "")
+                and self.result.refresh_token
+            ) and self._env_flag("OAUTH_CODEX_RT_BEFORE_CALLBACK", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             pre_exchange_default = "1" if refresh_only_mode else "0"
             pre_exchange = self._env_flag("OAUTH_EXCHANGE_BEFORE_CALLBACK", pre_exchange_default)
@@ -8154,13 +8260,20 @@ class AuthFlow:
             # RT 统一由下面独立的 Codex PKCE authorize 链获取。
             if self._env_flag("OAUTH_TOKEN_EXCHANGE_FROM_CALLBACK", "0"):
                 self.oauth_token_exchange(callback_url or "", continue_url or "")
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
+            if not (
+                getattr(self, "_codex_access_token", "")
+                and self.result.refresh_token
+            ) and self._env_flag("OAUTH_CODEX_RT_EXCHANGE", "1"):
                 self.oauth_codex_rt_exchange(mail_provider=mail_provider)
-            if (not self.result.refresh_token) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
+            if not (
+                getattr(self, "_codex_access_token", "")
+                and self.result.refresh_token
+            ) and self._env_flag("OAUTH_SECONDARY_AUTHORIZE_EXCHANGE", "0"):
                 self.oauth_secondary_authorize_exchange()
             if not refresh_only_mode:
                 self.get_auth_session()
 
+        self._restore_codex_token_family()
         if refresh_only_mode:
             if not (self.result.refresh_token or self.result.access_token):
                 raise RuntimeError("协议登录完成，但未拿到 refresh_token/access_token")
