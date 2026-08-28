@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -131,6 +132,7 @@ def _workspace_admin_request(
     interval = max(0.0, float(request_interval or 0.0))
     retries = max(0, int(max_429_retries or 0))
     request = getattr(session, str(method).strip().lower())
+    auth_refreshed = False
 
     with _workspace_admin_lock(key):
         for attempt in range(retries + 1):
@@ -169,6 +171,31 @@ def _workspace_admin_request(
                 with _workspace_admin_state_lock:
                     _workspace_admin_last_completed[key] = time.monotonic()
 
+            if response.status_code == 401 and not auth_refreshed:
+                refreshed = _refresh_workspace_access_token(key, session)
+                if refreshed:
+                    auth_refreshed = True
+                    current_headers = dict(kwargs.get("headers") or {})
+                    current_headers.update(_headers(refreshed, _workspace_external_id(key, fallback="")))
+                    # 保留调用方特有的 Referer/其他头，仅替换失效 Authorization
+                    # 和 account id。
+                    current_headers["Authorization"] = f"Bearer {refreshed}"
+                    kwargs["headers"] = current_headers
+                    logger.info(
+                        "母号管理请求已用 session token 刷新 access_token workspace_db_id=%s method=%s url=%s",
+                        key,
+                        str(method).upper(),
+                        str(url).split("?")[0],
+                    )
+                    continue
+                logger.warning(
+                    "母号管理请求鉴权失败 workspace_db_id=%s method=%s status=401 url=%s body=%s",
+                    key,
+                    str(method).upper(),
+                    str(url).split("?")[0],
+                    _response_debug_body(response),
+                )
+
             if response.status_code != 429:
                 with _workspace_admin_state_lock:
                     _workspace_admin_cooldown_until.pop(key, None)
@@ -202,6 +229,102 @@ def _safe_body(value) -> str:
     return text[:1200]
 
 
+def _response_debug_body(response) -> str:
+    """安全读取响应摘要，日志分支不能因非 JSON 响应再次抛异常。"""
+    try:
+        value = response.json() if hasattr(response, "json") else getattr(response, "text", "")
+    except Exception:
+        value = getattr(response, "text", "")
+    return _safe_body(value)
+
+
+def _workspace_external_id(workspace_db_id: int, fallback: str = "") -> str:
+    """返回母号的远端 Workspace ID；仅用于刷新凭证/构造请求头。"""
+    master = db.get_workspace_master(int(workspace_db_id)) or {}
+    return str(master.get("workspace_id") or fallback or "").strip()
+
+
+def _workspace_device_id(account_id: str) -> str:
+    """为管理端请求生成稳定的浏览器设备标识。"""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"workspace-admin:{account_id or 'unknown'}"))
+
+
+def _refresh_workspace_access_token(workspace_db_id: int, session) -> str:
+    """用母号保存的 NextAuth session cookie 换取新的 access token。"""
+    master = db.get_workspace_master(int(workspace_db_id)) or {}
+    session_token = str(master.get("session_token") or "").strip()
+    workspace_id = str(master.get("workspace_id") or "").strip()
+    if not session_token or not workspace_id:
+        logger.warning(
+            "母号 access_token 已失效且缺少 session_token/workspace_id，无法刷新 workspace_db_id=%s",
+            workspace_db_id,
+        )
+        return ""
+    try:
+        session.cookies.set(
+            "__Secure-next-auth.session-token",
+            session_token,
+            domain=".chatgpt.com",
+            path="/",
+        )
+        response = session.get(
+            f"{BASE}/api/auth/session",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": BASE,
+                "Referer": f"{BASE}/admin/members",
+                "oai-device-id": _workspace_device_id(workspace_id),
+            },
+            timeout=30,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            logger.warning(
+                "母号 session 刷新请求失败 workspace_db_id=%s status=%s body=%s",
+                workspace_db_id,
+                response.status_code,
+                _response_debug_body(response),
+            )
+            return ""
+        data = response.json() if hasattr(response, "json") else {}
+        access_token = str((data or {}).get("accessToken") or (data or {}).get("access_token") or "").strip()
+        if not access_token:
+            logger.warning(
+                "母号 session 刷新响应未返回 accessToken workspace_db_id=%s body=%s",
+                workspace_db_id,
+                _safe_body(data),
+            )
+            return ""
+        token_account = str(
+            (_payload(access_token).get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+            or ""
+        ).strip()
+        if token_account and token_account != workspace_id:
+            logger.warning(
+                "母号 session 刷新返回了其他 Workspace 的 accessToken workspace_db_id=%s expected=%s actual=%s",
+                workspace_db_id,
+                workspace_id,
+                token_account,
+            )
+            return ""
+        new_session_token = ""
+        try:
+            cookie_value = session.cookies.get("__Secure-next-auth.session-token")
+            if isinstance(cookie_value, str) and cookie_value.strip():
+                new_session_token = cookie_value.strip()
+        except Exception:
+            new_session_token = ""
+        db.update_workspace_master_auth(
+            workspace_db_id,
+            access_token,
+            new_session_token or None,
+        )
+        return access_token
+    except Exception:
+        logger.exception("母号 session 刷新异常 workspace_db_id=%s", workspace_db_id)
+        return ""
+
+
 def _payload(token: str) -> dict:
     try:
         part = token.split('.')[1]
@@ -217,7 +340,8 @@ def _headers(token: str, account_id: str) -> dict:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Origin": BASE,
-        "Referer": f"{BASE}/admin/{account_id}",
+        "Referer": f"{BASE}/admin/members",
+        "oai-device-id": _workspace_device_id(account_id),
     }
 
 
@@ -242,8 +366,8 @@ def invite_candidates(workspace_db_id: int, emails: list[str], seat_type: str = 
     token = master.get("access_token") or ""
     if not workspace_id or not token:
         raise RuntimeError("母号缺少 Workspace ID 或 Access Token，请重新导入完整 session.json")
-    if seat_type not in {"default", "usage_based"}:
-        raise ValueError("席位类型只能是标准席位或 Usage-based")
+    if seat_type not in {"default", "usage_based", "prolite"}:
+        raise ValueError("席位类型只能是标准席位、Usage-based 或 ProLite")
     logger.info("母号批量邀请开始 workspace_db_id=%s workspace_id=%s seat_type=%s count=%s emails=%s", workspace_db_id, workspace_id, seat_type, len(emails), emails[:20])
     try:
         response = _workspace_admin_request(
@@ -535,16 +659,21 @@ def fetch_candidate_seats_bulk(
     return out
 
 def update_member_seat_type(workspace_db_id: int, member_id: str, seat_type: str) -> dict:
-    if seat_type not in {"default", "usage_based"}: raise ValueError("席位类型只能是 default 或 usage_based")
+    if seat_type not in {"default", "usage_based", "prolite"}: raise ValueError("席位类型只能是 default、usage_based 或 prolite")
     session, master = create_workspace_http_session(workspace_db_id)
     wid, token = master.get("workspace_id") or "", master.get("access_token") or ""
     response = _workspace_admin_request(
         workspace_db_id,
         session,
-        "patch",
-        f"{BASE}/backend-api/accounts/{wid}/users/{member_id}",
+        "post",
+        f"{BASE}/backend-api/accounts/{wid}/users/{member_id}/seat/update",
         headers={**_headers(token, wid), "Referer": f"{BASE}/admin/members"},
-        json={"seat_type": seat_type},
+        json={
+            "operation": "switch",
+            "seat_type": seat_type,
+            "flow_id": str(uuid.uuid4()),
+            "mutation_attempt_id": str(uuid.uuid4()),
+        },
         timeout=30,
     )
     data = _json(response)
@@ -558,6 +687,8 @@ def _canonical_candidate_seat_type(value: object) -> str:
         return "usage_based"
     if normalized in {"default", "standard", "standard_seat", "gpt"} or "gpt席位" in normalized or "标准席位" in normalized:
         return "default"
+    if normalized in {"prolite", "pro_lite"}:
+        return "prolite"
     return normalized
 
 
@@ -677,23 +808,16 @@ def _ensure_candidate_usage_based(workspace_db_id: int, email: str, row: dict | 
         if attempt < 2:
             time.sleep(5)
 
-    # 上游可能已经成功切换，但查询有延迟；此时先把本地快照纠正为
-    # usage_based，避免垃圾箱列表继续显示旧席位。
+    # 查询始终未确认 usage_based 时，不能把本地缓存“猜成” Codex。
+    # 垃圾箱调用方会据此判定失败并保留原候选状态，等待下一轮重试。
     logger.warning(
-        "垃圾箱席位复查延迟，强制刷新本地快照 workspace_db_id=%s email=%s final_seat=%s last_error=%s",
+        "垃圾箱席位复查未确认 usage_based workspace_db_id=%s email=%s final_seat=%s last_error=%s",
         workspace_db_id,
         email,
         refreshed.get("raw_seat_type") or refreshed.get("seat_type") or "unknown",
         last_error,
     )
-    db.update_workspace_candidate_seats(workspace_db_id, email, "Codex席位", "")
-    db.update_workspace_candidate_member(workspace_db_id, email, member_id, "usage_based")
-    return _refresh_candidate_seat_snapshot(workspace_db_id, email) or {
-        "member_id": member_id,
-        "raw_seat_type": "usage_based",
-        "codex_seat": "Codex席位",
-        "gpt_seat": "",
-    }
+    return refreshed or {"member_id": member_id}
 
 
 def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = "", retries: int = 3) -> dict:
@@ -702,6 +826,35 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
     if not email:
         return {"ok": False, "error": "email 不能为空"}
     row = db.get_workspace_candidate(workspace_db_id, email) or {}
+    try:
+        seat = _ensure_candidate_usage_based(workspace_db_id, email, row=row, retries=retries)
+    except Exception as exc:
+        logger.warning(
+            "候选人移入垃圾箱前席位切换失败 workspace_db_id=%s email=%s error=%s",
+            workspace_db_id, email, str(exc)[:240],
+        )
+        return {"ok": False, "pending_seat": True, "error": str(exc)}
+    final_seat = _canonical_candidate_seat_type(
+        (seat or {}).get("raw_seat_type")
+        or (seat or {}).get("seat_type")
+        or (seat or {}).get("seat_label")
+        or (seat or {}).get("codex_seat")
+        or (seat or {}).get("gpt_seat")
+    )
+    if final_seat != "usage_based":
+        logger.warning(
+            "候选人移入垃圾箱失败：未确认 usage_based workspace_db_id=%s email=%s seat=%s",
+            workspace_db_id,
+            email,
+            (seat or {}).get("raw_seat_type") or (seat or {}).get("seat_type") or "unknown",
+        )
+        return {
+            "ok": False,
+            "pending_seat": True,
+            "error": "席位未确认切换为 Codex（usage based），不会移入垃圾箱",
+            "seat": seat,
+        }
+    # 只有远端复查确认 usage_based 后，才允许改变垃圾箱状态。
     db.update_workspace_candidate_trash(
         workspace_db_id,
         email,
@@ -709,18 +862,16 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
         reason=reason or "manual",
         due_at=0,
     )
-    try:
-        seat = _ensure_candidate_usage_based(workspace_db_id, email, row=row, retries=retries)
-    except Exception as exc:
-        logger.warning(
-            "候选人已入垃圾箱但席位切换待重试 workspace_db_id=%s email=%s error=%s",
-            workspace_db_id, email, str(exc)[:240],
-        )
-        return {"ok": False, "pending_seat": True, "error": str(exc)}
     return {"ok": True, "seat": seat}
 
 
-def trash_workspace_candidates_by_email(email: str, reason: str = "", retries: int = 3) -> dict:
+def trash_workspace_candidates_by_email(
+    email: str,
+    reason: str = "",
+    retries: int = 3,
+    *,
+    respect_invalid_settings: bool = False,
+) -> dict:
     """将该邮箱在所有母号空间中的候选关系都移入垃圾箱。"""
     key = str(email or "").strip().lower()
     if not key:
@@ -731,11 +882,24 @@ def trash_workspace_candidates_by_email(email: str, reason: str = "", retries: i
         workspace_db_id = int(row.get("workspace_master_id") or 0)
         if not workspace_db_id:
             continue
+        if respect_invalid_settings and not db.get_workspace_settings(workspace_db_id).get(
+            "trash_invalid_enabled", True,
+        ):
+            results.append({"workspace_db_id": workspace_db_id, "ok": True, "skipped": True})
+            continue
         try:
+            result = trash_workspace_candidate(
+                workspace_db_id,
+                key,
+                reason=reason,
+                retries=retries,
+            )
             results.append({
                 "workspace_db_id": workspace_db_id,
-                "ok": True,
-                "seat": trash_workspace_candidate(workspace_db_id, key, reason=reason, retries=retries).get("seat", {}),
+                "ok": bool(result.get("ok")),
+                "seat": result.get("seat", {}),
+                "pending_seat": bool(result.get("pending_seat")),
+                "error": result.get("error", ""),
             })
         except Exception as exc:  # noqa: BLE001
             logger.exception("垃圾箱处理失败 workspace_db_id=%s email=%s", workspace_db_id, key)
@@ -743,7 +907,8 @@ def trash_workspace_candidates_by_email(email: str, reason: str = "", retries: i
     return {
         "ok": not any(not item.get("ok") for item in results),
         "results": results,
-        "trashed": sum(1 for item in results if item.get("ok")),
+        "trashed": sum(1 for item in results if item.get("ok") and not item.get("skipped")),
+        "skipped": sum(1 for item in results if item.get("skipped")),
         "failed": sum(1 for item in results if not item.get("ok")),
     }
 
@@ -795,8 +960,8 @@ def request_join(workspace_db_id: int, candidate: dict, proxy: str, seat_type: s
     if not master or not master.get("workspace_id"): raise RuntimeError("母号缺少 Workspace ID")
     candidate_account = (_payload(token).get("https://api.openai.com/auth") or {}).get("chatgpt_account_id") or ""
     email = candidate.get("email") or ""
-    if seat_type not in {"default", "usage_based"}:
-        raise ValueError("席位类型只能是标准席位或 Usage-based")
+    if seat_type not in {"default", "usage_based", "prolite"}:
+        raise ValueError("席位类型只能是标准席位、Usage-based 或 ProLite")
     logger.info("子号申请加入开始 workspace_db_id=%s workspace_id=%s email=%s candidate_account_id=%s seat_type=%s proxy_configured=%s", workspace_db_id, master['workspace_id'], email, candidate_account, seat_type, bool(str(proxy or '').strip()))
     try:
         proxy_value = str(proxy or "").strip()
@@ -834,7 +999,37 @@ def sync_seat_info(workspace_db_id: int) -> dict:
     ))
     in_use = usage.get("seats_in_use")
     entitled = usage.get("seats_entitled")
-    result = {"seats_in_use": in_use, "seats_entitled": entitled, "seats_default": None, "seats_usage_based": None, "seat_cost": "", "renewal_date": ""}
+    result = {
+        "seats_in_use": in_use,
+        "seats_entitled": entitled,
+        "seats_default": None,
+        "seats_default_entitled": None,
+        "seats_usage_based": None,
+        "seats_prolite": None,
+        "seats_prolite_entitled": None,
+        "seat_cost": "",
+        "renewal_date": "",
+    }
+    # 新版 subscriptions 响应按席位类型返回订阅容量。default 与
+    # prolite 都属于已购订阅席位，但必须分别保存，不能只使用总数
+    # seats_entitled（例如 HAR 中分别购买 4+4，合计为 8）。
+    seat_capacity = usage.get("seat_capacity") if isinstance(usage, dict) else None
+    if isinstance(seat_capacity, list):
+        paid_by_type = {}
+        for item in seat_capacity:
+            if not isinstance(item, dict):
+                continue
+            seat_type = _canonical_candidate_seat_type(item.get("type"))
+            if seat_type not in {"default", "prolite"}:
+                continue
+            try:
+                paid_by_type[seat_type] = int(item.get("paid") or 0)
+            except (TypeError, ValueError):
+                paid_by_type[seat_type] = 0
+        result["seats_default_entitled"] = paid_by_type.get("default", 0)
+        result["seats_prolite_entitled"] = paid_by_type.get("prolite", 0)
+        if entitled is None:
+            result["seats_entitled"] = sum(paid_by_type.values())
     counts = _json(_workspace_admin_request(
         workspace_db_id,
         session,
@@ -847,7 +1042,8 @@ def sync_seat_info(workspace_db_id: int) -> dict:
     if isinstance(seat_counts, dict):
         result["seats_default"] = int(seat_counts.get("default") or 0)
         result["seats_usage_based"] = int(seat_counts.get("usage_based") or 0)
-        logger.info("席位分类同步 workspace_db_id=%s workspace_id=%s default=%s usage_based=%s automation=%s", workspace_db_id, workspace_id, result["seats_default"], result["seats_usage_based"], seat_counts.get("automation", 0))
+        result["seats_prolite"] = int(seat_counts.get("prolite") or 0)
+        logger.info("席位分类同步 workspace_db_id=%s workspace_id=%s default=%s usage_based=%s prolite=%s automation=%s", workspace_db_id, workspace_id, result["seats_default"], result["seats_usage_based"], result["seats_prolite"], seat_counts.get("automation", 0))
     if entitled is not None:
         preview = _json(_workspace_admin_request(
             workspace_db_id,

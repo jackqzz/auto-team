@@ -195,8 +195,8 @@ onActivated(() => load())
         </el-table-column>
         <el-table-column label="席位数量" width="250">
           <template #default="{ row }">
-            <div>{{ row.seats_default ?? '-' }} / {{ row.seats_entitled ?? '-' }} / {{ row.seats_usage_based ?? '-' }}</div>
-            <div class="hint">标准成员 / 标准已购 / Usage-based 成员</div>
+            <div>标准 {{ row.seats_default ?? '-' }} / {{ row.seats_default_entitled ?? '-' }} · ProLite {{ row.seats_prolite ?? '-' }} / {{ row.seats_prolite_entitled ?? '-' }} · Codex {{ row.seats_usage_based ?? '-' }}</div>
+            <div class="hint">成员数 / 已购数（标准、ProLite 为订阅席位；Codex=Usage-based）</div>
           </template>
         </el-table-column>
         <el-table-column prop="seat_cost" label="席位费用" width="130"><template #default="{row}">{{ row.seat_cost || '未同步' }}</template></el-table-column>

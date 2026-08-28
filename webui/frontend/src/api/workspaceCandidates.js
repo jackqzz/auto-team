@@ -1,5 +1,6 @@
 import http from './request'
 export const listCandidateOptions = (workspace_id, params = {}) => http.get('/api/workspace-candidates/options', { params: { workspace_id, ...params } })
+export const listCandidateGroups = (workspace_id) => http.get('/api/workspace-candidates/groups', { params: { workspace_id } })
 export const listCandidates = (workspace_id) => http.get('/api/workspace-candidates', { params: { workspace_id } })
 export const assignCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/assign', { workspace_id, emails })
 export const removeCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/remove', { workspace_id, emails })
@@ -19,4 +20,6 @@ export const autoStandardSeatScheduleStatus = (workspace_id) => http.get('/api/w
 export const listWorkspaceTaskLogs = (workspace_id, limit = 120) => http.get('/api/workspace-candidates/task-logs', { params: { workspace_id, limit } })
 export const saveCandidateSettings = (payload) => http.post('/api/workspace-candidates/settings', payload)
 export const fetchWorkspaceCredentials = (workspace_id, emails, proxy_pool, seat_type = 'default', auto_push = false, params = {}) => http.post('/api/workspace-candidates/credentials', { workspace_id, emails, proxy_pool, seat_type, auto_push, ...params })
+export const loginOnlyWorkspace = (workspace_id, emails, proxy_pool, seat_type = 'default', params = {}) => http.post('/api/workspace-candidates/login-only', { workspace_id, emails, proxy_pool, seat_type, ...params })
 export const trashCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/trash', { workspace_id, emails })
+export const restoreCandidatesFromTrash = (workspace_id, emails) => http.post('/api/workspace-candidates/trash/restore', { workspace_id, emails })

@@ -146,8 +146,11 @@ SMS_DEFAULT_SERVICE = "dr"
 SMS_DEFAULT_COUNTRY = "52"  # Thailand —— OpenAI 走 SMS 的稳定国家
 SMS_PHONE_LIFETIME = 20 * 60  # 号码租用窗口（秒）
 _SMS_CACHE_LOCK = threading.Lock()
-_SMS_VERIFY_LOCK = threading.RLock()
 _SMS_CACHE: Optional[dict] = None  # 跨线程共享的号码复用缓存
+# 不再用一把锁包住整个“租号→等码→验证”生命周期。这里只记录当前进程中
+# 正在使用的 activation，锁只保护集合和复用缓存的短事务，避免 12 并发被
+# 第一个手机号的 80 秒等待串行阻塞。
+_SMS_ACTIVE_ACTIVATIONS: set[str] = set()
 
 # OpenAI 走纯 SMS 的国家白名单（截至 2025-2026 实测；其它国家会抽到 WhatsApp 号）
 OPENAI_SMS_COUNTRIES = {"52"}  # Thailand only
@@ -547,66 +550,87 @@ class SmsBowerProvider(BaseSmsProvider):
         if not country_candidates:
             country_candidates = [str(country or self.default_country or SMS_DEFAULT_COUNTRY).strip()]
 
-        with _SMS_VERIFY_LOCK:
-            with _SMS_CACHE_LOCK:
-                # 复用 cache（仅当用户许可且 cache 国家在候选列表里）
-                cache = self._load_cache(service_code, country_candidates[0]) if self.reuse_phone_to_max else None
-                if cache and str(cache.get("country") or "") in country_candidates:
+        # 复用缓存只做短事务；网络租号绝不能在全局锁内执行。
+        with _SMS_CACHE_LOCK:
+            cache = (
+                self._load_cache(service_code, country_candidates[0])
+                if self.reuse_phone_to_max else None
+            )
+            cache_activation_id = str(cache.get("activation_id") or "") if cache else ""
+            if (
+                cache
+                and str(cache.get("country") or "") in country_candidates
+                and cache_activation_id not in _SMS_ACTIVE_ACTIVATIONS
+            ):
+                _SMS_ACTIVE_ACTIVATIONS.add(cache_activation_id)
+                activation = SmsActivation(
+                    activation_id=cache_activation_id,
+                    phone_number=str(cache["phone_number"]),
+                    country=str(cache.get("country") or country_candidates[0]),
+                    metadata={
+                        "reused": True,
+                        "cache_managed": True,
+                        "use_count": int(cache.get("use_count") or 0),
+                    },
+                )
+                self.current_activation = activation
+                return activation
+
+        # 双重 for：外层国家 × 内层 action（V2 / V1）。不同任务可以在这里
+        # 并行租号；只有下面写入共享缓存的短事务再次加锁。
+        failures: list[str] = []
+        last_exc: Optional[Exception] = None
+        for cid in country_candidates:
+            cid = str(cid).strip()
+            if not cid:
+                continue
+            for action in ("getNumberV2", "getNumber"):
+                try:
+                    info = self._request_number_single_action(action, service_code, cid)
+                    aid = str(info.get("activationId") or "")
+                    phone = self._format_phone(info)
+                    if not aid or not phone.strip("+"):
+                        failures.append(f"{cid}: {action} 返回信息不完整")
+                        continue  # 同国家试下个 action
+                    cache = {
+                        **self._cache_identity(service_code, cid),
+                        "country": cid,
+                        "activation_id": aid,
+                        "phone_number": phone,
+                        "acquired_at": time.time(),
+                        "use_count": 0,
+                        "used_codes": set(),
+                        "reuse_stopped": False,
+                        "stop_reason": "",
+                    }
+                    with _SMS_CACHE_LOCK:
+                        # 只有没有其他 activation 占用复用缓存时，当前号码才
+                        # 成为下一个可复用号码；并发号码仍正常完成/退款。
+                        cache_managed = not _SMS_ACTIVE_ACTIVATIONS
+                        if cache_managed and self.reuse_phone_to_max:
+                            self._save_cache(cache)
+                        _SMS_ACTIVE_ACTIVATIONS.add(aid)
                     activation = SmsActivation(
-                        activation_id=str(cache["activation_id"]),
-                        phone_number=str(cache["phone_number"]),
-                        country=str(cache.get("country") or country_candidates[0]),
-                        metadata={"reused": True, "use_count": int(cache.get("use_count") or 0)},
+                        activation_id=aid,
+                        phone_number=phone,
+                        country=cid,
+                        metadata={
+                            "reused": False,
+                            "cache_managed": bool(cache_managed and self.reuse_phone_to_max),
+                        },
                     )
                     self.current_activation = activation
+                    if len(country_candidates) > 1:
+                        logger.info("SmsBower 在国家 %s 租到号 %s (action=%s)", cid, phone, action)
                     return activation
+                except Exception as e:
+                    msg = str(e)[:120]
+                    failures.append(f"{cid}: {action}={msg}")
+                    last_exc = e
+                    continue  # 同国家试下个 action
 
-                # 双重 for：外层国家 × 内层 action（V2 / V1）
-                failures: list[str] = []
-                last_exc: Optional[Exception] = None
-                for cid in country_candidates:
-                    cid = str(cid).strip()
-                    if not cid:
-                        continue
-                    for action in ("getNumberV2", "getNumber"):
-                        try:
-                            info = self._request_number_single_action(action, service_code, cid)
-                            aid = str(info.get("activationId") or "")
-                            phone = self._format_phone(info)
-                            if not aid or not phone.strip("+"):
-                                failures.append(f"{cid}: {action} 返回信息不完整")
-                                continue  # 同国家试下个 action
-                            # 成功 → 立刻保存 cache + 返回
-                            cache = {
-                                **self._cache_identity(service_code, cid),
-                                "country": cid,
-                                "activation_id": aid,
-                                "phone_number": phone,
-                                "acquired_at": time.time(),
-                                "use_count": 0,
-                                "used_codes": set(),
-                                "reuse_stopped": False,
-                                "stop_reason": "",
-                            }
-                            self._save_cache(cache)
-                            activation = SmsActivation(
-                                activation_id=aid,
-                                phone_number=phone,
-                                country=cid,
-                                metadata={"reused": False},
-                            )
-                            self.current_activation = activation
-                            if len(country_candidates) > 1:
-                                logger.info("SmsBower 在国家 %s 租到号 %s (action=%s)", cid, phone, action)
-                            return activation
-                        except Exception as e:
-                            msg = str(e)[:120]
-                            failures.append(f"{cid}: {action}={msg}")
-                            last_exc = e
-                            continue  # 同国家试下个 action
-
-                detail = " | ".join(failures) if failures else "未知"
-                raise RuntimeError(f"SmsBower 依次尝试 {len(country_candidates)} 个候选国家全失败: {detail}") from last_exc
+        detail = " | ".join(failures) if failures else "未知"
+        raise RuntimeError(f"SmsBower 依次尝试 {len(country_candidates)} 个候选国家全失败: {detail}") from last_exc
 
     # ---- 等 code / 状态查询 ----
 
@@ -726,6 +750,7 @@ class SmsBowerProvider(BaseSmsProvider):
             cache = _SMS_CACHE
             if cache and str(cache.get("activation_id")) == str(activation_id):
                 self._clear_cache()
+            _SMS_ACTIVE_ACTIVATIONS.discard(str(activation_id))
         return ok
 
     def report_success(self, activation_id: str) -> bool:
@@ -733,7 +758,14 @@ class SmsBowerProvider(BaseSmsProvider):
             cache = _SMS_CACHE
             should_finish = False
             should_clear = False
-            if cache and str(cache.get("activation_id")) == str(activation_id):
+            activation = self.current_activation
+            cache_managed = bool(
+                activation
+                and str(activation.activation_id) == str(activation_id)
+                and (activation.metadata or {}).get("cache_managed")
+            )
+            cache_matches = cache and str(cache.get("activation_id")) == str(activation_id)
+            if cache_managed and cache_matches:
                 cache["use_count"] = int(cache.get("use_count") or 0) + 1
                 if self.last_code_result and self.last_code_result.get("code"):
                     used = set(cache.get("used_codes") or [])
@@ -754,8 +786,13 @@ class SmsBowerProvider(BaseSmsProvider):
                 self._save_cache(cache)
                 if should_clear:
                     self._clear_cache()
+            else:
+                # 并发租到的号码不会进入共享复用缓存，成功后始终结算并关闭
+                # 当前 activation，不能因为缓存被其他任务占用而跳过 finish。
+                should_finish = True
+            _SMS_ACTIVE_ACTIVATIONS.discard(str(activation_id))
         try:
-            if should_finish or not (cache and str(cache.get("activation_id")) == str(activation_id)):
+            if should_finish or not cache_matches:
                 resp = self._request({"action": "finishActivation", "id": activation_id})
                 return resp.status_code in (200, 204) or "ACCESS" in resp.text
         except Exception:
@@ -808,6 +845,7 @@ class SmsBowerProvider(BaseSmsProvider):
                 cache["stop_reason"] = reason or "phone rejected"
                 self._save_cache(cache)
                 self._clear_cache()
+            _SMS_ACTIVE_ACTIVATIONS.discard(str(activation_id))
 
     def set_resend_callback(self, callback: Optional[Callable[[], None]]) -> None:
         self._resend_callback = callback
@@ -905,10 +943,6 @@ class PhoneCallbackController:
     def get_phone(self) -> str:
         """阶段 1：租手机号（已带 +）。"""
         provider = self._provider()
-        # 同号复用锁（SmsBower 系列才用，防止两个注册任务并发抢同一个 cache）
-        if isinstance(provider, SmsBowerProvider) and not self._verify_lock_acquired:
-            _SMS_VERIFY_LOCK.acquire()
-            self._verify_lock_acquired = True
 
         # 收集候选国家列表：用户多选 > 自动选号选出的 best > 单一 country
         allowed_raw = str(self.config.get("sms_allowed_countries") or "").strip()
@@ -972,7 +1006,6 @@ class PhoneCallbackController:
                 country_candidates=country_candidates,
             )
         except Exception as exc:
-            self._release_lock()
             raise
 
         reused = bool((self.activation.metadata or {}).get("reused"))
@@ -1045,12 +1078,9 @@ class PhoneCallbackController:
         self._release_lock()
 
     def _release_lock(self) -> None:
-        if self._verify_lock_acquired:
-            try:
-                _SMS_VERIFY_LOCK.release()
-            except RuntimeError:
-                pass
-            self._verify_lock_acquired = False
+        # 兼容旧调用方；短信锁已改为 activation 级占用，不再存在整个验证
+        # 生命周期的全局锁。
+        self._verify_lock_acquired = False
 
 
 # ---------------------------------------------------------------------------

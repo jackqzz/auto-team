@@ -766,8 +766,10 @@ def _do_register(
                     f"[register] 2FA 绑定异常（账号仍有效）: {e}"
                 )
         # 空间凭证任务必须校验 AT 真正属于目标 Workspace，避免把 Personal 凭证误存。
+        # 仅登录（skip OAuth）时不获取 AT，跳过校验和空间凭证保存。
         target_workspace = str(options.get("workspace_id") or "").strip()
-        if target_workspace:
+        _skip_workspace_credential = not options.get("want_access_token", True)
+        if target_workspace and not _skip_workspace_credential:
             try:
                 part = str(d.get("access_token") or "").split(".")[1]
                 payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
@@ -779,7 +781,7 @@ def _do_register(
             logging.getLogger("registrar").info("[workspace] 目标空间凭证校验通过 workspace_id=%s", target_workspace)
         # Team 空间凭证与账号原有的 Personal/Free 凭证分开保存：同一账号可加入多个空间，
         # 不能用 save_registered 覆盖原凭证。
-        if target_workspace:
+        if target_workspace and not _skip_workspace_credential:
             master = db.get_workspace_master_by_external_id(target_workspace)
             if not master:
                 raise RuntimeError(f"找不到目标空间记录 workspace={target_workspace}")
@@ -809,7 +811,7 @@ def _do_register(
         # Codex/Usage-based 成员不进入自动推送号池。Team 凭证仍然正常保存，
         # 但自动导出只对标准席位生效；手动导出接口不受此限制。
         skip_auto_export = False
-        if target_workspace:
+        if target_workspace and not _skip_workspace_credential:
             from . import workspace_membership
 
             try:
@@ -875,11 +877,8 @@ def _do_register(
         err = str(e)
         category = classify_error(err, mail_source)
         logging.getLogger("registrar").error(f"[register] 失败 (category={category}): {err}")
-        # ⚠️ 密码是在 register_password 里现生成的，只活在内存里。
-        #    走到这里说明 save_registered 没执行过 —— 但 POST user/register 可能**已经成功**，
-        #    OpenAI 那边账号连同这个密码已经建好了，只是后续步骤（发码/验证/建账户）挂了。
-        #    不打出来的话这个号就成了谁也登不进去的孤儿。这里只写日志不落库，
-        #    避免把没有任何 token 的半成品塞进「注册结果」表里。
+        # ⚠️ 密码候选在 register_password/Camoufox 提交前就已早落盘；这里
+        #    只保留日志兜底，避免把没有任何 token 的半成品重复写入结果表。
         try:
             _pw = (flow.result.password or "").strip()
             if _pw:
@@ -971,18 +970,29 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
         except Exception:
             pass
 
+    target_workspace_id = str((options or {}).get("workspace_id") or "").strip()
+
+    def _persist_refreshed_tokens(fresh_cred: dict) -> None:
+        if target_workspace_id:
+            master = db.get_workspace_master_by_external_id(target_workspace_id)
+            if not master:
+                raise RuntimeError(f"找不到刷新 token 对应的空间记录: {target_workspace_id}")
+            db.save_workspace_credential(master["id"], fresh_cred)
+            return
+        db.update_registered_oauth_tokens(
+            fresh_cred.get("email", ""),
+            access_token=fresh_cred.get("access_token", ""),
+            refresh_token=fresh_cred.get("refresh_token", ""),
+            id_token=fresh_cred.get("id_token", ""),
+        )
+
     try:
         results = exporter.run_exports(
             cred,
             cpa_cfg=cfg.get("cpa") if cpa_enabled else None,
             sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
             log_fn=_log,
-            on_tokens_refreshed=lambda fresh_cred: db.update_registered_oauth_tokens(
-                fresh_cred.get("email", ""),
-                access_token=fresh_cred.get("access_token", ""),
-                refresh_token=fresh_cred.get("refresh_token", ""),
-                id_token=fresh_cred.get("id_token", ""),
-            ),
+            on_tokens_refreshed=_persist_refreshed_tokens,
             refresh_oauth=bool((options or {}).get("export_refresh_oauth", False)),
         )
     except Exception as e:

@@ -15,6 +15,7 @@ function accountFields(account) {
     email: text(credentials.email || raw.email || raw.name || extra.email).toLowerCase(),
     accessToken: text(credentials.access_token || raw.access_token),
     refreshToken: text(credentials.refresh_token || raw.refresh_token),
+    sessionToken: text(credentials.session_token || raw.session_token),
     idToken: text(credentials.id_token || raw.id_token),
     workspaceId: text(
       credentials.chatgpt_account_id
@@ -27,6 +28,7 @@ function accountFields(account) {
     ),
     userId: text(credentials.chatgpt_user_id || raw.chatgpt_user_id),
     clientId: text(credentials.client_id || raw.client_id),
+    planType: text(credentials.plan_type || raw.plan_type || credentials.chatgpt_plan_type || raw.chatgpt_plan_type),
   }
 }
 
@@ -204,27 +206,82 @@ export function buildSub2ApiPayload(account, groupIds = [2]) {
     ? tokenExpiresAt
     : Math.floor(Date.now() / 1000) + SUB2API_DEFAULT_EXPIRES_IN
 
+  const accountId = text(accessAuth.chatgpt_account_id || fields.workspaceId)
+  const planType = text(accessAuth.chatgpt_plan_type || fields.planType) || 'free'
+  const workspaceIdValue = accountId || text(fields.workspaceId)
+  const expiresIn = Math.max(0, Math.floor(expiresAt - Date.now() / 1000))
+  const userId = text(accessAuth.chatgpt_user_id || accessAuth.user_id || fields.userId || accessPayload.sub)
+  const accountUserId = text(accessAuth.chatgpt_account_user_id)
+    || (userId && accountId ? `${userId}__${accountId}` : '')
+  const exportedAt = new Date().toISOString()
+  const expired = expiresAt ? new Date(expiresAt * 1000).toISOString() : ''
+  const displayName = text(profilePayload(accessPayload).name || fields.email)
+  const credExtra = {
+    email: fields.email,
+    source: 'internal_resource_exchange',
+    privacy_mode: 'training_off',
+    original_format: 'codex-account',
+    openai_oauth_responses_websockets_v2_mode: 'off',
+    openai_oauth_responses_websockets_v2_enabled: false,
+  }
+  const liveIdentity = {
+    plan: planType,
+    email: fields.email,
+    user_id: userId,
+    client_id: text(fields.clientId || accessPayload.client_id) || CODEX_CLIENT_ID,
+    account_id: accountId,
+    plan_source: 'oauth_access_token_claim',
+    verified_at: exportedAt,
+    email_source: 'oauth_userinfo_email',
+    official_plan: planType,
+    client_trusted: false,
+    email_verified: true,
+    user_id_source: 'oauth_access_token_claim',
+    account_user_id: accountUserId,
+    identity_source: 'oauth_access_token_claim',
+    account_id_source: 'oauth_access_token_claim',
+    account_user_id_source: 'oauth_access_token_claim',
+  }
+
   return {
     name: fields.email,
-    notes: '',
-    platform: 'openai',
     type: 'oauth',
+    extra: credExtra,
+    platform: 'openai',
+    priority: 1,
+    plan_type: planType,
+    concurrency: 10,
     credentials: {
+      name: displayName,
+      type: 'codex',
+      extra: credExtra,
+      expired,
+      disabled: false,
       access_token: fields.accessToken,
       refresh_token: fields.refreshToken,
-      expires_in: SUB2API_DEFAULT_EXPIRES_IN,
-      expires_at: expiresAt,
-      chatgpt_account_id: text(accessAuth.chatgpt_account_id || fields.workspaceId),
-      chatgpt_user_id: text(accessAuth.chatgpt_user_id || fields.userId),
+      session_token: text(fields.sessionToken),
+      expires_in: expiresIn,
+      expires_at: expired,
+      chatgpt_account_id: accountId,
+      chatgpt_user_id: userId,
       organization_id: organizationId,
-      client_id: text(fields.clientId || accessPayload.client_id) || CODEX_CLIENT_ID,
+      client_id: text(accessPayload.client_id || fields.clientId) || CODEX_CLIENT_ID,
       id_token: fields.idToken,
+      plan_type: planType,
+      workspace_id: workspaceIdValue,
+      account_id: accountId,
+      email_source: 'oauth_userinfo_email',
+      last_refresh: exportedAt,
+      live_identity: liveIdentity,
+      outlook_email: fields.email,
+      identity_source: 'oauth_access_token_claim',
+      account_id_source: 'oauth_access_token_claim',
+      chatgpt_plan_type: planType,
+      chatgpt_account_user_id: accountUserId,
     },
-    extra: { email: fields.email },
     group_ids: parseGroupIds(groupIds),
-    concurrency: 10,
-    priority: 1,
     auto_pause_on_expired: true,
+    expires_at: expiresAt,
   }
 }
 

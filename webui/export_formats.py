@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -174,50 +175,134 @@ def _sub2_account(row: dict) -> dict:
     access_payload, access_auth, _id_auth = _jwt_parts(row)
     profile = exporter._get_profile(access_payload)
     account_email = email or str(profile.get("email") or "").strip()
+    exporter.validate_sub2_token_pair(
+        row.get("access_token", ""),
+        row.get("id_token", ""),
+    )
     expires_at = access_payload.get("exp")
-    if not isinstance(expires_at, int):
-        expires_at = 0
+    if not isinstance(expires_at, int) or expires_at <= 0:
+        expires_at = int(time.time()) + 863999
     account_id = str(
-        access_auth.get("chatgpt_account_id") or access_auth.get("account_id") or ""
+        access_auth.get("chatgpt_account_id") or access_auth.get("account_id")
+        or row.get("chatgpt_account_id") or row.get("workspace_id")
+        or row.get("account_id") or ""
     ).strip()
     user_id = str(
         access_auth.get("chatgpt_user_id")
         or access_auth.get("user_id")
+        or row.get("chatgpt_user_id")
         or access_payload.get("sub")
         or ""
     ).strip()
+    client_id = str(
+        access_payload.get("client_id") or row.get("client_id") or exporter.CODEX_CLIENT_ID
+    ).strip()
+    organization_id = _first_org_id(_id_auth, access_auth) or str(
+        access_auth.get("poid") or ""
+    ).strip()
+    plan_type = str(
+        access_auth.get("chatgpt_plan_type")
+        or row.get("plan_type")
+        or row.get("chatgpt_plan_type")
+        or "free"
+    ).strip() or "free"
+    workspace_id_value = account_id or str(
+        row.get("workspace_id") or row.get("chatgpt_account_id") or ""
+    ).strip()
+    session_token = _s(row, "session_token")
+    expires_in = max(0, int(expires_at) - int(time.time()))
+
+    # Build compound user+account key
+    chatgpt_account_user_id = ""
+    if user_id and account_id:
+        chatgpt_account_user_id = f"{user_id}__{account_id}"
+
+    # Expiry as ISO string
+    expired_str = ""
+    if isinstance(expires_at, int) and expires_at > 0:
+        expired_str = datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    display_name = str(profile.get("name") or account_email or "").strip()
+
+    cred_extra = {
+        "email": account_email,
+        "source": "internal_resource_exchange",
+        "privacy_mode": "training_off",
+        "original_format": "codex-account",
+        "openai_oauth_responses_websockets_v2_mode": "off",
+        "openai_oauth_responses_websockets_v2_enabled": False,
+    }
+
+    live_identity = {
+        "plan": plan_type,
+        "email": account_email,
+        "user_id": user_id,
+        "client_id": client_id,
+        "account_id": account_id,
+        "plan_source": "oauth_access_token_claim",
+        "verified_at": last_refresh,
+        "email_source": "oauth_userinfo_email",
+        "official_plan": plan_type,
+        "client_trusted": False,
+        "email_verified": True,
+        "user_id_source": "oauth_access_token_claim",
+        "account_user_id": chatgpt_account_user_id,
+        "identity_source": "oauth_access_token_claim",
+        "account_id_source": "oauth_access_token_claim",
+        "account_user_id_source": "oauth_access_token_claim",
+    }
+
     return {
         "name": account_email,
-        "platform": "openai",
         "type": "oauth",
-        "credentials": {
-            "access_token": _s(row, "access_token"),
+        "extra": {
             "email": account_email,
+            "source": "internal_resource_exchange",
+            "privacy_mode": "training_off",
+            "original_format": "codex-account",
+            "openai_oauth_responses_websockets_v2_mode": "off",
+            "openai_oauth_responses_websockets_v2_enabled": False,
+        },
+        "platform": "openai",
+        "priority": 1,
+        "plan_type": plan_type,
+        "concurrency": 10,
+        "credentials": {
+            "name": display_name,
+            "type": "codex",
+            "email": account_email,
+            "extra": cred_extra,
+            "expired": expired_str,
+            "disabled": False,
+            "id_token": _s(row, "id_token"),
             "password": _s(row, "password"),
             "totp_secret": _s(row, "totp_secret"),
-            "expires_at": expires_at,
+            "client_id": client_id,
+            "plan_type": plan_type,
+            "account_id": account_id,
+            "access_token": _s(row, "access_token"),
+            "email_source": "oauth_userinfo_email",
+            "last_refresh": last_refresh,
+            "workspace_id": workspace_id_value,
+            "live_identity": live_identity,
+            "outlook_email": account_email,
             "refresh_token": _s(row, "refresh_token"),
-            "chatgpt_account_id": account_id,
+            "session_token": session_token,
+            "expires_in": expires_in,
             "chatgpt_user_id": user_id,
-            "client_id": str(
-                access_payload.get("client_id") or exporter.CODEX_CLIENT_ID
-            ).strip(),
-            "id_token": _s(row, "id_token"),
-            "plan_type": str(access_auth.get("chatgpt_plan_type") or "free").strip() or "free",
-        },
-        "extra": {
-            "openai_long_context_billing_enabled": False,
-            "openai_oauth_responses_websockets_v2_enabled": False,
-            "openai_oauth_responses_websockets_v2_mode": "off",
-            "privacy_mode": "training_off",
-            "source": "workspace_oauth",
-            "workspace_id": account_id,
-            "email": account_email,
+            "identity_source": "oauth_access_token_claim",
+            "organization_id": organization_id,
+            "account_id_source": "oauth_access_token_claim",
+            "chatgpt_plan_type": plan_type,
+            "chatgpt_account_id": account_id,
+            "chatgpt_account_user_id": chatgpt_account_user_id,
+            # Sub2API-compatible exports use an ISO expiry inside credentials;
+            # the Unix timestamp remains on the account object below.
+            "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z"),
         },
         "group_ids": [4],
-        "priority": 1,
-        "concurrency": 10,
-        "rate_multiplier": 1,
+        "expires_at": expires_at,
         "auto_pause_on_expired": True,
     }
 
@@ -228,7 +313,6 @@ def _render_sub2(rows: list) -> bytes:
         "type": "sub2api-data",
         "version": 1,
         "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "workspace_id": accounts[0]["credentials"].get("chatgpt_account_id", "") if accounts else "",
         "proxies": [],
         "accounts": accounts,
     }

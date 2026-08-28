@@ -41,6 +41,8 @@ const groupManagerVisible = ref(false)
 const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
+const plusCheckConcurrency = ref(4)
+const checkProgress = ref({ done: 0, total: 0 })
 const checkResult = ref('')
 const importingSub2Api = ref(false)
 const sub2apiInput = ref(null)
@@ -51,9 +53,11 @@ const import2faText = ref('')
 const importing2fa = ref(false)
 const import2faResult = ref('')
 const import2faErrors = ref([])
+let loadRequestGeneration = 0
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
+  queued: 'info', checking: 'primary',
   // token_invalid（401 且响应体没有封号措辞）仍与 banned 分开显示——判据不同，
   // 不能混成一个。但配色从橙改红：AT 未到期却 401 = 被吊销，实测多半就是封号，
   // 橙色（=号还在）会让主人以为重新登录就能救回来。
@@ -62,25 +66,43 @@ const PLUS_TYPE = {
 }
 function plusOf(row) { return row.plus_check || null }
 
+async function runRollingPool(items, concurrency, worker) {
+  let cursor = 0
+  const workerCount = Math.min(Math.max(1, Number(concurrency) || 1), 4, items.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++
+      await worker(items[index], index)
+    }
+  }))
+}
+
 async function load(resetPage) {
   if (resetPage) page.value = 1
+  const generation = ++loadRequestGeneration
   loading.value = true
   try {
     const { items, total: t, groups: groupItems } = await listRegistered({
       limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filter.value,
       group_name: groupFilter.value,
     })
+    // 筛选/分组切换可能同时发出多个请求；旧请求晚返回时不能覆盖最新结果。
+    if (generation !== loadRequestGeneration) return
     rows.value = items
     total.value = t
     groups.value = groupItems || []
-  } catch (e) { ElMessage.error(e.message) }
-  finally { loading.value = false }
+  } catch (e) {
+    if (generation === loadRequestGeneration) ElMessage.error(e.message)
+  }
+  finally {
+    if (generation === loadRequestGeneration) loading.value = false
+  }
 }
 
 async function selectAllFiltered() {
   try {
     const r = await listRegistered({ limit: 100000, offset: 0, filter: filter.value, group_name: groupFilter.value })
-    selected.value = (r.items || []).filter((row) => row.account_status !== 'permanently_invalid')
+    selected.value = r.items || []
     ElMessage.success(`已全选当前筛选条件下的 ${selected.value.length} 个账号`)
   } catch (e) { ElMessage.error('全选失败: ' + e.message) }
 }
@@ -112,20 +134,66 @@ function collectEmails(mode) {
 async function doCheck(mode) {
   const emails = collectEmails(mode)
   if (!emails.length) { ElMessage.info('当前页没有可检测的号'); return }
+  if (checking.value) return ElMessage.warning('检测任务正在执行中')
   checking.value = true
-  checkResult.value = `检查中... (${emails.length} 个)`
+  checkProgress.value = { done: 0, total: emails.length }
+  const selectedProxy = proxyText(form.value)
+  const proxies = selectedProxy
+    ? [selectedProxy]
+    : [...new Set(proxyList.value.map((value) => String(value || '').trim()).filter(Boolean))]
+  const rowsByEmail = new Map(
+    rows.value.map((row) => [String(row.email || '').toLowerCase(), row]),
+  )
+  emails.forEach((email) => {
+    const row = rowsByEmail.get(email.toLowerCase())
+    if (row) row.plus_check = { status: 'queued', label: '排队中' }
+  })
+  checkResult.value = `检查中... (0/${emails.length})${proxies.length ? `，代理池 ${proxies.length} 条轮询` : '，直连'}`
+  let plus = 0, free = 0, banned = 0, failed = 0, badToken = 0, done = 0
+  const notes = new Set()
+  let progressTimer = null
+  let lastProgressAt = 0
+  let latestDone = 0
+  const publishProgress = (value, force = false) => {
+    latestDone = value
+    const now = Date.now()
+    const elapsed = now - lastProgressAt
+    if (!force && elapsed < 100) {
+      if (!progressTimer) {
+        progressTimer = setTimeout(() => {
+          progressTimer = null
+          publishProgress(latestDone, true)
+        }, 100 - elapsed)
+      }
+      return
+    }
+    lastProgressAt = now
+    checkProgress.value = { done: value, total: emails.length }
+    checkResult.value = `检查中... (${value}/${emails.length})${proxies.length ? `，代理池 ${proxies.length} 条轮询` : '，直连'}`
+  }
   try {
-    const { results, note } = await checkPlus(emails, proxyText(form.value))
-    let plus = 0, free = 0, banned = 0, failed = 0, badToken = 0
-    for (const [email, info] of Object.entries(results)) {
-      const row = rows.value.find((r) => r.email === email)
+    await runRollingPool(emails, plusCheckConcurrency.value, async (email, index) => {
+      const key = email.toLowerCase()
+      const row = rowsByEmail.get(key)
+      if (row) row.plus_check = { status: 'checking', label: '检测中' }
+      let info
+      try {
+        const response = await checkPlus([email], proxies.length ? proxies[index % proxies.length] : '')
+        info = response.results?.[key] || Object.values(response.results || {})[0]
+        if (!info) info = { status: 'error', label: '服务器未返回检测结果' }
+        if (response.note) notes.add(response.note)
+      } catch (error) {
+        info = { status: 'error', label: error.message || '检测失败' }
+      }
       if (row) row.plus_check = info
       if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
       else if (info.status === 'banned') banned++
       else if (info.status === 'free') free++
       else if (info.status === 'token_invalid') badToken++
       else if (info.status === 'error') failed++
-    }
+      done++
+      publishProgress(done)
+    })
     // failed / note 不入库，只是这一次的现场说明：
     // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
     // badToken 从 2026-08-10 起是**会入库**的结论，措辞也跟着改：
@@ -133,12 +201,17 @@ async function doCheck(mode) {
     const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
     if (badToken) parts.push(`${badToken} 个凭证失效（AT 被吊销，多半已封）`)
     if (failed) parts.push(`${failed} 个没检测成`)
-    if (note) parts.push(note)
+    if (notes.size) parts.push(...notes)
     checkResult.value = parts.join(' · ')
   } catch (e) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
-  } finally { checking.value = false }
+  } finally {
+    if (progressTimer) clearTimeout(progressTimer)
+    progressTimer = null
+    checkProgress.value = { done, total: emails.length }
+    checking.value = false
+  }
 }
 
 // customClass 里的 pre-line 让消息里的 \n 真的换行。
@@ -267,7 +340,9 @@ async function loadExportFormats() {
 async function doExport(fmt) {
   const emails = selected.value.map((r) => r.email)
   // 没勾选 = 导出全部（跨页，不只当前页）
-  const payload = emails.length ? { format: fmt.id, emails } : { format: fmt.id, all: true }
+  const payload = emails.length
+    ? { format: fmt.id, emails, proxy_pool: proxyList.value.join('\n') }
+    : { format: fmt.id, all: true, proxy_pool: proxyList.value.join('\n') }
   exporting.value = true
   try {
     const r = await exportRegistered(payload)
@@ -610,7 +685,7 @@ onActivated(() => load())
           <el-option label="未检测" value="unchecked" />
           <el-option label="Free" value="free" />
           <el-option label="可领Plus" value="plus" />
-          <el-option label="已封号" value="banned" />
+          <el-option label="已永久失效" value="permanently_invalid" />
           <el-option label="凭证失效" value="token_invalid" />
         </el-select>
         <el-select v-model="groupFilter" style="width: 170px" @change="load(true)">
@@ -628,6 +703,8 @@ onActivated(() => load())
         >
           <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
+        <el-input-number v-model="plusCheckConcurrency" :min="1" :max="4" controls-position="right" />
+        <span class="hint">检测并发</span>
         <el-button :loading="checking" @click="doCheck('unchecked')">检查未检测</el-button>
         <el-button :loading="checking" @click="doCheck('all')">重新检查</el-button>
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
@@ -693,7 +770,7 @@ onActivated(() => load())
         v-loading="loading" :data="rows" size="small" stripe
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="44" :selectable="(row) => row.account_status !== 'permanently_invalid'" />
+        <el-table-column type="selection" width="44" />
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
         <el-table-column label="分组" width="130" show-overflow-tooltip>
           <template #default="{ row }">

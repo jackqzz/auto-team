@@ -81,3 +81,8 @@ config.local.json
 .env
 .env.local
 secrets.json
+
+# ──────────────── 调试抓包 / 导出凭证（含 Cookie、Token 或账号信息）──────
+docs/*.har
+docs/*.json
+docs/update_seat*

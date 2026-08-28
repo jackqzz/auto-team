@@ -41,7 +41,6 @@ SUB2API_DEFAULT_EXPIRES_IN = 863999  # 跟 any-auto-register 一致
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_S = [3.0, 7.0]
 
-
 # ──────────────────────── 工具函数 ────────────────────────
 
 
@@ -76,6 +75,29 @@ def _get_profile(payload: dict) -> dict:
         return {}
     p = payload.get("https://api.openai.com/profile")
     return p if isinstance(p, dict) else {}
+
+
+def _oidc_at_hash(access_token: str) -> str:
+    """Return the OIDC ``at_hash`` value for an access token."""
+    digest = hashlib.sha256(str(access_token or "").encode("utf-8")).digest()[:16]
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def validate_sub2_token_pair(access_token: str, id_token: str = "") -> None:
+    """Reject a stale/mismatched access-token + ID-token pair.
+
+    Sub2API can refresh a valid RT, but it cannot repair an ID token that was
+    copied from a different access token.  OIDC's ``at_hash`` is the reliable
+    local check and does not expose token contents in logs.
+    """
+    access = str(access_token or "").strip()
+    identity = str(id_token or "").strip()
+    if not access or not identity:
+        return
+    claims = _decode_jwt_payload(identity)
+    claimed_hash = str(claims.get("at_hash") or "").strip()
+    if claimed_hash and claimed_hash != _oidc_at_hash(access):
+        raise RuntimeError("id_token 与 access_token 不匹配（at_hash 校验失败），请用同一 refresh_token 重新导出")
 
 
 def _first(*values) -> str:
@@ -130,7 +152,13 @@ def _import_cffi_mime():
 # ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
 
 
-def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT, proxy: str = "") -> dict:
+def refresh_codex_token(
+    refresh_token: str,
+    *,
+    timeout: int = DEFAULT_TIMEOUT,
+    proxy: str = "",
+    client_id: str = "",
+) -> dict:
     """用 Codex refresh_token 换一组新的 access_token / id_token / refresh_token(滚动)。
 
     参考 any-auto-register/platforms/chatgpt/token_refresh.py 风格。
@@ -144,9 +172,10 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT, p
         raise RuntimeError("缺少 refresh_token，无法刷新 Codex access_token")
 
     cffi = _import_cffi()
+    refresh_client_id = str(client_id or CODEX_CLIENT_ID).strip() or CODEX_CLIENT_ID
     body = {
         "grant_type": "refresh_token",
-        "client_id": CODEX_CLIENT_ID,
+        "client_id": refresh_client_id,
         "refresh_token": rt,
         "scope": CODEX_SCOPE,
     }
@@ -433,6 +462,7 @@ def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
     refresh_token = str(cred.get("refresh_token") or "").strip()
     id_token = str(cred.get("id_token") or "").strip()
     email = str(cred.get("email") or "").strip()
+    validate_sub2_token_pair(access_token, id_token)
 
     access_payload = _decode_jwt_payload(access_token)
     access_auth = _get_auth(access_payload)
@@ -455,8 +485,10 @@ def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
     if not organization_id:
         organization_id = str(access_auth.get("organization_id") or access_auth.get("poid") or "").strip()
 
+    # The client_id embedded in the freshly issued access token is
+    # authoritative; stale metadata must not select another RT family.
     client_id = str(
-        cred.get("client_id") or access_payload.get("client_id") or CODEX_CLIENT_ID
+        access_payload.get("client_id") or cred.get("client_id") or CODEX_CLIENT_ID
     ).strip() or CODEX_CLIENT_ID
 
     chatgpt_account_id = str(
@@ -464,27 +496,98 @@ def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
     ).strip()
     chatgpt_user_id = str(access_auth.get("chatgpt_user_id") or "").strip()
 
+    # plan_type: 从 access_token claims 或 cred 取
+    plan_type = str(
+        access_auth.get("chatgpt_plan_type")
+        or cred.get("plan_type")
+        or cred.get("chatgpt_plan_type")
+        or "free"
+    ).strip() or "free"
+
+    # workspace_id: 优先 chatgpt_account_id，fallback 从 cred
+    workspace_id_value = chatgpt_account_id or str(
+        cred.get("workspace_id") or cred.get("chatgpt_account_id") or ""
+    ).strip()
+
+    # session_token: 可能为空但字段需要存在
+    session_token = str(cred.get("session_token") or "").strip()
+
+    # expires_in: 用实际剩余秒数而非固定值
+    expires_in = max(0, int(expires_at) - int(time.time()))
+    expires_iso = datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z")
+    exported_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    profile = _get_profile(access_payload)
+    display_name = str(profile.get("name") or email or "").strip()
+    account_user_id = ""
+    if chatgpt_user_id and chatgpt_account_id:
+        account_user_id = f"{chatgpt_user_id}__{chatgpt_account_id}"
+    cred_extra = {
+        "email": email,
+        "source": "internal_resource_exchange",
+        "privacy_mode": "training_off",
+        "original_format": "codex-account",
+        "openai_oauth_responses_websockets_v2_mode": "off",
+        "openai_oauth_responses_websockets_v2_enabled": False,
+    }
+    live_identity = {
+        "plan": plan_type,
+        "email": email,
+        "user_id": chatgpt_user_id,
+        "client_id": client_id,
+        "account_id": chatgpt_account_id,
+        "plan_source": "oauth_access_token_claim",
+        "verified_at": exported_at,
+        "email_source": "oauth_userinfo_email",
+        "official_plan": plan_type,
+        "client_trusted": False,
+        "email_verified": True,
+        "user_id_source": "oauth_access_token_claim",
+        "account_user_id": account_user_id,
+        "identity_source": "oauth_access_token_claim",
+        "account_id_source": "oauth_access_token_claim",
+        "account_user_id_source": "oauth_access_token_claim",
+    }
+
     return {
         "name": email,
-        "notes": "",
-        "platform": "openai",
         "type": "oauth",
+        "extra": cred_extra,
+        "platform": "openai",
+        "priority": 1,
+        "plan_type": plan_type,
+        "concurrency": 10,
         "credentials": {
+            "name": display_name,
+            "type": "codex",
+            "extra": cred_extra,
+            "expired": expires_iso,
+            "disabled": False,
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "expires_in": SUB2API_DEFAULT_EXPIRES_IN,
-            "expires_at": expires_at,
+            "session_token": session_token,
+            "expires_in": expires_in,
+            "expires_at": expires_iso,
             "chatgpt_account_id": chatgpt_account_id,
             "chatgpt_user_id": chatgpt_user_id,
             "organization_id": organization_id,
             "client_id": client_id,
             "id_token": id_token,
+            "plan_type": plan_type,
+            "workspace_id": workspace_id_value,
+            "account_id": chatgpt_account_id,
+            "email": email,
+            "email_source": "oauth_userinfo_email",
+            "last_refresh": exported_at,
+            "live_identity": live_identity,
+            "outlook_email": email,
+            "identity_source": "oauth_access_token_claim",
+            "account_id_source": "oauth_access_token_claim",
+            "chatgpt_plan_type": plan_type,
+            "chatgpt_account_user_id": account_user_id,
         },
-        "extra": {"email": email},
         "group_ids": list(group_ids) if group_ids else list(DEFAULT_SUB2API_GROUP_IDS),
-        "concurrency": 10,
-        "priority": 1,
         "auto_pause_on_expired": True,
+        "expires_at": expires_at,
     }
 
 
@@ -492,8 +595,17 @@ def build_sub2api_payload(cred: dict, group_ids: list[int]) -> dict:
 
 
 def export_to_sub2api(cred: dict, cfg: dict, *,
-                        log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
-    """SUB2API x-api-key 直连上传（无登录流程）。"""
+                        log_fn: Optional[Callable[[str, str], None]] = None,
+                        on_tokens_refreshed: Optional[Callable[[dict], None]] = None,
+                        skip_token_refresh: bool = False) -> dict:
+    """SUB2API x-api-key 直连上传（无登录流程）。
+
+    自动用 refresh_token 换取 Codex 风格 access_token——
+    因为 DB 存储的 access_token 是 NextAuth 风格（被 get_auth_session() 覆盖），
+    在 SUB2API 会返回 401。
+
+    skip_token_refresh: 当调用方（如 run_exports）已经完成刷新时置 True，避免重复刷新。
+    """
     log = log_fn or (lambda m, lvl="info": logger.info(m))
 
     api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
@@ -502,6 +614,55 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
         raise RuntimeError("SUB2API 未配置 URL")
     if not api_key:
         raise RuntimeError("SUB2API 未配置 API Key")
+
+    # ── 自动刷新 Codex token ────────────────────────
+    # DB 中存储的 access_token 是 NextAuth 风格（get_auth_session 覆盖），
+    # SUB2API 需要 Codex 风格。用 refresh_token 换取新的 Codex access_token。
+    rt = str(cred.get("refresh_token") or "").strip()
+    if not skip_token_refresh and rt:
+        try:
+            refresh_timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
+            proxy_text = str(cfg.get("proxy") or "").strip()
+            log("[SUB2API] 用 refresh_token 换新的 Codex access_token...", "info")
+            # Sub2/CLIProxy uses the official Codex OAuth client for RT
+            # rotation. Do not fall back to the stale access token when this
+            # refresh fails: that creates an AT/ID pair which Sub2 rejects.
+            fresh = refresh_codex_token(
+                rt,
+                timeout=refresh_timeout,
+                proxy=proxy_text,
+                client_id=CODEX_CLIENT_ID,
+            )
+            validate_sub2_token_pair(
+                fresh.get("access_token", ""),
+                fresh.get("id_token", ""),
+            )
+            cred = {
+                **cred,
+                "access_token":  fresh["access_token"],
+                "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
+                "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
+            }
+            log(
+                f"[SUB2API] ✅ Codex token 刷新成功 "
+                f"(access_token len={len(fresh['access_token'])} "
+                f"id_token len={len(fresh.get('id_token') or '')})",
+                "ok",
+            )
+            # 回写 DB
+            if on_tokens_refreshed is not None:
+                try:
+                    on_tokens_refreshed(cred)
+                except Exception as e:
+                    log(f"[SUB2API] 新 OAuth token 回写 DB 失败（继续上传）: {e}", "warn")
+        except Exception as e:
+            raise RuntimeError(f"Sub2 导出前 refresh_token 刷新失败，已停止导出: {e}") from e
+    else:
+        validate_sub2_token_pair(
+            cred.get("access_token", ""),
+            cred.get("id_token", ""),
+        )
+        log("[SUB2API] 缺少 refresh_token，使用现有 access_token（已通过 AT/ID 一致性校验）", "warn")
 
     group_ids = _parse_group_ids(cfg.get("sub2api_group_ids"))
     timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
@@ -733,7 +894,12 @@ def run_exports(cred: dict, *,
     if sub2_on:
         out["any_attempted"] = True
         try:
-            out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
+            out["sub2api"] = export_to_sub2api(
+                cred, sub2api_cfg, log_fn=log,
+                on_tokens_refreshed=on_tokens_refreshed,
+                # refresh_oauth=True 时上面已经刷新过了，skip 避免重复刷新
+                skip_token_refresh=refresh_oauth,
+            )
         except Exception as e:
             log(f"[SUB2API] 导出异常: {e}", "error")
             out["sub2api"] = {"ok": False, "error": str(e)}

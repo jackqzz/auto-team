@@ -125,6 +125,25 @@ class WorkspaceMasterTests(unittest.TestCase):
                 self.assertEqual(options[0]["workspace_join_status"], "joined")
                 self.assertEqual(options[0]["credential_status"], "unavailable")
 
+    def test_candidate_seat_update_refreshes_display_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.import_workspace_sessions(
+                    f"owner@example.com----{SESSION_A}----{PROXY_A}"
+                )
+                db.save_registered({"email": "member@example.com", "access_token": "token"})
+                db.assign_workspace_candidates(1, ["member@example.com"])
+                db.update_workspace_candidate_member(1, "member@example.com", "member-1", "default")
+                row = db.list_workspace_candidate_options(1)[0]
+                self.assertEqual(row["seat_label"], "GPT席位")
+                self.assertEqual(row["codex_seat"], "")
+                db.update_workspace_candidate_member(1, "member@example.com", "member-1", "usage_based")
+                row = db.list_workspace_candidate_options(1)[0]
+                self.assertEqual(row["seat_label"], "Codex席位")
+                self.assertEqual(row["gpt_seat"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -207,6 +207,37 @@ class WorkspaceQuotaLeaseTests(unittest.TestCase):
 
 
 class WorkspaceSeatProtectionWorkerTests(unittest.TestCase):
+    def test_seat_switch_accepts_outbound_member(self):
+        outbound = {
+            "email": "outbound@example.com",
+            "workspace_join_status": "joined",
+            "member_id": "member-1",
+            "seat_type": "default",
+            "seat_label": "default",
+            "tag_status": "outbound",
+        }
+        with (
+            patch.object(
+                app.db,
+                "list_workspace_candidate_options",
+                side_effect=lambda _wid, **kwargs: [outbound] if kwargs.get("tag_status") == "outbound" else [],
+            ),
+            patch.object(app.db, "get_workspace_settings", return_value={}),
+            patch.object(app.workspace_membership, "update_member_seat_type", return_value={"success": True}) as update,
+            patch.object(app.db, "update_workspace_candidate_member"),
+        ):
+            result = app.api_update_candidate_seat(
+                app.WorkspaceCandidatesReq(
+                    workspace_id=5,
+                    emails=["outbound@example.com"],
+                    seat_type="usage_based",
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["changed"], 1)
+        update.assert_called_once_with(5, "member-1", "usage_based")
+
     def test_exhausted_protection_skips_all_workspace_requests(self):
         class StopAfterWait:
             stopped = False

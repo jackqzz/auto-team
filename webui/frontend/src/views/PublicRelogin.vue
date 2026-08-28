@@ -4,11 +4,13 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   checkPublicRelogin,
   getPublicReloginQueueStatus,
+  refreshPublicReloginExport,
   runPublicRelogin,
 } from '@/api/publicRelogin'
 import { useProxyStore } from '@/stores/proxy'
 import {
   decodeJwtPayload,
+  buildCpaTokenJson,
   pushToCpa,
   pushToSub2Api,
   testCpaConnection,
@@ -43,6 +45,8 @@ const clockNow = ref(Date.now())
 const poolPushDrawerVisible = ref(false)
 const testingPoolTarget = ref('')
 const manualPoolPushing = ref(false)
+const downloading = ref(false)
+const aliveOnly = ref(false)
 const poolPushResults = ref({})
 const poolPushStats = reactive({ queued: 0, running: 0, success: 0, failed: 0, lastMessage: '' })
 
@@ -66,6 +70,14 @@ const statusCount = computed(() => ({
   revived: accounts.value.filter((a) => a.status === 'revived').length,
   deactivated: accounts.value.filter((a) => a.status === 'deactivated').length,
 }))
+// 只有已经确认额度接口可用的账号才算“存活”。unknown/401/error/failed
+// 都不是存活证明，不能进入手动推送或导出批次；复活项是刚完成重登录的有效账号。
+const isAliveAccount = (item) => item?.status === 'active' || item?.status === 'revived'
+const aliveAccounts = computed(() => accounts.value.filter(isAliveAccount))
+// 导入后的账号状态是 unknown，需要先做一次额度检查才能确认是否存活；
+// 因此检测范围只排除已确认停用的账号，不能复用严格的推送范围。
+const checkableAccounts = computed(() => accounts.value.filter((item) => item?.status !== 'deactivated'))
+const visibleAccounts = computed(() => (aliveOnly.value ? aliveAccounts.value : accounts.value))
 
 const inspectionCountdown = computed(() => {
   if (!inspectionRunning.value || !inspectionNextAt.value) return '-'
@@ -78,6 +90,13 @@ const enabledPoolTargetNames = computed(() => [
   poolPushConfig.cpa.enabled ? 'CPA' : '',
   poolPushConfig.sub2api.enabled ? 'Sub2API' : '',
 ].filter(Boolean))
+const configuredPoolTargetNames = computed(() => [
+  poolPushConfig.cpa.url.trim() && poolPushConfig.cpa.key.trim() ? 'CPA' : '',
+  poolPushConfig.sub2api.url.trim() && poolPushConfig.sub2api.key.trim() ? 'Sub2API' : '',
+].filter(Boolean))
+const manualPoolPushConfigIssue = computed(() => (
+  configuredPoolTargetNames.value.length ? '' : '请先填写 CPA 或 Sub2API 的地址和密钥'
+))
 const poolPushConfigIssue = computed(() => {
   if (!enabledPoolTargetNames.value.length) return '请至少启用一个推送目标'
   if (poolPushConfig.cpa.enabled && (!poolPushConfig.cpa.url.trim() || !poolPushConfig.cpa.key.trim())) {
@@ -288,9 +307,9 @@ async function executePoolPush(account, target, config, credentialKey) {
   }
 }
 
-function enqueuePoolPush(account, { auto = false, force = false } = {}) {
+function enqueuePoolPush(account, { auto = false, force = false, targets: requestedTargets = null } = {}) {
   if (auto && !poolPushConfig.autoEnabled) return 0
-  const targets = ['cpa', 'sub2api'].filter((target) => poolTargetConfig(target).enabled)
+  const targets = requestedTargets || ['cpa', 'sub2api'].filter((target) => poolTargetConfig(target).enabled)
   let queued = 0
   for (const target of targets) {
     const config = { ...poolTargetConfig(target) }
@@ -304,17 +323,21 @@ function enqueuePoolPush(account, { auto = false, force = false } = {}) {
   return queued
 }
 
-async function pushCurrentRevived() {
+async function pushCurrentAlive() {
   if (poolPushStats.queued || poolPushStats.running) {
     return ElMessage.warning('已有号池推送正在执行，请等待当前队列结束')
   }
-  const rows = accounts.value.filter((item) => item.status === 'revived')
-  if (!rows.length) return ElMessage.warning('当前没有复活项可推送')
-  if (poolPushConfigIssue.value) return ElMessage.warning(poolPushConfigIssue.value)
+  const rows = aliveAccounts.value
+  if (!rows.length) return ElMessage.warning('当前没有存活账号可推送')
+  if (manualPoolPushConfigIssue.value) return ElMessage.warning(manualPoolPushConfigIssue.value)
+  const targets = ['cpa', 'sub2api'].filter((target) => {
+    const config = poolTargetConfig(target)
+    return config.url.trim() && config.key.trim()
+  })
   manualPoolPushing.value = true
   const startStats = { success: poolPushStats.success, failed: poolPushStats.failed }
   let queued = 0
-  for (const account of rows) queued += enqueuePoolPush(account, { force: true })
+  for (const account of rows) queued += enqueuePoolPush(account, { force: true, targets })
   if (!queued) {
     manualPoolPushing.value = false
     return ElMessage.info('没有需要推送的目标')
@@ -324,7 +347,7 @@ async function pushCurrentRevived() {
     const success = poolPushStats.success - startStats.success
     const failed = poolPushStats.failed - startStats.failed
     if (failed) ElMessage.warning(`手动推送完成：成功 ${success}，失败 ${failed}`)
-    else ElMessage.success(`手动推送完成：成功 ${success}`)
+    else ElMessage.success(`手动推送完成：成功 ${success}（存活账号 ${rows.length} 个）`)
   } finally {
     manualPoolPushing.value = false
   }
@@ -368,6 +391,10 @@ const normalizeAccount = (item, idx) => {
   const tokenPayload = decodeJwtPayload(accessToken)
   const tokenAuth = tokenPayload?.['https://api.openai.com/auth'] || {}
   const tokenProfile = tokenPayload?.['https://api.openai.com/profile'] || {}
+  const tokenExp = Number(tokenPayload?.exp)
+  const expiresAt = Number.isInteger(tokenExp) && tokenExp > 0
+    ? tokenExp
+    : (Number(first('expires_at', 'expiresAt')) || 0)
   const email = String(first('email', 'mail', 'username', 'name') || tokenProfile.email || '').trim().toLowerCase()
   const refreshToken = String(first('refresh_token', 'refreshToken')).trim()
   const idToken = String(first('id_token', 'idToken')).trim()
@@ -391,6 +418,24 @@ const normalizeAccount = (item, idx) => {
   ).trim()
   const clientId = String(first('client_id', 'clientId')).trim()
   const planType = String(first('plan_type', 'planType') || tokenAuth.chatgpt_plan_type || 'team').trim()
+  const sessionToken = String(first('session_token', 'sessionToken')).trim()
+  const organizationId = String(
+    first('organization_id', 'organizationId')
+      || tokenAuth.organization_id
+      || tokenAuth.poid
+      || idTokenAuth.organization_id
+      || '',
+  ).trim()
+  // 从 organizations 数组取第一个 org id 作为 fallback
+  const orgFallback = (() => {
+    for (const auth of [idTokenAuth, tokenAuth]) {
+      if (Array.isArray(auth.organizations)) {
+        const org = auth.organizations.find((o) => o && typeof o === 'object' && String(o.id || '').trim())
+        if (org) return String(org.id).trim()
+      }
+    }
+    return ''
+  })()
   const proxy = String(first('proxy') || '').trim()
   return {
     id: `${workspaceId || 'ws'}:${email || idx}`,
@@ -404,6 +449,9 @@ const normalizeAccount = (item, idx) => {
     chatgpt_user_id: userId,
     client_id: clientId,
     plan_type: planType || 'team',
+    session_token: sessionToken,
+    organization_id: organizationId || orgFallback,
+    expires_at: expiresAt,
     proxy,
     status: 'unknown',
     quota: null,
@@ -597,8 +645,9 @@ const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => 
 }
 
 const doCheck = async () => {
-  if (!accounts.value.length) return ElMessage.warning('请先导入账号')
-  await checkAccounts([...accounts.value])
+  const rows = checkableAccounts.value
+  if (!rows.length) return ElMessage.warning('没有可检测的账号（停用账号已过滤）')
+  await checkAccounts([...rows])
 }
 
 function clearInspectionTimer() {
@@ -620,15 +669,16 @@ async function runInspectionBatch() {
     scheduleInspection(5000)
     return
   }
-  if (!accounts.value.length) {
+  const candidates = checkableAccounts.value
+  if (!candidates.length) {
     stopInspection()
     return
   }
   const size = Math.min(
     Math.max(1, Number(inspectionBatchSize.value) || 8),
-    accounts.value.length,
+    candidates.length,
   )
-  const batch = accounts.value
+  const batch = candidates
     .map((item, index) => ({ item, index }))
     .sort((a, b) => (a.item.last_checked_at || 0) - (b.item.last_checked_at || 0) || a.index - b.index)
     .slice(0, size)
@@ -648,7 +698,7 @@ async function runInspectionBatch() {
 }
 
 function startInspection() {
-  if (!accounts.value.length) return ElMessage.warning('请先导入账号')
+  if (!checkableAccounts.value.length) return ElMessage.warning('没有可巡检的账号（停用账号已过滤）')
   if (!requireAccessKey()) return
   inspectionRunning.value = true
   inspectionRound.value = 0
@@ -669,7 +719,10 @@ function formatCheckedAt(value) {
 }
 
 const doRelogin = async (onlyRevived = true) => {
-  const list = accounts.value.filter((item) => item.status === '401' || (!onlyRevived && item.status !== 'deactivated'))
+  const list = accounts.value.filter((item) => (
+    item.status !== 'deactivated'
+    && (item.status === '401' || !onlyRevived)
+  ))
   if (!list.length) return ElMessage.warning('没有可重新登录的账号')
   const key = requireAccessKey()
   if (!key) return
@@ -754,59 +807,263 @@ const doRelogin = async (onlyRevived = true) => {
   }
 }
 
-const buildExport = (rows) => {
+const buildSub2Export = (rows) => {
   const accountsOut = rows.map((item) => {
     const workspaceId = item.workspace_id || ''
+    const expiresAt = item.expires_at || 0
+    const expiresIn = Math.max(0, Math.floor(expiresAt - Date.now() / 1000))
+    const tokenPayload = decodeJwtPayload(item.access_token || '')
+    const tokenAuth = tokenPayload?.['https://api.openai.com/auth'] || {}
+    const tokenProfile = tokenPayload?.['https://api.openai.com/profile'] || {}
+    const accountId = tokenAuth.chatgpt_account_id || tokenAuth.account_id || workspaceId
+    const userId = item.chatgpt_user_id || tokenAuth.chatgpt_user_id || tokenAuth.user_id || tokenPayload.sub || ''
+    const planType = item.plan_type || tokenAuth.chatgpt_plan_type || 'free'
+    const exportedAt = new Date().toISOString()
+    const expired = expiresAt ? new Date(expiresAt * 1000).toISOString() : ''
+    const accountUserId = tokenAuth.chatgpt_account_user_id || (userId && accountId ? `${userId}__${accountId}` : '')
+    const displayName = tokenProfile.name || item.email || ''
+    const liveIdentity = {
+      plan: planType,
+      email: item.email || tokenProfile.email || '',
+      user_id: userId,
+    client_id: tokenPayload.client_id || item.client_id || '',
+      account_id: accountId,
+      plan_source: 'oauth_access_token_claim',
+      verified_at: exportedAt,
+      email_source: 'oauth_userinfo_email',
+      official_plan: planType,
+      client_trusted: false,
+      email_verified: tokenProfile.email_verified !== false,
+      user_id_source: 'oauth_access_token_claim',
+      account_user_id: accountUserId,
+      identity_source: 'oauth_access_token_claim',
+      account_id_source: 'oauth_access_token_claim',
+      account_user_id_source: 'oauth_access_token_claim',
+    }
+    const credExtra = {
+      email: item.email || tokenProfile.email || '',
+      source: 'internal_resource_exchange',
+      privacy_mode: 'training_off',
+      original_format: 'codex-account',
+      openai_oauth_responses_websockets_v2_mode: 'off',
+      openai_oauth_responses_websockets_v2_enabled: false,
+    }
     return {
       name: item.email,
-      platform: 'openai',
       type: 'oauth',
+      extra: credExtra,
+      platform: 'openai',
+      priority: 1,
+      plan_type: planType,
+      concurrency: 10,
       credentials: {
+        name: displayName,
+        type: 'codex',
+        extra: credExtra,
+        expired,
+        disabled: false,
         access_token: item.access_token || '',
         email: item.email || '',
         password: item.password || '',
         totp_secret: item.totp_secret || '',
-        expires_at: 0,
-        refresh_token: item.refresh_token || '',
-        chatgpt_account_id: workspaceId,
-        chatgpt_user_id: item.chatgpt_user_id || '',
-        client_id: item.client_id || '',
         id_token: item.id_token || '',
-        plan_type: item.plan_type || 'team',
-      },
-      extra: {
-        source: 'public_relogin',
-        workspace_id: workspaceId,
-        email: item.email || '',
+        client_id: tokenPayload.client_id || item.client_id || '',
+        plan_type: planType,
+        account_id: accountId,
+        email_source: 'oauth_userinfo_email',
+        last_refresh: exportedAt,
+        workspace_id: accountId,
+        live_identity: liveIdentity,
+        outlook_email: item.email || '',
+        refresh_token: item.refresh_token || '',
+        session_token: item.session_token || '',
+        expires_in: expiresIn,
+        organization_id: item.organization_id || '',
+        chatgpt_user_id: userId,
+        identity_source: 'oauth_access_token_claim',
+        account_id_source: 'oauth_access_token_claim',
+        chatgpt_plan_type: planType,
+        chatgpt_account_id: accountId,
+        chatgpt_account_user_id: accountUserId,
+        expires_at: expired,
       },
       group_ids: [4],
-      priority: 1,
-      concurrency: 10,
-      rate_multiplier: 1,
       auto_pause_on_expired: true,
+      expires_at: expiresAt,
     }
   })
   return {
     type: 'sub2api-data',
     version: 1,
     exported_at: new Date().toISOString(),
-    workspace_id: accountsOut[0]?.credentials?.chatgpt_account_id || '',
     proxies: [],
     accounts: accountsOut,
   }
 }
 
-const download = (mode) => {
-  const filtered = accounts.value.filter((item) => item.status !== 'deactivated')
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function concatBytes(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+  const output = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length }
+  return output
+}
+
+function makeZip(entries) {
+  const encoder = new TextEncoder()
+  const local = []
+  const central = []
+  let offset = 0
+  for (const entry of entries) {
+    const name = encoder.encode(entry.name)
+    const data = encoder.encode(entry.content)
+    const checksum = crc32(data)
+    const header = new Uint8Array(30 + name.length)
+    const view = new DataView(header.buffer)
+    view.setUint32(0, 0x04034b50, true)
+    view.setUint16(4, 20, true)
+    view.setUint16(6, 0x800, true)
+    view.setUint16(8, 0, true)
+    view.setUint32(14, checksum, true)
+    view.setUint32(18, data.length, true)
+    view.setUint32(22, data.length, true)
+    view.setUint16(26, name.length, true)
+    header.set(name, 30)
+    local.push(header, data)
+
+    const directory = new Uint8Array(46 + name.length)
+    const directoryView = new DataView(directory.buffer)
+    directoryView.setUint32(0, 0x02014b50, true)
+    directoryView.setUint16(4, 20, true)
+    directoryView.setUint16(6, 20, true)
+    directoryView.setUint16(8, 0x800, true)
+    directoryView.setUint32(16, checksum, true)
+    directoryView.setUint32(20, data.length, true)
+    directoryView.setUint32(24, data.length, true)
+    directoryView.setUint16(28, name.length, true)
+    directoryView.setUint32(42, offset, true)
+    directory.set(name, 46)
+    central.push(directory)
+    offset += header.length + data.length
+  }
+  const centralBytes = concatBytes(central)
+  const end = new Uint8Array(22)
+  const endView = new DataView(end.buffer)
+  endView.setUint32(0, 0x06054b50, true)
+  endView.setUint16(8, entries.length, true)
+  endView.setUint16(10, entries.length, true)
+  endView.setUint32(12, centralBytes.length, true)
+  endView.setUint32(16, offset, true)
+  return new Blob([concatBytes([...local, centralBytes, end])], { type: 'application/zip' })
+}
+
+async function buildCpaExport(rows) {
+  const entries = []
+  const filenameCounts = new Map()
+  for (let index = 0; index < rows.length; index++) {
+    const item = await buildCpaTokenJson(rows[index])
+    const data = { ...item, disabled: false }
+    const baseName = String(data.email || rows[index].email || `account-${index + 1}`).replace(/[\\/:*?"<>|]/g, '_') || `account-${index + 1}`
+    const occurrence = (filenameCounts.get(baseName) || 0) + 1
+    filenameCounts.set(baseName, occurrence)
+    const filename = occurrence === 1 ? `${baseName}.json` : `${baseName}-${occurrence}.json`
+    entries.push({ name: filename, content: JSON.stringify(data, null, 2) })
+  }
+  if (entries.length === 1) return { blob: new Blob([entries[0].content], { type: 'application/json' }), filename: entries[0].name }
+  return { blob: makeZip(entries), filename: `cpa-accounts-${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}.zip` }
+}
+
+function buildPassword2faExport(rows) {
+  const text = rows.map((item) => `${item.email || ''}----${item.password || ''}----${item.totp_secret || ''}`).join('\n') + '\n'
+  return { blob: new Blob([text], { type: 'text/plain;charset=utf-8' }), filename: `accounts-password-2fa-${rows.length}.txt` }
+}
+
+async function refreshRowsForExport(rows) {
+  const key = requireAccessKey()
+  if (!key) throw new Error('缺少公开重登访问密钥')
+  const refreshed = new Array(rows.length)
+  const errors = []
+  let cursor = 0
+  const proxies = proxyStore.list.map((value) => String(value || '').trim()).filter(Boolean)
+  const workerCount = Math.min(10, rows.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < rows.length) {
+      const index = cursor
+      cursor += 1
+      const original = rows[index]
+      try {
+        const plain = JSON.parse(JSON.stringify(original))
+        const response = await refreshPublicReloginExport({
+          account: plain,
+          access_key: key,
+          proxy: proxies.length ? proxies[index % proxies.length] : '',
+        })
+        const normalized = normalizeAccount(response.account || {}, index)
+        refreshed[index] = {
+          ...original,
+          ...normalized,
+          id: original.id,
+          status: original.status,
+          quota: original.quota,
+          error: original.error,
+          last_checked_at: original.last_checked_at,
+        }
+        updateOne(original.id, refreshed[index])
+      } catch (error) {
+        errors.push(`${original.email || `第 ${index + 1} 条`}: ${error.message || '刷新失败'}`)
+      }
+    }
+  }))
+  if (errors.length) {
+    throw new Error(`有 ${errors.length} 个账号未能生成有效导出凭证：${errors.slice(0, 3).join('；')}`)
+  }
+  return refreshed
+}
+
+const download = async (format = 'sub2api', mode = 'all') => {
+  const filtered = aliveAccounts.value
   const rows = mode === 'revived' ? filtered.filter((item) => item.status === 'revived') : filtered
   if (!rows.length) return ElMessage.warning('没有可下载的账号')
-  const blob = new Blob([JSON.stringify(buildExport(rows), null, 2)], { type: 'application/json' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = mode === 'revived' ? 'sub2api-revived.json' : `sub2api-accounts-remaining-${rows.length}.json`
-  a.click()
-  URL.revokeObjectURL(url)
+  if (downloading.value) return ElMessage.warning('导出正在生成，请稍候')
+  downloading.value = true
+  try {
+    if (format === 'password2fa') {
+      const result = buildPassword2faExport(rows)
+      downloadBlob(result.blob, result.filename)
+      ElMessage.success(`账号----密码----2FA 导出完成，共 ${rows.length} 个`)
+    } else {
+      // CPA 文件可直接使用当前账号凭证；Sub2 导出仍刷新并校验 AT/RT/ID 一致性。
+      const exportRows = format === 'cpa' ? rows : await refreshRowsForExport(rows)
+      const result = format === 'cpa'
+        ? await buildCpaExport(exportRows)
+        : { blob: new Blob([JSON.stringify(buildSub2Export(exportRows), null, 2)], { type: 'application/json' }), filename: mode === 'revived' ? 'sub2api-revived.json' : `sub2api-accounts-remaining-${exportRows.length}.json` }
+      downloadBlob(result.blob, result.filename)
+      ElMessage.success(`${format === 'cpa' ? 'CPA' : 'Sub2'} 凭证刷新并下载完成，共 ${exportRows.length} 个`)
+    }
+  } catch (error) {
+    handleAuthError(error)
+    ElMessage.error(error.message || 'Sub2 导出失败')
+  } finally {
+    downloading.value = false
+  }
 }
 
 watch(accessKey, (value) => {
@@ -875,15 +1132,21 @@ onBeforeUnmount(() => {
           <el-icon><Upload /></el-icon>
           自动号池推送
         </el-button>
+        <el-button :type="aliveOnly ? 'primary' : 'default'" @click="aliveOnly = !aliveOnly">
+          仅查看存活账号
+        </el-button>
         <el-dropdown>
-          <el-button>
+          <el-button :loading="downloading">
             下载
             <el-icon class="el-icon--right"><ArrowDown /></el-icon>
           </el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item @click="download('revived')">仅下载复活项</el-dropdown-item>
-              <el-dropdown-item @click="download('all')">下载全部（过滤停用）</el-dropdown-item>
+              <el-dropdown-item @click="download('cpa', 'all')">导出 CPA 格式（存活账号）</el-dropdown-item>
+              <el-dropdown-item @click="download('sub2api', 'all')">导出 Sub2API 格式（存活账号）</el-dropdown-item>
+              <el-dropdown-item @click="download('password2fa', 'all')">导出 账号----密码----2FA（存活账号）</el-dropdown-item>
+              <el-dropdown-item divided @click="download('cpa', 'revived')">导出 CPA 格式（仅复活项）</el-dropdown-item>
+              <el-dropdown-item @click="download('sub2api', 'revived')">导出 Sub2API 格式（仅复活项）</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -931,7 +1194,7 @@ onBeforeUnmount(() => {
           v-if="!inspectionRunning"
           type="primary"
           plain
-          :disabled="!accounts.length"
+          :disabled="!checkableAccounts.length"
           @click="startInspection"
         >启动定时巡检</el-button>
         <el-button v-else type="danger" plain @click="stopInspection()">停止定时巡检</el-button>
@@ -990,7 +1253,7 @@ onBeforeUnmount(() => {
         :format="() => `重登录 ${reloginProgress.done}/${reloginProgress.total}`"
       />
 
-      <el-table :data="accounts" style="margin-top: 16px" height="640" row-key="id">
+      <el-table :data="visibleAccounts" style="margin-top: 16px" height="640" row-key="id">
         <el-table-column prop="email" label="邮箱" min-width="220" />
         <el-table-column label="密码" min-width="180">
           <template #default="{ row }">
@@ -1145,9 +1408,9 @@ onBeforeUnmount(() => {
         <el-button
           type="primary"
           :loading="manualPoolPushing"
-          :disabled="Boolean(poolPushConfigIssue) || Boolean(poolPushStats.queued || poolPushStats.running)"
-          @click="pushCurrentRevived"
-        >推送当前复活项</el-button>
+          :disabled="Boolean(manualPoolPushConfigIssue) || Boolean(poolPushStats.queued || poolPushStats.running)"
+          @click="pushCurrentAlive"
+        >手动推送存活账号</el-button>
       </div>
     </el-drawer>
 

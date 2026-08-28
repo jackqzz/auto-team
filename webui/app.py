@@ -124,7 +124,7 @@ for _logger_name in _TASK_LOGGER_NAMES:
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+app = FastAPI(title="team-auto", docs_url=None, redoc_url=None)
 
 _INVITE_STATUS_RECHECK_DELAY_SECONDS = 5
 _ADMIN_SESSIONS: dict[str, float] = {}
@@ -308,6 +308,12 @@ class PublicReloginReq(BaseModel):
     access_key: str = ""
     proxy_pool: str = ""
     concurrency: int = Field(0, ge=0, le=20)
+
+
+class PublicReloginExportRefreshReq(BaseModel):
+    account: dict = Field(default_factory=dict)
+    access_key: str = ""
+    proxy: str = ""
 
 
 _QuotaScheduler = tuple[threading.Event, threading.Thread, int, bool, float]
@@ -671,6 +677,44 @@ def api_public_relogin_queue_status():
     return {"ok": True, "queues": public_relogin.task_queue_status()}
 
 
+@app.post("/api/public-relogin/refresh-export")
+def api_public_relogin_refresh_export(req: PublicReloginExportRefreshReq):
+    """将一个公开页账号刷新成 AT/RT/ID 同源的 Sub2 凭证。"""
+    cfg = public_relogin.get_effective_config()
+    if not cfg["enabled"]:
+        raise HTTPException(403, "公开 401 重登录页面未启用")
+    _validate_public_relogin_access_key(req.access_key)
+    cred = public_relogin.normalized_account(req.account or {})
+    access_token = str(cred.get("access_token") or "").strip()
+    refresh_token = str(cred.get("refresh_token") or "").strip()
+    id_token = str(cred.get("id_token") or "").strip()
+    try:
+        from . import exporter as _exp
+
+        if refresh_token:
+            fresh = _exp.refresh_codex_token(
+                refresh_token,
+                timeout=cfg["quota_timeout"],
+                proxy=str(req.proxy or "").strip(),
+                client_id=_exp.CODEX_CLIENT_ID,
+            )
+            access_token = str(fresh.get("access_token") or "").strip()
+            refresh_token = str(fresh.get("refresh_token") or refresh_token).strip()
+            id_token = str(fresh.get("id_token") or "").strip()
+        _exp.validate_sub2_token_pair(access_token, id_token)
+    except Exception as exc:
+        raise HTTPException(502, f"Sub2 导出凭证刷新失败：{exc}") from exc
+    refreshed = public_relogin.normalized_account({
+        **cred,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "client_id": _decode_jwt_payload(access_token).get("client_id") or _exp.CODEX_CLIENT_ID,
+    })
+    refreshed["expires_at"] = int(_decode_jwt_payload(access_token).get("exp") or 0)
+    return {"ok": True, "account": refreshed}
+
+
 @app.post("/api/public-relogin/relogin")
 async def api_public_relogin_relogin(req: PublicReloginReq):
     cfg = public_relogin.get_effective_config()
@@ -716,6 +760,46 @@ async def api_public_relogin_relogin(req: PublicReloginReq):
 def _is_codex_seat(value: object) -> bool:
     normalized = str(value or "").strip().lower().replace("-", "_")
     return normalized in {"usage_based", "usagebased", "codex", "codex席位"}
+
+def _is_non_default_seat(value: object) -> bool:
+    """Check if the seat is a Codex/usage-based type excluded from quota queries.
+
+    ProLite also has a workspace credential and must remain queryable; it is
+    intentionally not treated as a quota-excluded seat here.
+    """
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return normalized in {"usage_based", "usagebased", "codex", "codex席位"}
+
+
+def _candidate_quota_ineligible_reason(row: dict | None) -> str:
+    if not row:
+        return "候选人不属于当前空间"
+    if str(row.get("account_status") or "active") == "permanently_invalid":
+        return "账号已永久失效"
+    # 定时额度查询及其 401 重登只面向当前仍在正常候选池中的成员。
+    # scheduled 代表已经排队入箱，也不能继续参与下一轮查询。
+    trash_status = str(row.get("trash_status") or "active").strip().lower()
+    if trash_status != "active":
+        return "候选人已在垃圾箱" if trash_status == "trashed" else "候选人已排队入箱"
+    tag_status = str(row.get("tag_status") or "active").strip().lower()
+    if tag_status == "outbound":
+        return "候选人已出库"
+    join_status = str(row.get("workspace_join_status") or "").strip().lower()
+    # 真实候选列表总会带计算后的 workspace_join_status；兼容旧调用方
+    # 未提供该字段时，以已有 Team 凭证视为已加入。
+    if join_status and join_status != "joined":
+        return "候选人尚未加入当前空间"
+    if not bool(row.get("has_workspace_access_token")):
+        return "未获得当前空间凭证"
+    seat = str(row.get("seat_label") or row.get("seat_type") or "").strip().lower().replace("-", "_")
+    if _is_non_default_seat(seat):
+        return "Codex席位不参与额度查询"
+    # 非 Codex 的可参与席位目前只有标准席位和 ProLite。未知席位不应
+    # 因为本地缓存缺失而误进入自动任务，待席位同步后再参与。
+    if seat not in {"default", "standard", "standard_seat", "gpt席位", "标准席位", "prolite", "pro_lite"}:
+        return "席位类型未知，暂不参与额度查询"
+    return ""
+
 
 def _workspace_settings_snapshot(workspace_id: int, overrides: dict | None = None) -> dict:
     cfg = dict(db.get_workspace_settings(workspace_id))
@@ -858,11 +942,7 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
         trash_delay = _candidate_trash_delay_seconds(workspace_id, settings)
         candidates = [
             row for row in db.list_workspace_candidate_options(workspace_id)
-            if (
-                row.get("has_workspace_access_token")
-                and row.get("account_status") != "permanently_invalid"
-                and not _is_codex_seat(row.get("seat_type"))
-            )
+            if not _candidate_quota_ineligible_reason(row)
         ]
         quota_leases = None
         if candidates:
@@ -1147,7 +1227,7 @@ def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 2
             gpt_seat = str(row.get("gpt_seat") or "").strip()
             codex_seat = str(row.get("codex_seat") or "").strip()
             member_id = str(row.get("member_id") or "").strip()
-            if seat in {"default", "usage_based"} and (gpt_seat or codex_seat) and member_id:
+            if seat in {"default", "usage_based", "prolite"} and (gpt_seat or codex_seat) and member_id:
                 continue
             pending.append(row)
 
@@ -1252,7 +1332,7 @@ def _switch_candidate_to_default_and_verify(workspace_id: int, candidate: dict, 
         current_seat = workspace_membership._canonical_candidate_seat_type(
             fresh.get("raw_seat_type") or fresh.get("seat_type") or fresh.get("seat_label")
         )
-    if current_seat and current_seat not in {"default", "usage_based"}:
+    if current_seat and current_seat not in {"default", "usage_based", "prolite"}:
         return {"ok": False, "error": f"当前席位不是可切换目标：{current_seat}"}
     member_id = str(fresh.get("member_id") or row.get("member_id") or "").strip()
     if not member_id:
@@ -1489,9 +1569,104 @@ _trash_sweeper_stop = threading.Event()
 _trash_sweeper_thread: threading.Thread | None = None
 
 
+def _reconcile_invalid_candidate_trash(limit: int = 500) -> dict:
+    rows = db.list_invalid_workspace_candidates_pending_trash(limit=limit)
+    settings_by_workspace: dict[int, dict] = {}
+    pending_seat_rows: list[dict] = []
+    marked = 0
+    skipped = 0
+    for row in rows:
+        workspace_id = int(row.get("workspace_master_id") or 0)
+        email = str(row.get("email") or "").strip().lower()
+        if not workspace_id or not email:
+            continue
+        settings = settings_by_workspace.get(workspace_id)
+        if settings is None:
+            settings = db.get_workspace_settings(workspace_id)
+            settings_by_workspace[workspace_id] = settings
+        if not _candidate_trash_invalid_enabled(workspace_id, settings):
+            skipped += 1
+            continue
+        # 没有成员关系就无法完成远端席位切换；这类记录不能仅凭账号
+        # 失效状态直接标记为已入箱。
+        if not row.get("member_id") and str(row.get("workspace_join_status") or "") != "joined":
+            skipped += 1
+            continue
+        if db.update_workspace_candidate_trash(
+            workspace_id,
+            email,
+            status="trashed",
+            due_at=0,
+            reason="account_invalid",
+        ):
+            marked += 1
+            pending_seat_rows.append(row)
+
+    seat_pending = 0
+    for row in pending_seat_rows:
+        workspace_id = int(row["workspace_master_id"])
+        email = str(row["email"]).strip().lower()
+        if _is_codex_seat(row.get("seat_type")):
+            continue
+        if not row.get("member_id") and str(row.get("workspace_join_status") or "") != "joined":
+            continue
+        try:
+            result = workspace_membership.trash_workspace_candidate(
+                workspace_id,
+                email,
+                reason="account_invalid",
+                retries=1,
+            )
+            if not result.get("ok"):
+                # 失效账号补偿流程历史上会先写入 trashed，再切换席位。
+                # 席位未确认 usage_based 时必须回滚，避免出现“已入箱但仍是
+                # 标准/ProLite 席位”的不一致状态。
+                db.update_workspace_candidate_trash(
+                    workspace_id,
+                    email,
+                    status="active",
+                    due_at=0,
+                    reason="",
+                )
+                seat_pending += 1
+        except Exception:
+            seat_pending += 1
+            # trash_workspace_candidate 可能在席位复查过程中抛错；此前的
+            # 兼容路径会先写 trashed，此处同样回滚，确保“未确认
+            # usage_based 就不能入箱”。
+            try:
+                db.update_workspace_candidate_trash(
+                    workspace_id,
+                    email,
+                    status="active",
+                    due_at=0,
+                    reason="",
+                )
+            except Exception:
+                logger.exception(
+                    "失效候选人垃圾箱状态回滚失败 workspace_db_id=%s email=%s",
+                    workspace_id,
+                    email,
+                )
+            logger.exception(
+                "失效候选人入箱后席位处理失败 workspace_db_id=%s email=%s",
+                workspace_id,
+                email,
+            )
+    return {
+        "scanned": len(rows),
+        "marked": marked,
+        "skipped": skipped,
+        "seat_pending": seat_pending,
+    }
+
+
 def _trash_sweeper_worker():
     while not _trash_sweeper_stop.is_set():
         try:
+            reconciled = _reconcile_invalid_candidate_trash()
+            if reconciled["marked"]:
+                logger.info("失效候选人自动入箱补偿完成 result=%s", reconciled)
             quota_lease_pools: dict[int, public_relogin.ProxyLeasePool] = {}
             for row in db.list_workspace_candidate_trash_due():
                 if _trash_sweeper_stop.is_set():
@@ -1796,7 +1971,11 @@ def _wait_and_relogin_for_candidate(workspace_id: int, email: str, settings: dic
     if account and account.get("account_status") == "permanently_invalid":
         if _candidate_trash_invalid_enabled(workspace_id, settings):
             try:
-                workspace_membership.trash_workspace_candidates_by_email(email, reason="login_403")
+                workspace_membership.trash_workspace_candidates_by_email(
+                    email,
+                    reason="login_403",
+                    respect_invalid_settings=True,
+                )
             except Exception:
                 logger.exception("账号失效后垃圾箱处理失败 workspace_db_id=%s email=%s", workspace_id, email)
         return False
@@ -1896,14 +2075,16 @@ def api_trash_workspace_candidates(req: WorkspaceCandidatesReq):
     results = []
     for email in emails:
         try:
+            result = workspace_membership.trash_workspace_candidate(
+                req.workspace_id,
+                email,
+                reason="manual_trash",
+            )
             results.append({
                 "email": email,
-                "ok": True,
-                "result": workspace_membership.trash_workspace_candidate(
-                    req.workspace_id,
-                    email,
-                    reason="manual_trash",
-                ),
+                "ok": bool(result.get("ok")),
+                "result": result,
+                "error": result.get("error", ""),
             })
         except Exception as exc:
             logger.exception("候选垃圾箱处理失败 workspace_db_id=%s email=%s", req.workspace_id, email)
@@ -1913,6 +2094,27 @@ def api_trash_workspace_candidates(req: WorkspaceCandidatesReq):
         "results": results,
         "trashed": sum(1 for item in results if item.get("ok")),
         "failed": sum(1 for item in results if not item.get("ok")),
+    }
+
+
+@app.post("/api/workspace-candidates/trash/restore")
+def api_restore_workspace_candidates_from_trash(req: WorkspaceCandidatesReq):
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    indexed = _workspace_candidate_index(req.workspace_id)
+    emails = list(dict.fromkeys(
+        email.strip().lower()
+        for email in req.emails
+        if email.strip() and email.strip().lower() in indexed
+    ))
+    if not emails:
+        raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    trashed = [email for email in emails if indexed[email].get("trash_status") == "trashed"]
+    restored = db.restore_workspace_candidates_from_trash(req.workspace_id, trashed)
+    return {
+        "ok": True,
+        "restored": restored,
+        "skipped": len(emails) - restored,
     }
 
 
@@ -1927,6 +2129,7 @@ def api_workspace_candidate_options(
     seat_type: str = "",
     trash_status: str = "",
     tag_status: str = "",
+    group_name: str = "",
 ):
     limit = max(1, min(1000, int(limit or 100)))
     offset = max(0, int(offset or 0))
@@ -1935,13 +2138,24 @@ def api_workspace_candidate_options(
         account_status=account_status, join_status=join_status,
         credential_status=credential_status, seat_type=seat_type,
         trash_status=trash_status, tag_status=tag_status,
+        group_name=group_name,
     )
+    for item in items:
+        reason = _candidate_quota_ineligible_reason(item)
+        item["quota_eligible"] = not reason
+        item["quota_ineligible_reason"] = reason
     total = db.count_workspace_candidate_options(
         workspace_id, account_status=account_status, join_status=join_status,
         credential_status=credential_status, seat_type=seat_type,
         trash_status=trash_status, tag_status=tag_status,
+        group_name=group_name,
     )
     return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/workspace-candidates/groups")
+def api_workspace_candidate_groups(workspace_id: int):
+    return {"ok": True, "groups": db.list_workspace_candidate_groups(workspace_id)}
 
 
 @app.get("/api/workspace-candidates")
@@ -1996,8 +2210,8 @@ def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
     assigned = {r["email"] for r in db.list_workspace_candidates(req.workspace_id)}
     if any(email.lower() not in assigned for email in req.emails):
         raise HTTPException(400, "只能邀请已划分到当前母号空间的候选人")
-    if req.seat_type not in {"default", "usage_based"}:
-        raise HTTPException(400, "席位类型只能是标准席位或 Usage-based")
+    if req.seat_type not in {"default", "usage_based", "prolite"}:
+        raise HTTPException(400, "席位类型只能是标准席位、Usage-based 或 ProLite")
     invite_error = ""
     try:
         result = workspace_membership.invite_candidates(req.workspace_id, req.emails, seat_type=req.seat_type)
@@ -2041,8 +2255,8 @@ def api_request_workspace_join(req: WorkspaceCandidatesReq):
     if not req.emails: raise HTTPException(400, "请选择候选人")
     _reject_permanently_invalid(req.emails)
     _reject_trashed_candidates(req.workspace_id, req.emails)
-    if req.seat_type not in {"default", "usage_based"}:
-        raise HTTPException(400, "席位类型只能是标准席位或 Usage-based")
+    if req.seat_type not in {"default", "usage_based", "prolite"}:
+        raise HTTPException(400, "席位类型只能是标准席位、Usage-based 或 ProLite")
     rows = db.list_workspace_candidates(req.workspace_id)
     indexed = {r["email"]: r for r in rows}; results = []
     pool_values = [line.strip() for line in req.proxy_pool.splitlines() if line.strip()]
@@ -2087,6 +2301,13 @@ def api_check_workspace_candidates(req: WorkspaceCandidatesReq):
             include_seats=True,
         )
     except Exception as e:
+        logger.error(
+            "候选状态校验失败 workspace_db_id=%s emails=%s error_type=%s error=%s",
+            req.workspace_id,
+            emails,
+            type(e).__name__,
+            str(e)[:500],
+        )
         logger.exception("候选状态校验失败 workspace_db_id=%s", req.workspace_id)
         status_code = 429 if getattr(e, "status_code", 0) == 429 else 400
         raise HTTPException(status_code, str(e))
@@ -2095,7 +2316,7 @@ def api_check_workspace_candidates(req: WorkspaceCandidatesReq):
     for email, info in seats.items():
         db.update_workspace_candidate_seats(req.workspace_id, email, info.get("codex_seat", ""), info.get("gpt_seat", ""))
         db.update_workspace_candidate_member(req.workspace_id, email, info.get("member_id", ""), info.get("raw_seat_type", ""))
-    return {"ok": True, "states": states}
+    return {"ok": True, "states": states, "seats": seats}
 
 
 @app.post("/api/workspace-candidates/invite-status")
@@ -2115,8 +2336,15 @@ def api_update_workspace_candidate_invite_status(req: WorkspaceCandidateInviteSt
 @app.post("/api/workspace-candidates/seat")
 def api_update_candidate_seat(req: WorkspaceCandidatesReq):
     if not req.emails: raise HTTPException(400, "请选择候选人")
-    if req.seat_type not in {"default", "usage_based"}: raise HTTPException(400, "席位类型无效")
-    indexed = {r["email"]: r for r in db.list_workspace_candidate_options(req.workspace_id)}; results = []
+    if req.seat_type not in {"default", "usage_based", "prolite"}: raise HTTPException(400, "席位类型无效")
+    # 席位切换是成员管理操作，允许处理已标记出库的成员；候选列表接口
+    # 默认隐藏出库记录，因此这里显式合并 active/outbound 两个视图。
+    indexed = {
+        r["email"]: r
+        for tag_filter in ("active", "outbound")
+        for r in db.list_workspace_candidate_options(req.workspace_id, tag_status=tag_filter)
+    }
+    results = []
     def canonical_seat(value: object) -> str:
         # 历史数据可能保存过 usage-based / usagebased，统一后再比较。
         value = str(value or "").strip().lower().replace("-", "_")
@@ -2124,6 +2352,8 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
             return "usage_based"
         if value in {"default", "standard", "standard_seat", "gpt席位", "标准席位"}:
             return "default"
+        if value in {"prolite", "pro_lite"}:
+            return "prolite"
         return value
     settings = db.get_workspace_settings(req.workspace_id)
     for email in req.emails:
@@ -2134,7 +2364,8 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
             if row.get("workspace_join_status") != "joined":
                 raise RuntimeError("候选人尚未加入当前空间")
             current_seat = canonical_seat(row.get("seat_label") or row.get("seat_type"))
-            if req.seat_type == "default" or current_seat not in {"default", "usage_based"}:
+            # 只有本地席位信息为空（不在已知范围内）才去远端获取
+            if current_seat not in {"default", "usage_based", "prolite"}:
                 fresh = workspace_membership.fetch_candidate_seats(req.workspace_id, [email]).get(key, {})
                 if not row.get("member_id"):
                     row["member_id"] = fresh.get("member_id", "")
@@ -2144,6 +2375,9 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
                     or fresh.get("gpt_seat")
                     or fresh.get("codex_seat")
                 )
+                # 同步更新本地席位信息
+                if current_seat in {"default", "usage_based", "prolite"}:
+                    db.update_workspace_candidate_member(req.workspace_id, email, fresh.get("member_id", row.get("member_id", "")), current_seat)
             if current_seat == req.seat_type:
                 results.append({
                     "email": key,
@@ -2157,7 +2391,7 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
                 fresh = workspace_membership.fetch_candidate_seats(req.workspace_id, [email]).get(key, {})
                 row["member_id"] = fresh.get("member_id", "")
             if not row.get("member_id"): raise RuntimeError("未获取到成员 member_id，请先校验候选状态")
-            if req.seat_type == "default" and current_seat == "usage_based":
+            if req.seat_type == "default" and current_seat in {"usage_based", "prolite"}:
                 reservation = db.reserve_workspace_seat_protect_quota(req.workspace_id, 1)
                 if not reservation.get("allowed", False):
                     raise RuntimeError(
@@ -2170,6 +2404,14 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
             db.update_workspace_candidate_member(req.workspace_id, email, row["member_id"], req.seat_type)
             results.append({"email": key, "ok": True, "skipped": False, "result": result})
         except Exception as e:
+            logger.error(
+                "候选席位切换失败 workspace_db_id=%s email=%s target_seat=%s error_type=%s error=%s",
+                req.workspace_id,
+                key,
+                req.seat_type,
+                type(e).__name__,
+                str(e)[:500],
+            )
             if reserved:
                 try:
                     db.release_workspace_seat_protect_quota(req.workspace_id, 1)
@@ -2201,21 +2443,19 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    options = {
-        r["email"] for r in db.list_workspace_candidate_options(req.workspace_id)
-        if r.get("has_workspace_access_token")
-        and r.get("account_status") != "permanently_invalid"
-        and not _is_codex_seat(r.get("seat_label") or r.get("seat_type"))
+    candidate_rows = {
+        str(row.get("email") or "").strip().lower(): row
+        for row in db.list_workspace_candidate_options(req.workspace_id)
+        if str(row.get("email") or "").strip()
     }
-    invalid_emails = db.list_registered_invalid_emails(req.emails)
     results = {}
     logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(req.proxy_pool.strip() or str(settings.get("proxy_pool") or "").strip()))
     trash_delay = _candidate_trash_delay_seconds(req.workspace_id, settings)
     for email in req.emails:
-        key = email.lower()
-        if key not in options:
-            if key in invalid_emails:
-                results[key] = {"ok": False, "error": "账号已永久失效"}
+        key = email.strip().lower()
+        ineligible_reason = _candidate_quota_ineligible_reason(candidate_rows.get(key))
+        if ineligible_reason:
+            results[key] = {"ok": False, "error": ineligible_reason, "skipped": True}
             continue
         quota = None
         quota_proxy = ""
@@ -2473,6 +2713,80 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
         raise HTTPException(400, result.get("error", "空间凭证任务启动失败"))
     return {"ok": True, "run": result, "workspace_id": master["workspace_id"], "eligible": len(eligible), "skipped": len(skipped), "skipped_emails": skipped}
 
+
+@app.post("/api/workspace-candidates/login-only")
+def api_workspace_login_only(req: WorkspaceCandidatesReq):
+    """仅登录空间（跳过 OAuth，不获取 access_token）"""
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    _reject_trashed_candidates(req.workspace_id, req.emails)
+    master = db.get_workspace_master(req.workspace_id)
+    if not master or not master.get("workspace_id"):
+        raise HTTPException(400, "母号缺少 Workspace ID")
+    invalid = db.list_registered_invalid_emails(req.emails)
+    active_emails = [email for email in req.emails if email.lower() not in invalid]
+    for email in invalid:
+        db.update_workspace_candidate_status(req.workspace_id, email, "permanently_invalid")
+    if not active_emails:
+        return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(invalid), "skipped_emails": sorted(invalid)}
+    eligible = []
+    skipped = sorted(invalid)
+    candidate_rows = {
+        str(row.get("email") or "").strip().lower(): row
+        for row in (db.get_workspace_candidate(req.workspace_id, email) for email in active_emails)
+        if row
+    }
+    trusted_eligible = []
+    need_check = []
+    for email in active_emails:
+        current_status = str(
+            (candidate_rows.get(email) or {}).get("workspace_join_status") or ""
+        ).strip()
+        if current_status in {"pending_invite", "joined"}:
+            trusted_eligible.append(email)
+        else:
+            need_check.append(email)
+    if need_check:
+        try:
+            states = workspace_membership.check_candidate_membership(req.workspace_id, need_check)
+        except Exception as exc:
+            logger.exception("仅登录任务候选状态校验失败 workspace_db_id=%s", req.workspace_id)
+            status_code = 429 if getattr(exc, "status_code", 0) == 429 else 400
+            raise HTTPException(status_code, str(exc))
+        for email, status in states.items():
+            db.update_workspace_candidate_status(req.workspace_id, email, status)
+            if status == "pending_request":
+                workspace_membership.approve_candidate_request(req.workspace_id, email, req.seat_type)
+                db.update_workspace_candidate_status(req.workspace_id, email, "approved")
+                skipped.append(email)
+            elif status in {"joined", "pending_invite"}:
+                eligible.append(email)
+            else:
+                skipped.append(email)
+    eligible = trusted_eligible + eligible
+    proxy_pool = req.proxy_pool
+    if not proxy_pool:
+        raise HTTPException(400, "全局代理池为空")
+    if not eligible:
+        return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(skipped), "skipped_emails": skipped}
+    result = login_controller_for(
+        workspace_db_id=req.workspace_id,
+        workspace_id=master["workspace_id"],
+        ensure_credentials=False,
+    ).start({
+        "login_only": True, "ensure_credentials": False,
+        "login_emails": eligible, "group_name": "__all__",
+        "workspace_id": master["workspace_id"], "workspace_db_id": req.workspace_id, "proxy_pool": proxy_pool,
+        "proxy": "", "proxy_usage_detail": "workspace_login_only",
+        "concurrency": req.concurrency, "otp_timeout": req.otp_timeout,
+        "want_access_token": False, "want_session_token": True, "want_refresh_token": False,
+        "want_password": False, "want_2fa": False, "allow_existing_login": True,
+        "cool_down_seconds": req.cool_down_seconds, "account_retry_count": req.account_retry_count, "auto_export": False,
+        "export_refresh_oauth": False, "target_count": 0,
+    })
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "仅登录任务启动失败"))
+    return {"ok": True, "run": result, "workspace_id": master["workspace_id"], "eligible": len(eligible), "skipped": len(skipped), "skipped_emails": skipped}
 
 @app.post("/api/workspaces/{workspace_id}/sync")
 def api_sync_workspace(workspace_id: int):
@@ -2939,6 +3253,7 @@ class ExportRegisteredReq(BaseModel):
     emails: Optional[list[str]] = Field(None, description="要导出的 email 列表")
     all: bool = Field(False, description="true = 导出全部（跨页），忽略 emails")
     workspace_id: Optional[int] = Field(None, description="按指定 Team 空间导出其独立凭证")
+    proxy_pool: str = Field("", description="刷新 Sub2 OAuth token 使用的代理池")
 
 
 @app.post("/api/registered/export")
@@ -2947,7 +3262,14 @@ def api_export_registered(req: ExportRegisteredReq):
     if fmt is None:
         raise HTTPException(400, f"未知导出格式: {req.format}")
 
-    if req.workspace_id:
+    # 候选管理页带 workspace_id，但邮箱/密码/2FA 是注册结果的账号凭证，
+    # 不属于 workspace_credentials。若继续统一走空间凭证查询，会在部分
+    # 候选尚未同步空间凭证时丢掉密码/TOTP，导出成空字段。文本凭证格式
+    # 始终按勾选邮箱读取 registered（同时 LEFT JOIN 带出 relay_url）。
+    credential_text_formats = {"email_pw", "email_pw_2fa", "email_pw_2fa_relay"}
+    if req.workspace_id and req.format in credential_text_formats:
+        rows = db.list_registered_by_emails(req.emails or [])
+    elif req.workspace_id:
         if not req.emails:
             raise HTTPException(400, "Team 空间导出需要 emails")
         rows = db.list_workspace_credentials_by_emails(req.workspace_id, req.emails)
@@ -2959,7 +3281,75 @@ def api_export_registered(req: ExportRegisteredReq):
         raise HTTPException(400, "需要 emails 或 all=true")
 
     # 不跳行：勾了几个号就几行 / 几个文件，字段为空也照样出。
-    # 手动导出**不做 refresh_token 刷新、不因为缺 rt 拦截**，这是和自动推送的区别。
+    # CPA 不做 refresh_token 刷新；SUB2API 需要刷新（DB 中是 NextAuth AT，401）。
+    if fmt.id == "sub2api":
+        from . import exporter as _exp
+        refresh_proxies = _public_relogin_proxy_pool(req.proxy_pool, "")
+        refresh_leases = public_relogin.ProxyLeasePool(refresh_proxies)
+        refreshed_rows = []
+        for r in rows:
+            rt = str(r.get("refresh_token") or "").strip()
+            if rt:
+                try:
+                    refresh_proxy, _, _ = refresh_leases.lease(
+                        task_type="other",
+                        task_detail="sub2_token_refresh",
+                    )
+                    fresh = _exp.refresh_codex_token(
+                        rt,
+                        timeout=30,
+                        proxy=refresh_proxy,
+                        client_id=_exp.CODEX_CLIENT_ID,
+                    )
+                    _exp.validate_sub2_token_pair(
+                        fresh.get("access_token", ""),
+                        fresh.get("id_token", ""),
+                    )
+                    r = {
+                        **r,
+                        "access_token":  fresh["access_token"],
+                        "refresh_token": fresh.get("refresh_token") or r.get("refresh_token"),
+                        "id_token":      fresh.get("id_token") or r.get("id_token", ""),
+                    }
+                    _exp.validate_sub2_token_pair(r.get("access_token", ""), r.get("id_token", ""))
+                    # 刷新 token 会轮换 RT，必须把整组 AT/RT/ID 写回正确的
+                    # 凭证域。候选导出写 workspace_credentials，不能污染
+                    # registered 中的 Personal 凭证。
+                    try:
+                        if req.workspace_id:
+                            db.save_workspace_credential(req.workspace_id, r)
+                        else:
+                            db.update_registered_oauth_tokens(
+                                r.get("email", ""),
+                                access_token=r.get("access_token", ""),
+                                refresh_token=r.get("refresh_token", ""),
+                                id_token=r.get("id_token", ""),
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Sub2 刷新凭证回写失败 email=%s workspace_db_id=%s",
+                            r.get("email", ""), req.workspace_id,
+                        )
+                        raise
+                except Exception as e:
+                    raise HTTPException(
+                        502,
+                        f"Sub2 导出前 refresh_token 刷新失败（{r.get('email', '')}）：{e}",
+                    ) from e
+            else:
+                try:
+                    _exp.validate_sub2_token_pair(
+                        r.get("access_token", ""),
+                        r.get("id_token", ""),
+                    )
+                except Exception as e:
+                    raise HTTPException(
+                        502,
+                        f"Sub2 导出前凭证一致性校验失败（{r.get('email', '')}）：{e}",
+                    ) from e
+            refreshed_rows.append(r)
+        rows = refreshed_rows
+
     base = {
         "ok": True,
         "count": len(rows),
@@ -2976,7 +3366,11 @@ def api_export_registered(req: ExportRegisteredReq):
 
     if fmt.mode == "download":
         # 二进制（zip / json 文件）走 base64，前端解出来直接存盘，不弹预览
-        blob = export_formats.render_bytes(rows, fmt)
+        try:
+            blob = export_formats.render_bytes(rows, fmt)
+        except Exception as exc:
+            prefix = "Sub2 导出凭证一致性校验失败" if fmt.id == "sub2api" else "导出文件生成失败"
+            raise HTTPException(502, f"{prefix}：{exc}") from exc
         return {**base, "b64": base64.b64encode(blob).decode("ascii"), "size": len(blob)}
 
     return {**base, "text": export_formats.render_text(rows, fmt)}
@@ -3281,7 +3675,15 @@ def api_manual_export_to_panel(req: ManualExportReq):
         sub2api_cfg = dict(cfg["sub2api"])
         sub2api_cfg["enabled"] = True
         try:
-            out["sub2api"] = exporter.export_to_sub2api(cred, sub2api_cfg)
+            out["sub2api"] = exporter.export_to_sub2api(
+                cred, sub2api_cfg,
+                on_tokens_refreshed=lambda fresh_cred: db.update_registered_oauth_tokens(
+                    fresh_cred.get("email", ""),
+                    access_token=fresh_cred.get("access_token", ""),
+                    refresh_token=fresh_cred.get("refresh_token", ""),
+                    id_token=fresh_cred.get("id_token", ""),
+                ),
+            )
         except Exception as e:
             out["sub2api"] = {"ok": False, "error": str(e)}
 
@@ -3744,4 +4146,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("webui.app:app", host="127.0.0.1", port=8765, reload=False)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+    uvicorn.run("webui.app:app", host="127.0.0.1", port=args.port, reload=False)

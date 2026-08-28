@@ -52,7 +52,7 @@ def main():
     import uvicorn
 
     url = f"http://{args.host if args.host != '0.0.0.0' else '127.0.0.1'}:{args.port}/"
-    print(f"\n🔔 GPT Outlook Register WebUI 启动中...")
+    print(f"\n🔔 team-auto 启动中...")
     print(f"   访问: {url}\n")
 
     if not args.no_browser:

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Any, Callable
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
@@ -90,6 +90,94 @@ def _is_permanently_invalid_error(text: str) -> bool:
     """只识别明确的账号失效正文，避免把 Cloudflare 403 当成封号。"""
     value = str(text or "").lower()
     return any(marker in value for marker in _PERMANENT_INVALID_MARKERS)
+
+
+def _normalize_camoufox_profile_age(value: Any, *, minimum: int = 18, maximum: int = 120) -> int:
+    """将资料页年龄规范化为可提交的整数。
+
+    年龄由本地随机资料生成器提供时通常落在 18～55，但浏览器端的值还
+    需要单独校验，避免 OTP 输入框状态污染后把数百位数字提交给上游。
+    """
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"\d{1,3}", raw):
+        raise ValueError(f"年龄必须是 1～3 位数字，实际值={raw[:32]!r}")
+    age = int(raw)
+    if not minimum <= age <= maximum:
+        raise ValueError(f"年龄必须在 {minimum}～{maximum} 之间，实际值={age}")
+    return age
+
+
+def _camoufox_birthday_for_age(value: Any, *, today: date | None = None) -> str:
+    """为资料页生成一个已经过生日的 ISO 出生日期。"""
+    age = _normalize_camoufox_profile_age(value)
+    current = today or date.today()
+    # 统一使用 1 月 1 日，确保在当前年份已经过生日，年龄不会少一岁。
+    return f"{current.year - age:04d}-01-01"
+
+
+def _normalize_camoufox_birthday(value: Any) -> str:
+    """把 date/text 输入框中的生日值规范化为 YYYY-MM-DD。"""
+    raw = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError(f"生日必须是有效日期，实际值={raw[:32]!r}")
+
+
+def _classify_camoufox_profile_response(status: int | None, body: str = "") -> str:
+    """分类资料提交响应，返回 success/retry/age/permanent/unknown。"""
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        code = 0
+    lowered = str(body or "").lower().replace("’", "'")
+
+    if any(marker in lowered for marker in (
+        "enter a valid age",
+        "invalid age",
+        "age must be",
+        "age is required",
+    )):
+        return "age"
+    if any(marker in lowered for marker in (
+        "user_already_exists",
+        "user already exists",
+        "account already exists",
+        "email already exists",
+    )):
+        return "permanent"
+    # 某些版本会用 200/202 返回业务错误页面，先检查错误正文再判断
+    # HTTP 成功，避免把“提交失败但接口返回 200”误判为成功。
+    if 200 <= code < 300:
+        if any(marker in lowered for marker in (
+            "we can't create your account",
+            "something went wrong",
+            "please try again",
+            "unable to create",
+            "could not create",
+            "error",
+            "failed",
+        )):
+            return "retry"
+        return "success"
+    # 400 的 Terms 文案在实际运行中也可能是上游风控/网络抖动产生的
+    # 临时页面；交给有上限的重试流程处理，连续失败后再向上抛错。
+    if code in {0, 408, 425, 429} or code >= 500:
+        return "retry"
+    if any(marker in lowered for marker in (
+        "we can't create your account",
+        "we can't create your account due to our terms of use",
+        "something went wrong",
+        "please try again",
+        "unable to create",
+        "could not create",
+        "temporarily unavailable",
+        "network error",
+    )):
+        return "retry"
+    return "unknown"
 
 
 class _MissingTOTPSecretError(RuntimeError):
@@ -3738,16 +3826,39 @@ class AuthFlow:
         ``/api/accounts/user/register`` 接口。后者不是“重置密码”：账号原本
         没有密码，所以必须在当前授权状态里走这个创建接口。
 
-        ``password`` 为空时保持原有注册行为，自动生成随机密码；已有账号的
-        凭证补齐分支会显式传入待创建的密码。只有接口明确返回成功后才写入
-        ``result.password`` 和 ``on_password`` 回调，避免把失败请求的密码误存。
+        ``password`` 为空时保持原有注册行为，自动生成随机密码；如果本轮
+        已经有候选密码则优先复用。密码一旦被本地确定，就立即写入
+        ``result.password`` 和 ``on_password`` 回调；远端响应失败/超时也不能
+        丢弃它，因为服务端可能已经完成写入但响应在网络中丢失。
         """
         logger.info(
             "%s...",
             "[login] 创建已有 passwordless 账号密码" if existing_account else "[5.5/10] 注册密码",
         )
-        password = str(password or "").strip() or self._random_password()
+        password = str(
+            password or getattr(self.result, "password", "") or ""
+        ).strip()
+        if not password and getattr(self, "_account_callback", None):
+            try:
+                saved = self._account_callback(email) or {}
+                password = str(saved.get("password") or "").strip()
+                if password:
+                    logger.info("密码创建/重试复用账号回调中的历史密码")
+            except Exception as exc:
+                logger.debug("读取历史密码候选失败，继续生成新密码: %s", exc)
+        password = password or self._random_password()
         self._last_password_continue_url = ""
+
+        # 密码候选的持久化以“本地首次确定”为准，而不是等待远端响应。
+        # 这样即使 POST 已在服务端生效但返回包丢失，下次重试仍会拿同一
+        # 个密码；如果服务端确实未生效，下一次进入 Create a password 页面
+        # 使用这个候选重新创建同样安全。
+        self.result.password = password
+        if self._on_password is not None:
+            try:
+                self._on_password(email, password)
+            except Exception as e:
+                logger.warning(f"密码候选早落盘失败（不影响注册）: {e}")
 
         # 新注册和 passwordless 老账号都必须先建立同一个注册密码步骤。
         # 过去已有账号分支跳过这一步，随后又打开 reset-password 页面，正是
@@ -3899,20 +4010,12 @@ class AuthFlow:
             # full URL/workspace helpers.  The raw server URL is still useful
             # and must not turn a successful password creation into a failure.
             self._last_password_continue_url = raw_password_continue
-        self.result.password = password
         logger.info("密码创建成功%s", "（已有 passwordless 账号）" if existing_account else "")
-        # ⚠️ 走到这里 = OpenAI 侧账号连同这个密码**已经建好了**，但注册流程后面还有
-        #    发码 → 验证 OTP → create_account 三步，任何一步挂掉都到不了 save_registered。
-        #    密码是这个方法现生成的、只活在内存里，进程一退就永久没了 ——
-        #    号还在 OpenAI 那边好好的，却谁也登不进去（实测 2026-08-07 被 OTP 超时坑过一次）。
-        #    所以在这里立刻回调落盘。
-        #    位置刻意选在 POST 200 **之后**而不是生成密码时：POST 失败的密码
-        #    OpenAI 侧根本没生效，写进库里反而误导人以为能用。
-        if self._on_password is not None:
-            try:
-                self._on_password(email, password)
-            except Exception as e:
-                logger.warning(f"密码落盘回调失败（不影响注册，日志里还有兜底）: {e}")
+        # ⚠️ 注册流程后面还有发码 → 验证 OTP → create_account 多个步骤，任何一步
+        #    挂掉都可能到不了 save_registered。密码候选已在请求前落盘，防止
+        #    “远端已写入但响应丢失”时下一轮丢失唯一可用密码。
+        # 密码已经在请求前落盘；这里不重复回调，避免并发重试误把候选当成
+        # 新密码写入。无论响应是否可读，result.password 都保持该候选值。
         return True
 
     def create_password_via_api(self, email: str, password: str) -> bool:
@@ -5037,7 +5140,36 @@ class AuthFlow:
         # 重试场景由 registrar 预先注入已落盘密码；此时这是登录密码，
         # 不能再生成新密码或等待 Create a password 页面。
         known_password = str(self.result.password or "").strip()
+        if not known_password and self._account_callback:
+            try:
+                saved = self._account_callback(email) or {}
+                known_password = str(saved.get("password") or "").strip()
+                if known_password:
+                    self.result.password = known_password
+                    logger.info("[camoufox] 已从账号回调加载历史 OpenAI 密码")
+            except Exception as exc:
+                logger.warning("[camoufox] 加载历史 OpenAI 密码失败: %s", exc)
         password = known_password or (self._random_password() if want_password else "")
+        if password and not known_password:
+            # Camoufox 的密码提交响应可能丢失，但服务端仍可能已经写入；
+            # 从生成这一刻起固定候选并落盘，后续页面分支都复用它。
+            self.result.password = password
+            if self._on_password is not None:
+                try:
+                    self._on_password(email, password)
+                except Exception as exc:
+                    logger.warning("Camoufox 密码候选早落盘失败（不影响注册）: %s", exc)
+        try:
+            _password_submit_timeout = int(
+                self._get_env("OPENAI_CAMOUFOX_PASSWORD_SUBMIT_TIMEOUT", "60") or "60"
+            )
+        except (TypeError, ValueError):
+            _password_submit_timeout = 60
+        _password_submit_timeout = max(20, min(_password_submit_timeout, 180))
+        logger.info(
+            "[camoufox] 密码提交等待窗口=%ss（响应慢时保留同一密码候选）",
+            _password_submit_timeout,
+        )
 
         browser_proxy, proxy_display = self._camoufox_proxy_config()
         headless_env = (self._get_env("OPENAI_CAMOUFOX_REGISTER_HEADLESS", "") or "").strip().lower()
@@ -5146,6 +5278,299 @@ class AuthFlow:
                     logger.debug("[camoufox] 资料按钮 %s 点击失败: %s", button_text, str(exc)[:160])
             raise RuntimeError("Camoufox 注册年龄/姓名页面未找到 Finish creating account 或 Continue")
 
+        _password_response = {
+            "seen": False,
+            "status": 0,
+            "url": "",
+            "body": "",
+        }
+
+        def _observe_password_submission_response(response) -> None:
+            try:
+                response_url = str(getattr(response, "url", "") or "")
+                lowered_url = response_url.lower()
+                if not any(marker in lowered_url for marker in (
+                    "/api/accounts/password/verify",
+                    "/api/accounts/user/register",
+                    "/api/accounts/create_account",
+                )):
+                    return
+                status = int(getattr(response, "status", 0) or 0)
+                body = ""
+                try:
+                    body = str(response.text() or "")[:2_000]
+                except Exception:
+                    pass
+                _password_response.update({
+                    "seen": True,
+                    "status": status,
+                    "url": response_url,
+                    "body": body,
+                })
+                logger.info(
+                    "[camoufox] password submission response status=%s url=%s body=%s",
+                    status,
+                    response_url[:180],
+                    re.sub(r"\s+", " ", body)[:240],
+                )
+            except Exception:
+                pass
+
+        def _install_password_observer(current_page) -> None:
+            try:
+                current_page.on("response", _observe_password_submission_response)
+            except Exception as exc:
+                logger.debug("[camoufox] 密码响应监听器安装失败: %s", exc)
+
+        def _reset_password_response() -> None:
+            _password_response.update({
+                "seen": False,
+                "status": 0,
+                "url": "",
+                "body": "",
+            })
+
+        def _remember_password_created(candidate: str) -> None:
+            value = str(candidate or "").strip()
+            if not value:
+                return
+            if str(self.result.password or "").strip() == value:
+                return
+            self.result.password = value
+            if self._on_password is not None:
+                try:
+                    self._on_password(email, value)
+                except Exception as exc:
+                    logger.warning("Camoufox 密码早落盘失败（不影响流程）: %s", exc)
+
+        def _wait_password_submission(current_page, timeout_seconds: int = 60) -> bool:
+            """等待密码提交得到明确的成功转场/2xx 响应。"""
+            started_at = time.time()
+            deadline = started_at + max(3, timeout_seconds)
+            last_progress_log = 0
+            while time.time() < deadline:
+                if _is_incorrect_password_page(current_page):
+                    return False
+                try:
+                    title = str(current_page.title() or "")
+                except Exception:
+                    title = ""
+                if title in {
+                    "Check your inbox - OpenAI",
+                    "Check your authenticator app - OpenAI",
+                    "How old are you? - OpenAI",
+                    "Let's confirm your age - OpenAI",
+                    "Let's confirm your age? - OpenAI",
+                    "ChatGPT",
+                    "ChatGPT: Chat, Work, Create & Code with AI",
+                } or _profile_success_page(current_page):
+                    return True
+                try:
+                    status = int(_password_response.get("status") or 0)
+                except (TypeError, ValueError):
+                    status = 0
+                if _password_response.get("seen") and 200 <= status < 300:
+                    body_lower = str(_password_response.get("body") or "").lower()
+                    if not any(marker in body_lower for marker in (
+                        "incorrect email address or password",
+                        "incorrect password",
+                        "invalid password",
+                        "invalid auth step",
+                        "invalid_state",
+                    )):
+                        # API 已接受请求，页面跳转可能还在异步进行。
+                        # 返回 True 允许保存密码；后续页面等待仍会负责捕获
+                        # 真正的流程错误。
+                        return True
+                elapsed = int(time.time() - started_at)
+                progress_bucket = elapsed // 10
+                if progress_bucket > last_progress_log:
+                    last_progress_log = progress_bucket
+                    logger.info(
+                        "[camoufox] 密码提交仍在等待 elapsed=%ss/%ss title=%s response_seen=%s",
+                        elapsed,
+                        timeout_seconds,
+                        title[:100],
+                        bool(_password_response.get("seen")),
+                    )
+                try:
+                    current_page.wait_for_timeout(400)
+                except Exception:
+                    time.sleep(0.4)
+            return False
+
+        def _browser_body_text(current_page) -> str:
+            try:
+                return re.sub(
+                    r"\s+", " ",
+                    str(current_page.locator("body").inner_text(timeout=800) or ""),
+                ).strip()
+            except Exception:
+                return ""
+
+        def _is_authenticator_page(current_page) -> bool:
+            try:
+                title = str(current_page.title() or "").lower()
+            except Exception:
+                title = ""
+            body = _browser_body_text(current_page).lower()
+            return any(marker in (title + " " + body) for marker in (
+                "check your authenticator app",
+                "one-time authentication code",
+                "authenticator app",
+            ))
+
+        def _is_incorrect_password_page(current_page) -> bool:
+            body = _browser_body_text(current_page).lower().replace("’", "'")
+            return any(marker in body for marker in (
+                "incorrect email address or password",
+                "incorrect password",
+                "invalid email address or password",
+                "invalid password",
+            ))
+
+        def _find_authenticator_input(current_page):
+            found = _locator(current_page, (
+                "input[autocomplete='one-time-code']",
+                "input[name='code']",
+                "input[inputmode='numeric']",
+            ))
+            if found is not None:
+                return found
+            for label in ("One-time code", "Authentication code", "Code"):
+                try:
+                    candidate = current_page.get_by_label(label, exact=False).first
+                    if candidate.count() and candidate.is_visible():
+                        return candidate
+                except Exception:
+                    continue
+            return None
+
+        def _load_browser_totp_secret(account_email: str) -> str:
+            secret = str(self.result.totp_secret or "").strip()
+            if secret:
+                return secret
+            if self._account_callback:
+                try:
+                    data = self._account_callback(account_email) or {}
+                    secret = str(data.get("totp_secret") or "").strip()
+                    if secret:
+                        self.result.totp_secret = secret
+                        logger.info("[camoufox] 已从数据库加载已有 totp_secret")
+                except Exception as exc:
+                    logger.warning("[camoufox] 读取已有 totp_secret 失败: %s", exc)
+            return secret
+
+        def _click_email_fallback(current_page) -> bool:
+            """在已启用 2FA 但本地没有 secret 时尝试邮箱验证码。"""
+            candidates = (
+                "Email code",
+                "Email me a code",
+                "Get a code by email",
+                "Send a code to your email",
+                "Continue with email",
+                "Use a one-time code",
+                "Log in with a one-time code",
+            )
+            for text_value in candidates:
+                try:
+                    loc = current_page.get_by_text(text_value, exact=False).first
+                    if loc.count() and loc.is_visible() and loc.is_enabled():
+                        loc.click(timeout=5_000)
+                        logger.warning("[camoufox] 2FA secret 不在本地，切换邮箱验证码: %s", text_value)
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        def _click_one_time_login(current_page) -> bool:
+            for text_value in (
+                "Log in with a one-time code",
+                "Login with a one-time code",
+                "Use a one-time code",
+                "Continue with email",
+            ):
+                try:
+                    loc = current_page.get_by_text(text_value, exact=False).first
+                    if loc.count() and loc.is_visible() and loc.is_enabled():
+                        loc.click(timeout=5_000)
+                        logger.warning("[camoufox] 密码校验失败，切换邮箱 OTP: %s", text_value)
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        def _handle_browser_authenticator(account_email: str, current_page) -> str:
+            """处理密码登录后的浏览器 MFA 页面，返回 success/email_otp/failed。"""
+            if not _is_authenticator_page(current_page):
+                return "not_mfa"
+            secret = _load_browser_totp_secret(account_email)
+            if secret:
+                code_input = _find_authenticator_input(current_page)
+                if code_input is not None:
+                    try:
+                        code_input.fill(_totp_now(secret))
+                        _click_continue(current_page)
+                    except Exception as exc:
+                        logger.warning("[camoufox] 浏览器 TOTP 提交失败: %s", exc)
+                    for _ in range(20):
+                        if _profile_success_page(current_page):
+                            return "success"
+                        try:
+                            title = str(current_page.title() or "")
+                        except Exception:
+                            title = ""
+                        if title in {
+                            "ChatGPT",
+                            "ChatGPT: Chat, Work, Create & Code with AI",
+                        }:
+                            return "success"
+                        if title == "Check your inbox - OpenAI":
+                            return "email_otp"
+                        if _is_authenticator_page(current_page) and any(
+                            marker in _browser_body_text(current_page).lower()
+                            for marker in ("invalid", "incorrect", "try again")
+                        ):
+                            break
+                        try:
+                            current_page.wait_for_timeout(500)
+                        except Exception:
+                            time.sleep(0.5)
+                else:
+                    logger.warning("[camoufox] 2FA 页面未找到 One-time code 输入框")
+            # Try another method 可能直接展开选项，也可能需要先点击文本。
+            try:
+                another = current_page.get_by_text("Try another method", exact=False).first
+                if another.count() and another.is_visible():
+                    another.click(timeout=5_000)
+                    try:
+                        current_page.wait_for_timeout(400)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if _click_email_fallback(current_page):
+                for _ in range(30):
+                    try:
+                        title = str(current_page.title() or "")
+                    except Exception:
+                        title = ""
+                    body_lower = _browser_body_text(current_page).lower()
+                    if (
+                        title == "Check your inbox - OpenAI"
+                        or "check your inbox" in body_lower
+                        or "code sent to your email" in body_lower
+                    ):
+                        return "email_otp"
+                    if _profile_success_page(current_page):
+                        return "success"
+                    try:
+                        current_page.wait_for_timeout(400)
+                    except Exception:
+                        time.sleep(0.4)
+                logger.warning("[camoufox] 选择邮箱 2FA 后页面未进入收件箱")
+            return "failed"
+
         def _profile_error_text(page) -> str:
             """提取资料提交后的可见错误，用于决定是否重新点击提交。"""
             try:
@@ -5153,10 +5578,9 @@ class AuthFlow:
             except Exception:
                 return ""
             compact = re.sub(r"\s+", " ", body).strip()
-            lowered = compact.lower()
+            lowered = compact.lower().replace("’", "'")
             markers = (
-                "we can’t create your account",
-                "we can’t create your account",
+                "we can't create your account",
                 "something went wrong",
                 "try again",
                 "please try again",
@@ -5173,6 +5597,153 @@ class AuthFlow:
                 )[:500]
             return ""
 
+        def _profile_success_page(current_page) -> bool:
+            """识别 create_account 成功后的 onboarding 确认页。"""
+            try:
+                title = str(current_page.title() or "").lower()
+            except Exception:
+                title = ""
+            if title in {"chatgpt", "chatgpt: chat, work, create & code with ai"}:
+                return True
+            try:
+                body = str(current_page.locator("body").inner_text(timeout=500) or "")
+            except Exception:
+                return False
+            lowered = re.sub(r"\s+", " ", body).strip().lower().replace("’", "'")
+            return any(marker in lowered for marker in (
+                "you're all set",
+                "account created successfully",
+                "your account is ready",
+            ))
+
+        def _find_profile_field(current_page, field: str):
+            """只定位当前可见的资料输入框，避免复用 OTP 的 number input。"""
+            if field == "name":
+                selectors = (
+                    "input[name='name']",
+                    "input[autocomplete='name']",
+                    "input[placeholder*='Full name']",
+                    "input[placeholder*='Name']",
+                )
+                labels = ("Full name", "Name")
+                fallback_selectors = ()
+            elif field == "birthday":
+                selectors = (
+                    "input[name='birthday']",
+                    "input[name='birthdate']",
+                    "input[name='date_of_birth']",
+                    "input[autocomplete='bday']",
+                    "input[aria-label*='Birthday']",
+                    "input[placeholder*='Birthday']",
+                    "input[placeholder*='MM/DD/YYYY']",
+                    "input[placeholder*='YYYY']",
+                    "input[type='date']",
+                )
+                labels = ("Birthday", "Birth date", "Date of birth")
+                fallback_selectors = ()
+            else:
+                selectors = (
+                    "input[name='age']",
+                    "input[autocomplete='age']",
+                    "input[aria-label='Age']",
+                    "input[placeholder*='Age']",
+                )
+                labels = ("Age",)
+                # type=number 必须等语义化选择器和 label 都失败后再使用，
+                # 防止 OTP 输入框仍在 DOM 中时被误选。
+                fallback_selectors = (
+                    "input[type='number']:not([name='code']):not([autocomplete='one-time-code'])",
+                )
+            found = _locator(current_page, selectors)
+            if found is not None:
+                return found
+            for label in labels:
+                try:
+                    candidate = current_page.get_by_label(label, exact=(label == "Age")).first
+                    if candidate.count() and candidate.is_visible():
+                        return candidate
+                except Exception:
+                    continue
+            return _locator(current_page, fallback_selectors) if fallback_selectors else None
+
+        def _fill_profile_form(
+            current_page,
+            person_name: str,
+            person_age: int,
+            *,
+            birthday_mode: bool = False,
+        ) -> tuple[str, int]:
+            """重新获取并填写资料，返回经过 DOM 校验的实际值。"""
+            normalized_age = _normalize_camoufox_profile_age(person_age)
+            current_name = _find_profile_field(current_page, "name")
+            current_age = _find_profile_field(
+                current_page, "birthday" if birthday_mode else "age"
+            )
+            if current_name is None or current_age is None:
+                raise RuntimeError(
+                    "Camoufox 资料重试时未找到 Full name 或 "
+                    + ("Birthday" if birthday_mode else "Age")
+                    + " 输入框"
+                )
+
+            # fill("") + fill(value) 强制同步 React 受控输入状态；每次重试
+            # 都重新获取 locator，避免页面重渲染后沿用旧的 OTP locator。
+            current_name.fill("")
+            current_age.fill("")
+            current_name.fill(str(person_name))
+            if birthday_mode:
+                birthday_iso = _camoufox_birthday_for_age(normalized_age)
+                try:
+                    input_type = str(current_age.get_attribute("type") or "").lower()
+                except Exception:
+                    input_type = ""
+                birthday_value = (
+                    birthday_iso
+                    if input_type == "date"
+                    else datetime.strptime(birthday_iso, "%Y-%m-%d").strftime("%m/%d/%Y")
+                )
+                current_age.fill(birthday_value)
+            else:
+                current_age.fill(str(normalized_age))
+            try:
+                current_age.press("Tab")
+                current_page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            try:
+                actual_name = str(current_name.input_value() or "").strip()
+                actual_age = str(current_age.input_value() or "").strip()
+            except Exception as exc:
+                raise RuntimeError(f"Camoufox 资料填写后无法读取 DOM 值: {exc}") from exc
+            if actual_name != str(person_name).strip():
+                raise RuntimeError("Camoufox Full name 输入值未同步")
+            if birthday_mode:
+                actual_birthday = _normalize_camoufox_birthday(actual_age)
+                try:
+                    birthday_date = datetime.strptime(actual_birthday, "%Y-%m-%d").date()
+                    today = date.today()
+                    checked_age = today.year - birthday_date.year - (
+                        (today.month, today.day) < (birthday_date.month, birthday_date.day)
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(f"Camoufox Birthday 输入值无效: {actual_age!r}") from exc
+                if not 18 <= checked_age <= 120:
+                    raise RuntimeError(
+                        f"Camoufox Birthday 推算年龄不合法: {actual_birthday} -> {checked_age}"
+                    )
+                logger.info(
+                    "[camoufox] profile_dom_values name=%s birthday=%s age=%s age_valid=true",
+                    actual_name[:80], actual_birthday, checked_age,
+                )
+                return actual_name, checked_age
+            checked_age = _normalize_camoufox_profile_age(actual_age)
+            logger.info(
+                "[camoufox] profile_dom_values name=%s age=%s age_valid=true",
+                actual_name[:80], checked_age,
+            )
+            return actual_name, checked_age
+
         def _check_deadline(label: str = "") -> None:
             """检查全局超时，超时则抛出 RuntimeError 强制退出。"""
             if time.time() >= _camoufox_deadline:
@@ -5184,7 +5755,33 @@ class AuthFlow:
                 logger.error("[camoufox] %s", msg)
                 raise RuntimeError(msg)
 
-        def _wait_titles(page, titles, *, interval_ms: int = 1000, attempts: int = 60) -> bool:
+        # 页面错误关键词 —— 命中任意一个即视为页面加载失败，提前退出轮询
+        _ERROR_KEYWORDS = (
+            "Unable to load site",
+            "This site can’t be reached",
+            "This site can't be reached",
+            "ERR_CONNECTION",
+            "ERR_TIMED_OUT",
+            "ERR_PROXY",
+            "ERR_NAME_NOT_RESOLVED",
+            "Access Denied",
+        )
+
+        def _wait_titles(
+            page,
+            titles,
+            *,
+            interval_ms: int = 1000,
+            attempts: int = 60,
+            error_keywords=_ERROR_KEYWORDS,
+            error_check_interval: int = 3,
+        ) -> bool:
+            """轮询页面标题，同时周期性检查页面文本中是否出现错误提示。
+
+            *error_keywords*: 页面 body 文本中命中即判定为错误的关键词元组。
+            *error_check_interval*: 每隔多少次轮询做一次页面文本检查（默认 3，
+              即第 3、6、9 … 次轮询时检查，避免每秒都读取 body 造成性能开销）。
+            """
             wanted = {str(item) for item in titles}
             last_title = ""
             for index in range(max(1, attempts)):
@@ -5196,6 +5793,22 @@ class AuthFlow:
                 if title in wanted:
                     logger.info("[camoufox] title_poll %s/%s title=%s ✓", index + 1, attempts, title[:120])
                     return True
+
+                # ── 周期性检查页面 body 是否出现错误关键词 ──
+                if error_keywords and index > 0 and index % error_check_interval == 0:
+                    try:
+                        body = str(page.locator("body").inner_text(timeout=2000) or "")
+                    except Exception:
+                        body = ""
+                    if body:
+                        for kw in error_keywords:
+                            if kw in body:
+                                logger.warning(
+                                    "[camoufox] title_poll %s/%s 检测到页面错误关键词: %s — 提前退出",
+                                    index + 1, attempts, kw,
+                                )
+                                return False
+
                 if index == 0:
                     logger.info("[camoufox] title_poll 1/%s title=%s (waiting...)", attempts, title[:120])
                 last_title = title
@@ -5235,146 +5848,291 @@ class AuthFlow:
             headless,
             proxy_display,
         )
-        with Camoufox(
-            headless=headless,
-            proxy=browser_proxy,
-            exclude_addons=[DefaultAddons.UBO],
-            geoip=True,
-            enable_cache=True,
-            locale=CAMOUFOX_LOCALE,
-        ) as browser:
-            logger.info("[camoufox] 浏览器实例已启动 headless=%s", headless)
-            # 与 auto_manq.py 保持一致：使用 browser.new_page()，先访问注册
-            # 页让 OpenAI 建立登录态，再回到 create-account，而不是直接从
-            # auth.openai.com/create-account 开始（后者可能停留在空壳页面）。
-            page = browser.new_page()
-            try:
-                context = page.context
-            except Exception:
-                context = browser.new_context()
-            try:
-                def _browser_console(msg) -> None:
-                    msg_type = str(getattr(msg, "type", "") or "").lower()
-                    text = str(getattr(msg, "text", "") or "")
-                    # OpenAI 页面会输出大量 Statsig、CSP、字体和埋点提示；
-                    # 这些不影响注册，不能污染任务日志。
-                    noise = (
-                        "statsig",
-                        "content-security-policy",
-                        "ignoring unsupported entrytypes",
-                        "datadog browser sdk",
-                        "customer data exceeds",
-                        "downloadable font",
-                        "font-family:",
-                        "bounce tracker",
-                        "mouseevent.mozinputsource",
-                        "__cf_bm",
-                        # Google One Tap / FedCM 无关警告
-                        "gsi_logger",
-                        "fedcm",
-                        # Firefox 渲染提示：页面未完全加载就触发 layout
-                        "layout was forced before the page was fully loaded",
-                        # OpenAI sentinel SDK 加载失败
-                        "sentinel",
-                        # SameSite Cookie 跨域拒绝（__oailb / oai-did）
-                        "has been rejected because it is in a cross-site context",
-                        "samesite",
-                        # 网络/资源加载失败（headless 下正常）
-                        "networkerror when attempting to fetch",
-                        "failed to load analytics",
-                        # WebGL 不可用（headless 无 GPU）
-                        "webgl",
-                        # WebRTC ICE 失败（headless 无 RTC）
-                        "webrtc",
-                        "ice failed",
-                        # 通用 JS 空错误
-                        "error undefined",
-                    )
-                    if any(item in text.lower() for item in noise):
-                        return
-                    if msg_type in {"error", "warning"}:
-                        logger.warning(
-                            "[camoufox] browser_console type=%s text=%s",
-                            msg_type,
-                            text[:300],
-                        )
 
-                def _browser_request_failed(req) -> None:
-                    error = str(getattr(req, "failure", "") or "")
-                    url = str(getattr(req, "url", "") or "")
-                    # 页面切换时 Firefox 会为大量统计/CDN请求报 abort，
-                    # 属于正常行为；仅保留注册关键接口的真实网络失败。
-                    if any(item in error.upper() for item in ("NS_ERROR_ABORT", "NS_BINDING_ABORTED")):
-                        return
-                    if any(item in url for item in (
-                        "/awe/api/", "/rum", "/cdn-cgi/", "/assets/", ".woff", ".woff2",
-                        "statsig", "datadog", "/ces/",
-                        "play.google.com/log",
-                        "sentinel",
-                    )):
-                        return
-                    logger.warning(
-                        "[camoufox] browser_request_failed method=%s url=%s error=%s",
-                        getattr(req, "method", ""),
-                        url[:220],
-                        error[:220],
-                    )
+        # ── 初始页面加载重试循环 ──
+        # 有时首次进入 GPT 页面会遇到 "Unable to load site" 白屏错误，
+        # 此时需要切换代理出口、重启浏览器重试，而不是直接放弃。
+        _MAX_INITIAL_LOAD_ATTEMPTS = 3
+        _initial_load_browser = None  # 用于 finally 清理
+        _initial_load_page = None
+        _initial_load_context = None
 
-                page.on(
-                    "console",
-                    _browser_console,
-                )
-                page.on(
-                    "pageerror",
-                    lambda exc: logger.warning(
-                        "[camoufox] browser_pageerror %s", str(exc)[:400]
-                    ),
-                )
-                page.on(
-                    "requestfailed",
-                    _browser_request_failed,
-                )
-                page.on(
-                    "response",
-                    lambda response: (
-                        logger.info(
-                            "[camoufox] browser_response status=%s url=%s",
-                            getattr(response, "status", None),
-                            str(getattr(response, "url", "") or "")[:220],
-                        )
-                        if any(x in str(getattr(response, "url", "") or "") for x in (
-                            "/create-account", "/api/auth/", "/email-otp/", "/accounts/",
-                        ))
-                        else None
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("[camoufox] 浏览器事件监听器安装失败: %s", exc)
-            _page_state(page, "before_initial_register_goto")
-            _check_deadline("initial_goto")
-            goto_with_timeout(
-                page,
-                "https://auth.openai.com/create-account",
-                self.config,
-                wait_until="domcontentloaded",
-                timeout=60_000,
-            )
+        for _initial_attempt in range(1, _MAX_INITIAL_LOAD_ATTEMPTS + 1):
+            _check_deadline("initial_load_attempt")
+
+            # 每次重试前重新读取代理配置（可能已被切换）
+            if _initial_attempt > 1:
+                browser_proxy, proxy_display = self._camoufox_proxy_config()
+
             logger.info(
-                "[camoufox] 注册页已打开 url=%s title=%s",
-                str(getattr(page, "url", "") or "")[:180],
-                str(page.title() or "")[:120],
+                "[camoufox] 初始页面加载 attempt=%s/%s proxy=%s",
+                _initial_attempt, _MAX_INITIAL_LOAD_ATTEMPTS, proxy_display,
             )
-            _page_state(page, "after_register_goto")
-            # 与 auto_manq.py 完全一致：注册页首次跳转后，先等待 OpenAI
-            # 必经的 session-ended 页面，再点击一次 Log in 建立登录态。
-            # 这一步不能省略；直接从 create-account 继续会停在空壳页面。
-            if not _wait_titles(
-                page,
-                ("ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI", "Your session has ended - OpenAI", "Create an account - OpenAI"),
-            ):
-                _page_screenshot(page, "initial_title_timeout")
-                _page_text(page, "initial_title_timeout")
-                raise RuntimeError("Camoufox 初始页面未进入 ChatGPT/session-ended 页面")
+
+            _initial_load_ok = False
+            try:
+                _initial_load_browser = Camoufox(
+                    headless=headless,
+                    proxy=browser_proxy,
+                    exclude_addons=[DefaultAddons.UBO],
+                    geoip=True,
+                    enable_cache=True,
+                    locale=CAMOUFOX_LOCALE,
+                )
+                browser = _initial_load_browser.__enter__()
+                logger.info("[camoufox] 浏览器实例已启动 headless=%s attempt=%s", headless, _initial_attempt)
+
+                page = browser.new_page()
+                _initial_load_page = page
+                _install_password_observer(page)
+                try:
+                    context = page.context
+                except Exception:
+                    context = browser.new_context()
+                _initial_load_context = context
+
+                try:
+                    def _browser_console(msg) -> None:
+                        msg_type = str(getattr(msg, "type", "") or "").lower()
+                        text = str(getattr(msg, "text", "") or "")
+                        noise = (
+                            "statsig",
+                            "content-security-policy",
+                            "ignoring unsupported entrytypes",
+                            "datadog browser sdk",
+                            "customer data exceeds",
+                            "downloadable font",
+                            "font-family:",
+                            "bounce tracker",
+                            "mouseevent.mozinputsource",
+                            "__cf_bm",
+                            "gsi_logger",
+                            "fedcm",
+                            "layout was forced before the page was fully loaded",
+                            "sentinel",
+                            "has been rejected because it is in a cross-site context",
+                            "samesite",
+                            "networkerror when attempting to fetch",
+                            "failed to load analytics",
+                            "webgl",
+                            "webrtc",
+                            "ice failed",
+                            "error undefined",
+                        )
+                        if any(item in text.lower() for item in noise):
+                            return
+                        if msg_type in {"error", "warning"}:
+                            logger.warning(
+                                "[camoufox] browser_console type=%s text=%s",
+                                msg_type,
+                                text[:300],
+                            )
+
+                    def _browser_request_failed(req) -> None:
+                        error = str(getattr(req, "failure", "") or "")
+                        url = str(getattr(req, "url", "") or "")
+                        if any(item in error.upper() for item in ("NS_ERROR_ABORT", "NS_BINDING_ABORTED")):
+                            return
+                        if any(item in url for item in (
+                            "/awe/api/", "/rum", "/cdn-cgi/", "/assets/", ".woff", ".woff2",
+                            "statsig", "datadog", "/ces/",
+                            "play.google.com/log",
+                            "sentinel",
+                        )):
+                            return
+                        logger.warning(
+                            "[camoufox] browser_request_failed method=%s url=%s error=%s",
+                            getattr(req, "method", ""),
+                            url[:220],
+                            error[:220],
+                        )
+
+                    page.on("console", _browser_console)
+                    page.on(
+                        "pageerror",
+                        lambda exc: logger.warning(
+                            "[camoufox] browser_pageerror %s", str(exc)[:400]
+                        ),
+                    )
+                    page.on("requestfailed", _browser_request_failed)
+                    page.on(
+                        "response",
+                        lambda response: (
+                            logger.info(
+                                "[camoufox] browser_response status=%s url=%s",
+                                getattr(response, "status", None),
+                                str(getattr(response, "url", "") or "")[:220],
+                            )
+                            if any(x in str(getattr(response, "url", "") or "") for x in (
+                                "/create-account", "/api/auth/", "/email-otp/", "/accounts/",
+                            ))
+                            else None
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning("[camoufox] 浏览器事件监听器安装失败: %s", exc)
+
+                _page_state(page, "before_initial_register_goto")
+                _check_deadline("initial_goto")
+                goto_with_timeout(
+                    page,
+                    "https://auth.openai.com/create-account",
+                    self.config,
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+                logger.info(
+                    "[camoufox] 注册页已打开 url=%s title=%s",
+                    str(getattr(page, "url", "") or "")[:180],
+                    str(page.title() or "")[:120],
+                )
+                _page_state(page, "after_register_goto")
+
+                if not _wait_titles(
+                    page,
+                    ("ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI", "Your session has ended - OpenAI", "Create an account - OpenAI"),
+                ):
+                    _page_screenshot(page, "initial_title_timeout")
+                    _page_text(page, "initial_title_timeout")
+
+                    # ── 检测具体错误关键词，用于代理冷却记录 ──
+                    _detected_error_kw = ""
+                    try:
+                        _body_for_err = str(page.locator("body").inner_text(timeout=3000) or "")
+                    except Exception:
+                        _body_for_err = ""
+                    if _body_for_err:
+                        for _ekw in _ERROR_KEYWORDS:
+                            if _ekw in _body_for_err:
+                                _detected_error_kw = _ekw
+                                break
+
+                    # ── 记录代理错误并冷却 1h ──
+                    _current_proxy_for_cd = (self.config.proxy or "").strip()
+                    if _current_proxy_for_cd and _detected_error_kw:
+                        _err_type = _detected_error_kw.lower().replace(" ", "_")
+                        try:
+                            from webui import db as _cd_db
+                            _cd_db.record_proxy_error(
+                                _current_proxy_for_cd,
+                                _err_type,
+                                cooldown_seconds=3600,
+                            )
+                            logger.warning(
+                                "[camoufox] 代理 %s 触发 '%s' 错误，已记录并冷却 1h",
+                                _current_proxy_for_cd[:80], _detected_error_kw,
+                            )
+                        except Exception as _cd_exc:
+                            logger.debug(
+                                "[camoufox] 记录代理冷却失败: %s", str(_cd_exc)[:200],
+                            )
+
+                    # ── 尝试切换代理出口并重试 ──
+                    if _initial_attempt < _MAX_INITIAL_LOAD_ATTEMPTS and self._on_proxy_switch:
+                        current_proxy = (self.config.proxy or "").strip()
+                        try:
+                            new_proxy = self._on_proxy_switch(
+                                current_proxy,
+                                "Camoufox 初始页面加载失败 (Unable to load site)",
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[camoufox] 初始页面加载失败，请求切换代理出错: %s", e,
+                            )
+                            new_proxy = None
+                        if new_proxy:
+                            self.config.proxy = str(new_proxy).strip()
+                            self._country_code = ""
+                            # 重建 HTTP session 使后续协议请求也走新代理
+                            self.session = create_http_session(
+                                proxy=self.config.proxy,
+                                impersonate=self._impersonate_candidates[self._impersonate_idx],
+                                user_agent=self._ua,
+                            )
+                            self.check_proxy()
+                            logger.warning(
+                                "[camoufox] 初始页面加载失败，已切换代理出口，"
+                                "关闭当前浏览器，准备第 %s/%s 次重试",
+                                _initial_attempt + 1, _MAX_INITIAL_LOAD_ATTEMPTS,
+                            )
+                            # 关闭当前浏览器，进入下一次循环重新启动
+                            try:
+                                _initial_load_browser.__exit__(None, None, None)
+                            except Exception:
+                                pass
+                            _initial_load_browser = None
+                            _initial_load_page = None
+                            _initial_load_context = None
+                            continue
+                        else:
+                            logger.warning(
+                                "[camoufox] 初始页面加载失败，无可用替换代理，直接报错",
+                            )
+
+                    raise RuntimeError("Camoufox 初始页面未进入 ChatGPT/session-ended 页面")
+
+                # 初始页面加载成功，跳出重试循环
+                _initial_load_ok = True
+                break
+
+            except RuntimeError:
+                # 不捕获 RuntimeError（含 deadline 超时和上面的主动 raise），直接上抛
+                if _initial_load_browser is not None:
+                    try:
+                        _initial_load_browser.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                raise
+            except Exception as exc:
+                # 浏览器启动 / goto 等异常也可尝试切换代理重试
+                logger.warning(
+                    "[camoufox] 初始页面加载异常 attempt=%s/%s: %s",
+                    _initial_attempt, _MAX_INITIAL_LOAD_ATTEMPTS, str(exc)[:300],
+                )
+                if _initial_load_browser is not None:
+                    try:
+                        _initial_load_browser.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    _initial_load_browser = None
+                    _initial_load_page = None
+                    _initial_load_context = None
+
+                if _initial_attempt < _MAX_INITIAL_LOAD_ATTEMPTS and self._on_proxy_switch:
+                    current_proxy = (self.config.proxy or "").strip()
+                    try:
+                        new_proxy = self._on_proxy_switch(
+                            current_proxy,
+                            f"Camoufox 浏览器启动/加载异常: {str(exc)[:120]}",
+                        )
+                    except Exception as e:
+                        logger.warning("[camoufox] 请求切换代理出错: %s", e)
+                        new_proxy = None
+                    if new_proxy:
+                        self.config.proxy = str(new_proxy).strip()
+                        self._country_code = ""
+                        self.session = create_http_session(
+                            proxy=self.config.proxy,
+                            impersonate=self._impersonate_candidates[self._impersonate_idx],
+                            user_agent=self._ua,
+                        )
+                        self.check_proxy()
+                        logger.warning(
+                            "[camoufox] 已切换代理出口，准备第 %s/%s 次重试",
+                            _initial_attempt + 1, _MAX_INITIAL_LOAD_ATTEMPTS,
+                        )
+                        continue
+                raise
+
+        if not _initial_load_ok:
+            raise RuntimeError("Camoufox 初始页面加载失败，已用尽所有重试")
+
+        # ── 初始页面加载成功，继续注册流程 ──
+        # 注意：此时 browser / page / context 变量已在上面的循环中赋值，
+        # _initial_load_browser 持有 Camoufox context manager 引用。
+        # 后续代码仍在 _initial_load_browser 的生命周期内运行，
+        # 需要在最外层 try/finally 中确保清理。
+        try:
             session_ended = _wait_titles(
                 page,
                 ("Your session has ended - OpenAI",),
@@ -5409,10 +6167,184 @@ class AuthFlow:
                     _page_text(page, "login_locator_missing")
                     raise RuntimeError("Camoufox session ended 页面未找到可点击的 Log in")
                 _page_state(page, "after_login_click")
-            if session_ended and not _wait_titles(page, ("Welcome back - OpenAI",)):
+            # ── 点击 Log in 后等待 Welcome back，遇到 Oops 错误页则点 Go back 重试 ──
+            _WELCOME_BACK_MAX_RETRIES = 3
+            _welcome_back_ok = False
+            for _wb_attempt in range(1, _WELCOME_BACK_MAX_RETRIES + 1):
+                if not session_ended:
+                    _welcome_back_ok = True
+                    break
+                _check_deadline("welcome_back_wait")
+                if _wait_titles(page, ("Welcome back - OpenAI",)):
+                    _welcome_back_ok = True
+                    break
+
+                # 标题不是 Welcome back，检查页面是否出现 Oops 错误
                 _page_screenshot(page, "welcome_back_timeout")
                 _page_text(page, "welcome_back_timeout")
-                raise RuntimeError("Camoufox 未进入 Welcome back 登录页")
+                try:
+                    body_text = str(page.locator("body").inner_text(timeout=3000) or "")
+                except Exception:
+                    body_text = ""
+
+                if "Oops" in body_text or "issue while signing you in" in body_text:
+                    logger.warning(
+                        "[camoufox] 登录跳转遇到 Oops 错误页 (attempt %s/%s)，"
+                        "直接导航回注册页面重新开始流程",
+                        _wb_attempt, _WELCOME_BACK_MAX_RETRIES,
+                    )
+                    # Oops 页面的 Go back 按钮不可靠（可能点了没反应），
+                    # 直接 goto 回注册页面重新走一遍 session ended → Log in 流程
+                    _check_deadline("oops_retry_goto")
+                    try:
+                        goto_with_timeout(
+                            page,
+                            "https://auth.openai.com/create-account",
+                            self.config,
+                            wait_until="domcontentloaded",
+                            timeout=60_000,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[camoufox] Oops 重试 goto 注册页面失败: %s", str(exc)[:300],
+                        )
+                        _page_screenshot(page, f"oops_retry_goto_failed_{_wb_attempt}")
+                        _page_text(page, f"oops_retry_goto_failed_{_wb_attempt}")
+                        raise RuntimeError(
+                            f"Camoufox Oops 重试导航回注册页面失败: {str(exc)[:200]}"
+                        )
+
+                    _page_state(page, f"after_oops_retry_goto_{_wb_attempt}")
+
+                    # 等待页面到达 session ended 或 create account
+                    if not _wait_titles(
+                        page,
+                        (
+                            "Your session has ended - OpenAI",
+                            "Create an account - OpenAI",
+                            "ChatGPT",
+                            "ChatGPT: Chat, Work, Create & Code with AI",
+                        ),
+                        attempts=60,
+                    ):
+                        _page_screenshot(page, f"oops_retry_title_timeout_{_wb_attempt}")
+                        _page_text(page, f"oops_retry_title_timeout_{_wb_attempt}")
+                        raise RuntimeError("Camoufox Oops 重试后页面未进入预期状态")
+
+                    # 检查回到了哪个页面
+                    try:
+                        _after_retry_title = str(page.title() or "")
+                    except Exception:
+                        _after_retry_title = ""
+                    logger.info(
+                        "[camoufox] Oops 重试后页面标题: %s", _after_retry_title[:120],
+                    )
+
+                    if "Create an account" in _after_retry_title:
+                        # 回到了注册页面，但注册页面大概率又会弹出 session ended，
+                        # 所以这里等待 session ended（最多 60s），如果等不到且
+                        # 标题仍为 Create an account 才视为可以直接注册。
+                        logger.info(
+                            "[camoufox] Oops 重试后回到注册页面，等待 session ended 弹出..."
+                        )
+                        _se_again = _wait_titles(
+                            page,
+                            ("Your session has ended - OpenAI",),
+                            attempts=60,
+                        )
+                        if _se_again:
+                            # session ended 再次出现，重新点 Log in
+                            logger.info(
+                                "[camoufox] 注册页面再次出现 session ended，重新点击 Log in"
+                            )
+                            clicked = False
+                            for index, locator in enumerate([
+                                page.get_by_role("link", name="Log in", exact=True),
+                                page.get_by_role("button", name="Log in", exact=True),
+                                page.get_by_text("Log in", exact=True),
+                                page.locator("a:has-text('Log in')").first,
+                            ], 1):
+                                try:
+                                    count = locator.count()
+                                    visible = bool(count and locator.first.is_visible())
+                                    if visible:
+                                        locator.first.click(timeout=10_000)
+                                        clicked = True
+                                        break
+                                except Exception:
+                                    pass
+                            if not clicked:
+                                raise RuntimeError(
+                                    "Camoufox Oops 重试后 session ended 页面未找到 Log in"
+                                )
+                            _page_state(page, f"after_login_click_retry_{_wb_attempt}")
+                            continue  # 回到循环顶部重新等待 Welcome back
+                        else:
+                            # 60s 没等到 session ended，检查当前标题
+                            try:
+                                _cur_title = str(page.title() or "")
+                            except Exception:
+                                _cur_title = ""
+                            if "Create an account" in _cur_title:
+                                # 仍在注册页面且 60s 没弹 session ended → 可以直接注册
+                                session_ended = False
+                                _welcome_back_ok = True
+                                logger.info(
+                                    "[camoufox] 60s 未出现 session ended，"
+                                    "当前仍为注册页面，直接继续注册流程"
+                                )
+                                break
+                            else:
+                                logger.warning(
+                                    "[camoufox] 60s 后页面标题变为 %s，继续重试",
+                                    _cur_title[:120],
+                                )
+                                continue
+
+                    if "session has ended" in _after_retry_title.lower():
+                        # 回到 session ended，重新点击 Log in
+                        logger.info(
+                            "[camoufox] Oops 重试后回到 session ended，重新点击 Log in"
+                        )
+                        clicked = False
+                        for index, locator in enumerate([
+                            page.get_by_role("link", name="Log in", exact=True),
+                            page.get_by_role("button", name="Log in", exact=True),
+                            page.get_by_text("Log in", exact=True),
+                            page.locator("a:has-text('Log in')").first,
+                        ], 1):
+                            try:
+                                count = locator.count()
+                                visible = bool(count and locator.first.is_visible())
+                                if visible:
+                                    locator.first.click(timeout=10_000)
+                                    clicked = True
+                                    break
+                            except Exception:
+                                pass
+                        if not clicked:
+                            raise RuntimeError(
+                                "Camoufox Oops 重试后 session ended 页面未找到 Log in"
+                            )
+                        _page_state(page, f"after_login_click_retry_{_wb_attempt}")
+                        continue  # 回到循环顶部重新等待 Welcome back
+
+                    # ChatGPT 标题 — 可能又跳到了 Oops 页，继续循环重试
+                    logger.warning(
+                        "[camoufox] Oops 重试后标题为 %s，可能仍在错误页，继续重试",
+                        _after_retry_title[:120],
+                    )
+                    continue
+                else:
+                    # 不是 Oops 错误页，未知状态，直接报错
+                    raise RuntimeError("Camoufox 未进入 Welcome back 登录页")
+
+            if not _welcome_back_ok:
+                _page_screenshot(page, "welcome_back_all_retries_failed")
+                _page_text(page, "welcome_back_all_retries_failed")
+                raise RuntimeError(
+                    f"Camoufox 未进入 Welcome back 登录页 (Oops 重试 {_WELCOME_BACK_MAX_RETRIES} 次后仍失败)"
+                )
             _check_deadline("second_goto_create_account")
             goto_with_timeout(
                 page,
@@ -5464,7 +6396,10 @@ class AuthFlow:
                     "Create a password - OpenAI",
                     "Enter your password - OpenAI",
                     "Check your inbox - OpenAI",
+                    "Check your authenticator app - OpenAI",
                     "How old are you? - OpenAI",
+                    "Let's confirm your age - OpenAI",
+                    "Let's confirm your age? - OpenAI",
                     "ChatGPT",
                     "ChatGPT: Chat, Work, Create & Code with AI",
                 ),
@@ -5477,31 +6412,87 @@ class AuthFlow:
             page_title = str(page.title() or "")
             if page_title == "Enter your password - OpenAI":
                 if not known_password:
-                    _page_screenshot(page, "enter_password_no_saved")
-                    raise RuntimeError("Camoufox 进入输入密码页面，但本地没有已保存密码")
-                logger.info("[camoufox] 检测到已有账号密码页面，使用已落盘密码登录")
-                password_input = _locator(page, ("input[type='password']", "input[name='password']"))
-                if password_input is None:
+                    logger.warning("[camoufox] 已有账号没有本地密码，直接切换邮箱 OTP")
+                    password = ""
+                    if not _click_one_time_login(page):
+                        _page_screenshot(page, "enter_password_no_saved")
+                        raise RuntimeError(
+                            "Camoufox 进入输入密码页面，本地没有历史密码且页面未提供邮箱 OTP"
+                        )
+                else:
+                    logger.info("[camoufox] 检测到已有账号密码页面，使用已落盘密码登录")
+                    password_input = _locator(page, ("input[type='password']", "input[name='password']"))
+                    if password_input is None:
+                        try:
+                            password_input = page.get_by_label("Password", exact=True).first
+                        except Exception:
+                            password_input = None
+                    if password_input is None:
+                        _page_screenshot(page, "enter_password_input_missing")
+                        raise RuntimeError("Camoufox 输入密码页面未找到 Password 输入框")
+                    _reset_password_response()
+                    password_input.fill(known_password)
+                    _click_continue(page)
+                    self.result.password = known_password
+                    _page_state(page, "after_existing_password_continue")
+                    _existing_password_transition_ok = _wait_password_submission(
+                        page, timeout_seconds=_password_submit_timeout
+                    )
+                    if not _existing_password_transition_ok and _is_authenticator_page(page):
+                        _existing_password_transition_ok = True
+                    if not _existing_password_transition_ok and _is_incorrect_password_page(page):
+                        # 不要因为一次密码错误页面就生成/覆盖新的随机密码；
+                        # 本地历史候选仍是下次 Create/Enter 分支要复用的唯一值。
+                        logger.warning(
+                            "[camoufox] 历史密码被页面拒绝，保留本地密码候选并切换邮箱 OTP"
+                        )
+                        self.result.password = known_password
+                        password = ""
+                        if not _click_one_time_login(page):
+                            _page_screenshot(page, "existing_password_invalid_no_otp")
+                            raise RuntimeError("Camoufox 已有账号密码错误，且页面未提供邮箱 OTP 入口")
+                    elif not _existing_password_transition_ok:
+                        _page_screenshot(page, "existing_password_transition_timeout")
+                        _page_text(page, "existing_password_transition_timeout")
+                        raise RuntimeError("Camoufox 已有密码登录后未进入 OTP/资料/ChatGPT 页面")
+
+                # 无历史密码或密码错误时，上面已经点了邮箱 OTP；等待页面进入
+                # 收件箱。正常密码验证则可能直接进入 MFA/主页。
+                if not _is_authenticator_page(page) and not _profile_success_page(page):
                     try:
-                        password_input = page.get_by_label("Password", exact=True).first
+                        _after_password_title = str(page.title() or "")
                     except Exception:
-                        password_input = None
-                if password_input is None:
-                    _page_screenshot(page, "enter_password_input_missing")
-                    raise RuntimeError("Camoufox 输入密码页面未找到 Password 输入框")
-                password_input.fill(known_password)
-                _click_continue(page)
-                self.result.password = known_password
-                _page_state(page, "after_existing_password_continue")
-                if not _wait_titles(
-                    page,
-                    ("Check your inbox - OpenAI", "How old are you? - OpenAI", "ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI"),
-                    attempts=60,
-                ):
-                    _page_screenshot(page, "existing_password_transition_timeout")
-                    _page_text(page, "existing_password_transition_timeout")
-                    raise RuntimeError("Camoufox 已有密码登录后未进入 OTP/资料/ChatGPT 页面")
+                        _after_password_title = ""
+                    if _after_password_title == "Enter your password - OpenAI" and not _wait_titles(
+                        page,
+                        (
+                            "Check your inbox - OpenAI",
+                            "Check your authenticator app - OpenAI",
+                            "How old are you? - OpenAI",
+                            "Let's confirm your age? - OpenAI",
+                            "ChatGPT",
+                            "ChatGPT: Chat, Work, Create & Code with AI",
+                        ),
+                        attempts=30,
+                    ):
+                        _page_screenshot(page, "existing_password_otp_transition_timeout")
+                        _page_text(page, "existing_password_otp_transition_timeout")
+                        raise RuntimeError("Camoufox 已有账号切换邮箱 OTP 失败")
+
                 page_title = str(page.title() or "")
+                if _is_authenticator_page(page):
+                    mfa_result = _handle_browser_authenticator(email, page)
+                    if mfa_result == "failed":
+                        _page_screenshot(page, "existing_password_mfa_failed")
+                        _page_text(page, "existing_password_mfa_failed")
+                        raise RuntimeError(
+                            "Camoufox 已有账号进入 2FA，但本地没有可用 totp_secret，"
+                            "且页面未提供邮箱验证码替代方式"
+                        )
+                    page_title = str(page.title() or "")
+                # 这是“验证已有密码”输入框，不是“创建新密码”输入框；完成
+                # 登录分支后必须清空 locator，避免下面的创建密码分支再次填充。
+                password_input = None
             if page_title == "Create a password - OpenAI":
                 try:
                     password_input = page.get_by_label("Password", exact=True).first
@@ -5528,83 +6519,195 @@ class AuthFlow:
                         _page_screenshot(page, "password_required_but_disabled")
                         raise RuntimeError("Camoufox 页面要求密码，但当前任务已关闭创建密码")
                 else:
+                    _reset_password_response()
                     password_input.fill(password)
                     _click_continue(page)
                     _page_state(page, "after_password_continue")
-                    self.result.password = password
-                    if self._on_password is not None:
-                        try:
-                            self._on_password(email, password)
-                        except Exception as exc:
-                            logger.warning("Camoufox 密码早落盘失败（不影响流程）: %s", exc)
+                    if not _wait_password_submission(
+                        page, timeout_seconds=_password_submit_timeout
+                    ):
+                        _page_screenshot(page, "password_submit_failed")
+                        _page_text(page, "password_submit_failed")
+                        raise RuntimeError(
+                            "Camoufox 密码提交未确认成功；本地密码候选已保留，下一次重试将复用"
+                        )
+                    _remember_password_created(password)
 
             elif str(page.title() or "") == "Check your inbox - OpenAI" and password:
                 # auto_manq.py 的兼容路径：页面先落在收件箱时，点击
                 # Continue with password，再回到密码页提交随机密码。
                 try:
-                    page.get_by_text("Continue with password", exact=True).click()
+                    continue_with_password = page.get_by_text(
+                        "Continue with password", exact=True
+                    ).first
+                    if not continue_with_password.count() or not continue_with_password.is_visible():
+                        raise RuntimeError("页面未找到可见的 Continue with password 链接")
+                    # 该链接点击后有时会在 30 秒以上才完成导航；禁止 click
+                    # 自己等待导航，后面统一用 title_poll 等待目标页面。
+                    continue_with_password.click(timeout=8_000, no_wait_after=True)
                 except Exception as exc:
-                    _page_screenshot(page, "continue_with_password_missing")
-                    raise RuntimeError("Camoufox 收件箱页面未找到 Continue with password") from exc
-                if not _wait_titles(page, ("Create a password - OpenAI", "Enter your password - OpenAI"), attempts=30):
+                    # 即使 click 的导航等待抛 TimeoutError，动作本身可能已经
+                    # 成功，先检查当前页面是否已经落到密码页，避免把成功跳转
+                    # 误报成“按钮不存在”。
+                    try:
+                        current_after_click = str(page.title() or "")
+                    except Exception:
+                        current_after_click = ""
+                    if current_after_click in {
+                        "Create a password - OpenAI",
+                        "Enter your password - OpenAI",
+                    }:
+                        logger.info(
+                            "[camoufox] Continue with password 已触发导航，当前页面=%s",
+                            current_after_click,
+                        )
+                    else:
+                        _page_screenshot(page, "continue_with_password_missing")
+                        _page_text(page, "continue_with_password_missing")
+                        raise RuntimeError(
+                            "Camoufox 收件箱页面 Continue with password 点击/导航失败"
+                        ) from exc
+                if not _wait_titles(
+                    page,
+                    ("Create a password - OpenAI", "Enter your password - OpenAI"),
+                    attempts=60,
+                ):
                     _page_screenshot(page, "continue_with_password_timeout")
                     _page_text(page, "continue_with_password_timeout")
                     raise RuntimeError("Camoufox 未进入密码输入页面")
                 password_input = _locator(page, ("input[type='password']", "input[name='password']"))
                 if password_input is None:
                     try:
-                        password_input = page.get_by_text("Password", exact=True).first
+                        password_input = page.get_by_label("Password", exact=True).first
+                        if not password_input.count() or not password_input.is_visible():
+                            password_input = None
                     except Exception:
                         password_input = None
                 if password_input is None:
                     _page_screenshot(page, "inbox_password_input_missing")
                     raise RuntimeError("Camoufox 密码页面未找到 Password 输入框")
                 password_input.fill(password)
+                _reset_password_response()
                 _click_continue(page)
-                self.result.password = password
-                if self._on_password is not None:
-                    try:
-                        self._on_password(email, password)
-                    except Exception as exc:
-                        logger.warning("Camoufox 密码早落盘失败（不影响流程）: %s", exc)
+                if not _wait_password_submission(
+                    page, timeout_seconds=_password_submit_timeout
+                ):
+                    _page_screenshot(page, "password_submit_failed")
+                    _page_text(page, "password_submit_failed")
+                    raise RuntimeError(
+                        "Camoufox 密码提交未确认成功；本地密码候选已保留，下一次重试将复用"
+                    )
+                _remember_password_created(password)
+
+            if _is_authenticator_page(page):
+                mfa_result = _handle_browser_authenticator(email, page)
+                if mfa_result == "failed":
+                    _page_screenshot(page, "password_mfa_failed")
+                    _page_text(page, "password_mfa_failed")
+                    raise RuntimeError(
+                        "Camoufox 密码后进入 2FA，但 TOTP/邮箱替代验证均不可用"
+                    )
 
             current_title_after_password = str(page.title() or "")
-            if current_title_after_password not in {
+            if (
+                not _profile_success_page(page)
+                and current_title_after_password not in {
                 "How old are you? - OpenAI",
+                "Let's confirm your age - OpenAI",
+                "Let's confirm your age? - OpenAI",
                 "ChatGPT",
                 "ChatGPT: Chat, Work, Create & Code with AI",
-            } and not _wait_titles(
+                }
+                and not _wait_titles(
                 page,
                 (
                     "Check your inbox - OpenAI",
+                    "Check your authenticator app - OpenAI",
                     "How old are you? - OpenAI",
+                    "Let's confirm your age - OpenAI",
+                    "Let's confirm your age? - OpenAI",
                     "ChatGPT",
                     "ChatGPT: Chat, Work, Create & Code with AI",
                 ),
                 attempts=60,
+                )
+                and not _is_authenticator_page(page)
             ):
                 _page_screenshot(page, "inbox_title_timeout")
                 _page_text(page, "inbox_title_timeout")
                 raise RuntimeError("Camoufox 密码提交后未进入 OTP、资料或主页")
+
+            # 响应返回 200 时页面可能稍后才切到 MFA 路由；在进入邮箱 OTP
+            # 循环前再检查一次，避免把认证器验证码输入框误当成邮箱 OTP。
+            if _is_authenticator_page(page):
+                mfa_result = _handle_browser_authenticator(email, page)
+                if mfa_result == "failed":
+                    _page_screenshot(page, "password_mfa_failed")
+                    _page_text(page, "password_mfa_failed")
+                    raise RuntimeError(
+                        "Camoufox 密码后进入 2FA，但 TOTP/邮箱替代验证均不可用"
+                    )
 
             # 邮箱验证码：浏览器提交，验证码仍由当前 MailProvider 获取。
             otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "180")))
             otp_input_selectors = (
                 "input[autocomplete='one-time-code']",
                 "input[name='code']",
+                "input[id*='code' i]",
+                "input[aria-label*='code' i]",
+                "input[placeholder*='code' i]",
                 "input[inputmode='numeric']",
+                "input[type='tel']",
             )
             def _find_otp_input(current_page):
                 found = _locator(current_page, otp_input_selectors)
                 if found is not None:
                     return found
-                try:
-                    candidate = current_page.get_by_label("Code", exact=True).first
-                    if candidate.count() and candidate.is_visible():
-                        return candidate
-                except Exception:
-                    pass
+                for label in ("Code", "Verification code", "One-time code"):
+                    try:
+                        candidate = current_page.get_by_label(label, exact=False).first
+                        if candidate.count() and candidate.is_visible():
+                            return candidate
+                    except Exception:
+                        continue
+                # Auth0/Next frontend 有时不给输入框设置 name/autocomplete，
+                # 但该页面只有一个可见的普通 input。作为最后兜底，只取可见
+                # 且非 email/password 的输入框，避免重新误选邮箱框。
+                for selector in (
+                    "input:visible:not([type='email']):not([type='password'])",
+                    "input:not([type='hidden']):not([type='email']):not([type='password'])",
+                ):
+                    try:
+                        candidate = current_page.locator(selector).first
+                        if candidate.count() and candidate.is_visible():
+                            return candidate
+                    except Exception:
+                        continue
                 return None
+
+            def _wait_for_otp_input(current_page, timeout_seconds: int = 8):
+                """等待 Code 输入框完成前端渲染，避免首轮误判 input=False。"""
+                deadline = time.time() + max(1, timeout_seconds)
+                while time.time() < deadline:
+                    found = _find_otp_input(current_page)
+                    if found is not None:
+                        return found
+                    try:
+                        current_page.wait_for_timeout(300)
+                    except Exception:
+                        time.sleep(0.3)
+                return _find_otp_input(current_page)
+
+            def _clear_otp_input(input_locator) -> None:
+                """OTP 成功后清理旧值，避免前端重渲染时污染资料页。"""
+                if input_locator is None:
+                    return
+                try:
+                    input_locator.fill("")
+                except Exception:
+                    # 页面跳转后 locator 可能已经 detached，清理失败不应阻断
+                    # 流程；资料页会重新定位并覆盖输入值。
+                    pass
 
             # 若已直接进入资料页或主页，跳过 OTP 环节
             _current_title_before_otp = str(page.title() or "")
@@ -5638,15 +6741,77 @@ class AuthFlow:
                                 break
                         except Exception:
                             continue
-                otp_input = _find_otp_input(page)
+                # 页面可能已经从 OTP 路由切到 about-you，但 title 还没来得及
+                # 更新；先检查 URL/title，避免把年龄 number input 当成 OTP。
+                try:
+                    current_title = str(page.title() or "")
+                    current_url = str(getattr(page, "url", "") or "")
+                except Exception:
+                    current_title = ""
+                    current_url = ""
+                if current_title in {
+                    "How old are you? - OpenAI",
+                    "Let's confirm your age - OpenAI",
+                    "Let's confirm your age? - OpenAI",
+                    "Let's confirm your age",
+                    "Let's confirm your age?",
+                    "Confirm your age - OpenAI",
+                    "Confirm your age? - OpenAI",
+                    "ChatGPT",
+                    "ChatGPT: Chat, Work, Create & Code with AI",
+                } or "/about-you" in current_url or (
+                    _find_profile_field(page, "name") is not None
+                    and (
+                        _find_profile_field(page, "age") is not None
+                        or _find_profile_field(page, "birthday") is not None
+                    )
+                ):
+                    _clear_otp_input(otp_input)
+                    otp_done = True
+                    _page_state(page, "after_otp_continue")
+                    break
+                if _is_authenticator_page(page):
+                    mfa_result = _handle_browser_authenticator(email, page)
+                    if mfa_result == "failed":
+                        _page_screenshot(page, "otp_mfa_failed")
+                        _page_text(page, "otp_mfa_failed")
+                        raise RuntimeError("Camoufox 邮箱 OTP 后进入 2FA，但验证失败")
+                    if mfa_result == "success":
+                        _clear_otp_input(otp_input)
+                        otp_done = True
+                        _page_state(page, "after_mfa_continue")
+                        break
+                otp_input = _wait_for_otp_input(page)
                 logger.info(
                     "[camoufox] OTP 页面检测 attempt=%s input=%s",
                     attempt + 1,
                     bool(otp_input),
                 )
                 if otp_input is None:
-                    # 已经跳过邮箱 OTP（少数已有 session 的页面）
-                    break
+                    # 页面标题仍是 Check your inbox 时说明只是输入框渲染/选择
+                    # 器异常，先重新触发一次 Resend email 并重试定位；不要把
+                    # 它当成“没有收到验证码”直接进入 30s 标题超时。
+                    try:
+                        body = _browser_body_text(page).lower()
+                    except Exception:
+                        body = ""
+                    if "check your inbox" in body and attempt < 2:
+                        for resend_text in ("Resend email", "Resend code", "Resend"):
+                            try:
+                                resend = page.get_by_text(resend_text, exact=True).first
+                                if resend.count() and resend.is_visible() and resend.is_enabled():
+                                    resend.click(timeout=5_000)
+                                    logger.warning(
+                                        "[camoufox] Check inbox 未找到 Code 输入框，已点击 %s 后重试",
+                                        resend_text,
+                                    )
+                                    break
+                            except Exception:
+                                continue
+                        continue
+                    _page_screenshot(page, "otp_input_missing")
+                    _page_text(page, "otp_input_missing")
+                    raise RuntimeError("Camoufox 收件箱页面未找到 Code 输入框")
                 # 页面点击 Continue 时已经触发发码，给 provider 留出少量
                 # 时钟/网络偏差，避免邮件先到而 issued_after 过晚被过滤。
                 issued_after = time.time() - 8
@@ -5668,6 +6833,17 @@ class AuthFlow:
                     except Exception:
                         current_title = ""
                     current_url = str(getattr(page, "url", "") or "")
+                    if _is_authenticator_page(page):
+                        mfa_result = _handle_browser_authenticator(email, page)
+                        if mfa_result == "failed":
+                            raise RuntimeError("Camoufox 邮箱 OTP 后进入 2FA，但验证失败")
+                        if mfa_result == "success":
+                            transitioned = True
+                            break
+                        # email_otp 表示已切换到收件箱；当前这次验证码
+                        # 已消费，跳出等待并让下一轮读取新的输入框。
+                        if mfa_result == "email_otp":
+                            break
                     if current_title in target_titles or "/about-you" in current_url:
                         transitioned = True
                         break
@@ -5676,10 +6852,12 @@ class AuthFlow:
                     except Exception:
                         time.sleep(1.0)
                 if transitioned:
+                    _clear_otp_input(otp_input)
                     otp_done = True
                     _page_state(page, "after_otp_continue")
                     break
                 if _find_otp_input(page) is None:
+                    _clear_otp_input(otp_input)
                     otp_done = True
                     _page_state(page, "after_otp_continue")
                     break
@@ -5694,67 +6872,65 @@ class AuthFlow:
                 _page_state(page, "otp_failed")
                 raise RuntimeError("Camoufox 邮箱验证码校验失败（重试 3 次）")
 
-            if not _wait_titles(
+            _otp_profile_titles_ready = _wait_titles(
                 page,
-                ("How old are you? - OpenAI", "ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI"),
+                (
+                    "How old are you? - OpenAI",
+                    "Let's confirm your age - OpenAI",
+                    "Let's confirm your age? - OpenAI",
+                    "Let's confirm your age",
+                    "Let's confirm your age?",
+                    "Confirm your age - OpenAI",
+                    "Confirm your age? - OpenAI",
+                    "ChatGPT",
+                    "ChatGPT: Chat, Work, Create & Code with AI",
+                ),
                 attempts=30,
-            ):
-                _page_screenshot(page, "after_otp_title_timeout")
-                _page_text(page, "after_otp_title_timeout")
-                raise RuntimeError("Camoufox OTP 提交后未进入年龄资料页或 ChatGPT")
+            )
+            if not _otp_profile_titles_ready:
+                # 部分前端版本标题仍保持 ChatGPT 或为空，但资料表单已经
+                # 渲染完成；以可见的 Full name + Age/Birthday 字段作为更可靠
+                # 的页面就绪信号，避免误报 after_otp_title_timeout。
+                _profile_name_ready = _find_profile_field(page, "name")
+                _profile_age_ready = _find_profile_field(page, "age")
+                _profile_birthday_ready = _find_profile_field(page, "birthday")
+                if not (
+                    _profile_name_ready is not None
+                    and (_profile_age_ready is not None or _profile_birthday_ready is not None)
+                ):
+                    _page_screenshot(page, "after_otp_title_timeout")
+                    _page_text(page, "after_otp_title_timeout")
+                    raise RuntimeError("Camoufox OTP 提交后未进入年龄资料页或 ChatGPT")
+                logger.warning(
+                    "[camoufox] OTP 后标题未命中，但已检测到资料表单，继续填写 profile"
+                )
 
             # 新账号资料页（若上游改成直接进入主页则跳过）。
-            name_input = _locator(page, ("input[name='name']", "input[autocomplete='name']"))
-            age_input = _locator(page, ("input[name='age']", "input[type='number']"))
-            if name_input is None:
-                try:
-                    candidate = page.get_by_label("Full name", exact=True).first
-                    if candidate.count() and candidate.is_visible():
-                        name_input = candidate
-                except Exception:
-                    pass
-            if name_input is None:
-                try:
-                    candidate = page.get_by_label("Full name", exact=False).first
-                    if candidate.count() and candidate.is_visible():
-                        name_input = candidate
-                except Exception:
-                    pass
-            if age_input is None:
-                try:
-                    candidate = page.get_by_label("Age", exact=True).first
-                    if candidate.count() and candidate.is_visible():
-                        age_input = candidate
-                except Exception:
-                    pass
-            if name_input is None:
-                name_input = _locator(page, (
-                    "input[placeholder*='Full name']",
-                    "input[placeholder*='Name']",
-                ))
-            if age_input is None:
-                try:
-                    candidate = page.get_by_label("Age", exact=False).first
-                    if candidate.count() and candidate.is_visible():
-                        age_input = candidate
-                except Exception:
-                    pass
-            if age_input is None:
-                age_input = _locator(page, (
-                    "input[placeholder*='Age']",
-                    "input[aria-label*='Age']",
-                ))
+            # 这里不要直接拿 OTP 阶段的 locator；页面是 React 受控表单，
+            # 切换路由后旧 locator 可能仍指向已经改变用途的 number input。
+            name_input = _find_profile_field(page, "name")
+            age_input = _find_profile_field(page, "age")
+            birthday_input = _find_profile_field(page, "birthday")
+            try:
+                profile_title = str(page.title() or "").lower()
+            except Exception:
+                profile_title = ""
+            is_profile_page = any(marker in profile_title for marker in (
+                "how old are you",
+                "let's confirm your age",
+                "confirm your age",
+            )) or "/about-you" in str(getattr(page, "url", "") or "").lower()
             logger.info(
-                "[camoufox] 资料输入框检测 name=%s age=%s",
-                bool(name_input), bool(age_input),
+                "[camoufox] 资料输入框检测 name=%s age=%s birthday=%s",
+                bool(name_input), bool(age_input), bool(birthday_input),
             )
-            if str(page.title() or "") == "How old are you? - OpenAI" and (
-                name_input is None or age_input is None
+            if is_profile_page and (
+                name_input is None or (age_input is None and birthday_input is None)
             ):
                 _page_screenshot(page, "profile_inputs_missing")
                 _page_text(page, "profile_inputs_missing")
-                raise RuntimeError("Camoufox 年龄/姓名页面未找到 Full name 或 Age 输入框")
-            if name_input is not None and age_input is not None:
+                raise RuntimeError("Camoufox 年龄/姓名页面未找到 Full name 或 Age/Birthday 输入框")
+            if name_input is not None and (age_input is not None or birthday_input is not None):
                 logger.info("[camoufox] 检测到年龄/姓名页面，提交注册资料")
                 try:
                     from auto_manq import generate_random_person
@@ -5770,107 +6946,255 @@ class AuthFlow:
                         person_age = round(random.gauss(mu=36.5, sigma=8))
                         if 18 <= person_age <= 55:
                             break
+                person_age = _normalize_camoufox_profile_age(person_age)
                 logger.info("[camoufox] 资料已生成 name=%s age=%s", person_name, person_age)
-                # create_account 偶发返回 400，但资料其实已在页面状态中；
-                # 按 auto_manq.py 的浏览器行为重试提交，最多 3 次。
-                submitted_profile = False
-                _profile_retry_clicks = 0
-                _profile_max_retry_clicks = 10  # 最多重试点击次数
+                birthday_mode = age_input is None and birthday_input is not None
 
-                # 首次填写并提交
+                # create_account 的 400/网络异常可能只在重复提交后恢复，但每次
+                # 重试都必须重新填表，不能继续使用被前端重渲染污染的输入值。
                 try:
-                    current_name = _locator(page, ("input[name='name']", "input[autocomplete='name']")) or page.get_by_label("Full name", exact=False).first
-                    current_age = _locator(page, ("input[name='age']", "input[type='number']")) or page.get_by_label("Age", exact=False).first
-                    current_name.fill(person_name)
-                    current_age.fill(str(person_age))
-                    try:
-                        current_age.press("Tab")
-                        page.wait_for_timeout(300)
-                    except Exception:
-                        pass
-                    # 填写完资料后延迟 1s 再点击提交，减少服务器随机报错概率
-                    try:
-                        page.wait_for_timeout(1_000)
-                    except Exception:
-                        time.sleep(1.0)
-                    _click_registration_next(page)
-                except Exception:
-                    _page_screenshot(page, "profile_fill_error")
-                    raise
+                    _profile_max_attempts = int(
+                        self._get_env("OPENAI_CAMOUFOX_PROFILE_MAX_RETRIES", "10") or "10"
+                    )
+                except (TypeError, ValueError):
+                    _profile_max_attempts = 10
+                _profile_max_attempts = max(1, min(_profile_max_attempts, 20))
+                try:
+                    _profile_timeout = int(
+                        self._get_env("OPENAI_CAMOUFOX_PROFILE_TIMEOUT", "240") or "240"
+                    )
+                except (TypeError, ValueError):
+                    _profile_timeout = 240
+                _profile_timeout = max(30, min(_profile_timeout, 600))
+                _profile_deadline = min(_camoufox_deadline, time.time() + _profile_timeout)
+                try:
+                    _profile_submit_wait = int(
+                        self._get_env("OPENAI_CAMOUFOX_PROFILE_SUBMIT_WAIT", "45") or "45"
+                    )
+                except (TypeError, ValueError):
+                    _profile_submit_wait = 45
+                _profile_submit_wait = max(20, min(_profile_submit_wait, 120))
+                profile_response = {
+                    "seen": False,
+                    "status": 0,
+                    "url": "",
+                    "body": "",
+                    "seen_at": 0.0,
+                }
 
-                logger.info("[camoufox] profile_submit_poll title=%s (waiting...)", str(page.title() or "")[:120])
-                for _wait_index in range(60):
-                    _check_deadline("profile_poll")
+                def _observe_profile_response(response) -> None:
                     try:
-                        current_title = str(page.title() or "")
-                    except Exception:
-                        current_title = ""
-                    if current_title in {"ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI"}:
-                        submitted_profile = True
-                        break
-                    # 检测页面错误文本，等待后重新点击提交
-                    error_text = _profile_error_text(page)
-                    if error_text and _profile_retry_clicks < _profile_max_retry_clicks:
-                        _profile_retry_clicks += 1
-                        logger.warning(
-                            "[camoufox] 资料提交页面错误，2s 后重新点击提交 retry=%s/%s error=%s",
-                            _profile_retry_clicks, _profile_max_retry_clicks, error_text[:200],
-                        )
+                        response_url = str(getattr(response, "url", "") or "")
+                        if "/api/accounts/create_account" not in response_url.lower():
+                            return
+                        status = int(getattr(response, "status", 0) or 0)
+                        body = ""
                         try:
-                            page.wait_for_timeout(2_000)
-                        except Exception:
-                            time.sleep(2.0)
-                        try:
-                            _click_registration_next(page)
+                            body = str(response.text() or "")[:2_000]
                         except Exception:
                             pass
-                        continue
-                    try:
-                        page.wait_for_timeout(1_000)
-                    except Exception:
-                        time.sleep(1.0)
-                if not submitted_profile:
-                    _page_screenshot(page, "profile_submit_failed")
-                    _page_text(page, "profile_submit_failed")
-                    # ── 安全网：轮询超时后再检测一次错误文本，尝试重试提交 ──
-                    _safety_error = _profile_error_text(page)
-                    if _safety_error:
-                        logger.warning(
-                            "[camoufox] 安全网触发：60s 轮询超时但检测到错误文本，尝试重试提交 error=%s",
-                            _safety_error[:200],
+                        profile_response.update({
+                            "seen": True,
+                            "status": status,
+                            "url": response_url,
+                            "body": body,
+                            "seen_at": time.monotonic(),
+                        })
+                        safe_body = re.sub(
+                            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", "<email>", body
                         )
-                        for _safety_i in range(5):
-                            _check_deadline("safety_net_retry")
-                            try:
-                                page.wait_for_timeout(2_000)
-                            except Exception:
-                                time.sleep(2.0)
-                            try:
-                                _click_registration_next(page)
-                            except Exception:
+                        logger.info(
+                            "[camoufox] create_account response status=%s body=%s",
+                            status,
+                            re.sub(r"\s+", " ", safe_body)[:300],
+                        )
+                    except Exception:
+                        pass
+
+                try:
+                    page.on("response", _observe_profile_response)
+                except Exception as exc:
+                    logger.debug("[camoufox] 资料响应监听器安装失败: %s", exc)
+
+                def _reset_profile_response() -> None:
+                    profile_response.update({
+                        "seen": False,
+                        "status": 0,
+                        "url": "",
+                        "body": "",
+                        "seen_at": 0.0,
+                    })
+
+                def _wait_profile_submission(previous_page_error: str = "") -> tuple[str, str]:
+                    """等待一次提交结果，返回结果分类和错误摘要。"""
+                    # create_account 可能已经返回 200，但 callback/页面跳转
+                    # 还要额外十几秒；20s 会在成功前一秒误触发下一次重填。
+                    wait_deadline = min(_profile_deadline, time.time() + _profile_submit_wait)
+                    last_error = ""
+                    while time.time() < wait_deadline:
+                        _check_deadline("profile_poll")
+                        try:
+                            current_title = str(page.title() or "")
+                        except Exception:
+                            current_title = ""
+                        if _profile_success_page(page):
+                            # “You're all set” 表示 create_account 已完成；尝试
+                            # 点击其 Continue 进入主页，但即使按钮导航失败也
+                            # 继续取 /api/auth/session，浏览器中通常已经有 AT。
+                            if current_title.lower() not in {
+                                "chatgpt",
+                                "chatgpt: chat, work, create & code with ai",
+                            }:
+                                try:
+                                    _click_registration_next(page)
+                                    page.wait_for_timeout(500)
+                                except Exception as exc:
+                                    logger.debug("[camoufox] all-set 页面 Continue 点击失败: %s", exc)
+                            return "success", ""
+
+                        page_error = _profile_error_text(page)
+                        # 上一次提交的错误文案可能在 React 重绘期间短暂保留；
+                        # 没有新的 create_account 响应时先等待，避免刚点击就
+                        # 把旧错误当成当前请求结果。
+                        if (
+                            page_error
+                            and not profile_response.get("seen")
+                            and previous_page_error
+                            and page_error == previous_page_error
+                        ):
+                            page_error = ""
+                        response_body = str(profile_response.get("body") or "")
+                        response_status = int(profile_response.get("status") or 0)
+                        combined_error = " ".join(
+                            item for item in (response_body, page_error) if item
+                        ).strip()
+                        if profile_response.get("seen") or page_error:
+                            kind = _classify_camoufox_profile_response(
+                                response_status, combined_error
+                            )
+                            last_error = page_error or response_body or (
+                                f"HTTP {response_status}" if response_status else "页面错误"
+                            )
+                            if kind == "success" and not page_error:
+                                # API 已成功但浏览器跳转可能尚未完成，继续等标题。
                                 pass
-                            logger.info("[camoufox] 安全网重试 %s/5 已点击提交，等待页面跳转...", _safety_i + 1)
-                            # 每次重试后等待最多 15s 看是否跳转成功
-                            for _safety_wait in range(15):
-                                try:
-                                    _safety_title = str(page.title() or "")
-                                except Exception:
-                                    _safety_title = ""
-                                if _safety_title in {"ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI"}:
-                                    submitted_profile = True
-                                    break
-                                try:
-                                    page.wait_for_timeout(1_000)
-                                except Exception:
-                                    time.sleep(1.0)
-                            if submitted_profile:
-                                logger.info("[camoufox] 安全网重试成功！已进入 ChatGPT")
+                            elif kind == "age":
+                                return "age", last_error[:500]
+                            elif kind == "permanent":
+                                return "permanent", last_error[:500]
+                            else:
+                                return "retry", last_error[:500]
+                        try:
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            time.sleep(0.5)
+                    return "retry", last_error or "资料提交等待超时"
+
+                submitted_profile = False
+                last_profile_error = ""
+                try:
+                    for _profile_attempt in range(1, _profile_max_attempts + 1):
+                        _check_deadline("profile_attempt")
+                        if time.time() >= _profile_deadline:
+                            last_profile_error = "资料阶段达到独立超时"
+                            break
+                        # 上一次等待结束后页面可能刚刚完成 callback；先判定
+                        # 成功页，不能再尝试寻找已经消失的资料输入框。
+                        if _profile_success_page(page):
+                            submitted_profile = True
+                            logger.info(
+                                "[camoufox] 资料提交已在重试前完成，跳过重新填表 attempt=%s",
+                                _profile_attempt,
+                            )
+                            break
+                        _reset_profile_response()
+                        try:
+                            _fill_profile_form(
+                                page,
+                                person_name,
+                                person_age,
+                                birthday_mode=birthday_mode,
+                            )
+                            previous_page_error = _profile_error_text(page)
+                            # 给 React 的 change/input 状态和服务端风控请求留出
+                            # 短暂稳定时间，随后再监听并提交。
+                            try:
+                                page.wait_for_timeout(1_000)
+                            except Exception:
+                                time.sleep(1.0)
+                            _click_registration_next(page)
+                        except Exception as exc:
+                            if _profile_success_page(page):
+                                submitted_profile = True
+                                logger.info(
+                                    "[camoufox] 资料提交后页面已成功跳转，忽略重填异常 attempt=%s",
+                                    _profile_attempt,
+                                )
                                 break
-                        if not submitted_profile:
-                            _page_screenshot(page, "profile_safety_net_failed")
-                            raise RuntimeError("Camoufox 资料提交 60s+安全网重试后仍未进入 ChatGPT")
-                    else:
-                        raise RuntimeError("Camoufox 资料提交 60s 后仍未进入 ChatGPT")
+                            last_profile_error = str(exc)[:500]
+                            logger.warning(
+                                "[camoufox] 资料填充/提交失败，准备重试 attempt=%s/%s error=%s",
+                                _profile_attempt, _profile_max_attempts, last_profile_error,
+                            )
+                            if _profile_attempt >= _profile_max_attempts:
+                                break
+                            try:
+                                page.wait_for_timeout(min(4_000, 1_000 + _profile_attempt * 300))
+                            except Exception:
+                                time.sleep(min(4.0, 1.0 + _profile_attempt * 0.3))
+                            continue
+
+                        logger.info(
+                            "[camoufox] profile_submit_poll attempt=%s/%s title=%s",
+                            _profile_attempt,
+                            _profile_max_attempts,
+                            str(page.title() or "")[:120],
+                        )
+                        result_kind, result_error = _wait_profile_submission(previous_page_error)
+                        if result_kind == "success":
+                            submitted_profile = True
+                            logger.info(
+                                "[camoufox] 资料提交成功 attempt=%s/%s",
+                                _profile_attempt, _profile_max_attempts,
+                            )
+                            break
+                        last_profile_error = result_error or last_profile_error
+                        if result_kind == "permanent":
+                            raise RuntimeError(
+                                f"Camoufox 资料提交被上游拒绝: {last_profile_error[:300]}"
+                            )
+                        logger.warning(
+                            "[camoufox] 资料提交需要重试 attempt=%s/%s kind=%s error=%s",
+                            _profile_attempt,
+                            _profile_max_attempts,
+                            result_kind,
+                            last_profile_error[:300],
+                        )
+                        if _profile_attempt < _profile_max_attempts:
+                            try:
+                                page.wait_for_timeout(min(4_000, 1_000 + _profile_attempt * 300))
+                            except Exception:
+                                time.sleep(min(4.0, 1.0 + _profile_attempt * 0.3))
+                    # 最后一轮等待和截图之间也可能刚好完成 callback；再判一次
+                    # 成功页，避免把已进入 ChatGPT 的页面记录成安全网失败。
+                    if not submitted_profile and _profile_success_page(page):
+                        submitted_profile = True
+                        logger.info("[camoufox] 安全网前检测到已完成账号页，按成功处理")
+                    if not submitted_profile:
+                        _page_screenshot(page, "profile_submit_failed")
+                        _page_text(page, "profile_submit_failed")
+                        # 保留原有安全网截图标签，便于和历史失败样本对照；
+                        # 新流程已经在此之前完成了有上限的重填表单重试。
+                        _page_screenshot(page, "profile_safety_net_failed")
+                        raise RuntimeError(
+                            "Camoufox 资料提交重试后仍未进入 ChatGPT"
+                            + (f": {last_profile_error[:300]}" if last_profile_error else "")
+                        )
+                finally:
+                    try:
+                        page.remove_listener("response", _observe_profile_response)
+                    except Exception:
+                        pass
 
             # 与 auto_manq.py 一致：提交资料后等待最终 ChatGPT 页面，
             # 不能只 sleep 1.5 秒就检查 URL。
@@ -5878,17 +7202,22 @@ class AuthFlow:
                 page.wait_for_timeout(1_800)
             except Exception:
                 time.sleep(1.8)
-            if not _wait_titles(
+            _post_profile_ready = _profile_success_page(page)
+            if not _post_profile_ready and not _wait_titles(
                 page,
                 ("ChatGPT", "ChatGPT: Chat, Work, Create & Code with AI"),
                 attempts=60,
             ):
-                _page_screenshot(page, "registration_not_completed")
-                _page_text(page, "registration_not_completed")
-                raise RuntimeError(
-                    "Camoufox 注册资料提交后未进入 ChatGPT 页面，"
-                    "请查看 create_account 响应和页面正文"
-                )
+                # 新版流程可能停在 “You're all set” onboarding 页；该页面
+                # 已代表账号创建成功，后续直接访问 NextAuth session 获取 AT/ST。
+                if not _profile_success_page(page):
+                    _page_screenshot(page, "registration_not_completed")
+                    _page_text(page, "registration_not_completed")
+                    raise RuntimeError(
+                        "Camoufox 注册资料提交后未进入 ChatGPT 页面，"
+                        "请查看 create_account 响应和页面正文"
+                    )
+                logger.info("[camoufox] 检测到 all-set 成功页，继续获取浏览器 session")
             current_url = str(getattr(page, "url", "") or "")
             _page_state(page, "after_profile_or_otp")
             # 让 NextAuth 在浏览器侧主动写入 session cookie；随后协议请求
@@ -5939,6 +7268,14 @@ class AuthFlow:
                         "有" if browser_at else "无",
                     )
             _sync_cookies(context)
+        finally:
+            # 确保浏览器在注册流程结束后（无论成功或异常）被正确关闭
+            if _initial_load_browser is not None:
+                try:
+                    _initial_load_browser.__exit__(None, None, None)
+                except Exception:
+                    pass
+                _initial_load_browser = None
 
         # 现有 session 提取、2FA hook、OAuth RT 均从这里继续，保证落库格式一致。
         # 浏览器 JSON 已有凭证时，HTTP 端点只用于补齐/刷新；某些部署返回空
@@ -5965,7 +7302,6 @@ class AuthFlow:
             self.oauth_codex_rt_exchange(mail_provider=mail_provider)
             self.get_auth_session()
         if not self.result.is_valid():
-            _page_screenshot(page, "token_extraction_failed")
             raise RuntimeError("Camoufox 注册完成但未获取有效 access/session token")
         logger.info("[camoufox] 注册流程完成 email=%s", email)
         return self.result

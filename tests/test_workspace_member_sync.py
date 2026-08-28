@@ -66,6 +66,39 @@ class WorkspaceMemberPaginationTests(unittest.TestCase):
             workspace_membership._workspace_admin_last_completed.clear()
             workspace_membership._workspace_admin_cooldown_until.clear()
 
+    def test_subscription_capacity_keeps_default_and_prolite_purchased_counts(self):
+        def response(payload):
+            item = Mock(status_code=200, headers={})
+            item.json.return_value = payload
+            return item
+
+        session = Mock()
+        master = {"workspace_id": "workspace-1", "access_token": "token"}
+        responses = [
+            response({
+                "seats_in_use": 76,
+                "seats_entitled": 8,
+                "seat_capacity": [
+                    {"type": "default", "paid": 4, "available": 4},
+                    {"type": "prolite", "paid": 4, "available": 1},
+                ],
+            }),
+            response({"seat_type_counts": {"default": 0, "usage_based": 73, "prolite": 3}}),
+            response({"amount_due": {"amount": 0, "currency": "sgd"}, "renewal_date": "2026-09-14"}),
+        ]
+        with (
+            patch.object(workspace_membership, "create_workspace_http_session", return_value=(session, master)),
+            patch.object(workspace_membership, "_workspace_admin_request", side_effect=responses),
+        ):
+            result = workspace_membership.sync_seat_info(5)
+
+        self.assertEqual(result["seats_entitled"], 8)
+        self.assertEqual(result["seats_default_entitled"], 4)
+        self.assertEqual(result["seats_prolite_entitled"], 4)
+        self.assertEqual(result["seats_default"], 0)
+        self.assertEqual(result["seats_prolite"], 3)
+        self.assertEqual(result["seats_usage_based"], 73)
+
     def test_bulk_member_sync_paginates_and_matches_locally(self):
         first = Mock(status_code=200, headers={})
         first.json.return_value = {
@@ -266,6 +299,34 @@ class WorkspaceMembershipThrottleTests(unittest.TestCase):
                 self.assertIs(future.result(), response)
 
         self.assertEqual(max_active, 1)
+
+    def test_admin_request_retries_once_after_refreshing_expired_access_token(self):
+        expired = Mock(status_code=401, headers={})
+        expired.json.return_value = {"detail": {"code": "token_expired"}}
+        fresh = Mock(status_code=200, headers={})
+        session = Mock()
+        session.get.side_effect = [expired, fresh]
+        with (
+            patch.object(workspace_membership, "_refresh_workspace_access_token", return_value="fresh-token") as refresh,
+            patch.object(workspace_membership, "_workspace_external_id", return_value="workspace-1"),
+        ):
+            result = workspace_membership._workspace_admin_request(
+                16,
+                session,
+                "get",
+                "https://example.test/users",
+                headers={"Authorization": "Bearer expired"},
+                request_interval=0,
+            )
+
+        self.assertIs(result, fresh)
+        refresh.assert_called_once_with(16, session)
+        self.assertEqual(session.get.call_args_list[1].kwargs["headers"]["Authorization"], "Bearer fresh-token")
+
+    def test_admin_headers_include_browser_device_id(self):
+        headers = workspace_membership._headers("token", "workspace-1")
+        self.assertTrue(headers["oai-device-id"])
+        self.assertEqual(headers["Referer"], "https://chatgpt.com/admin/members")
 
     def test_same_workspace_waits_after_previous_response(self):
         response = Mock(status_code=200, headers={})

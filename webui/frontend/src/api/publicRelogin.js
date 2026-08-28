@@ -8,3 +8,6 @@ export const runPublicRelogin = (payload) =>
 
 export const getPublicReloginQueueStatus = () =>
   http.get('/api/public-relogin/queue-status')
+
+export const refreshPublicReloginExport = (payload) =>
+  http.post('/api/public-relogin/refresh-export', payload, { timeout: 120000 })

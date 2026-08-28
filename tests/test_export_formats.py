@@ -4,8 +4,9 @@ import io
 import json
 import unittest
 import zipfile
+from unittest.mock import patch
 
-from webui import export_formats
+from webui import export_formats, exporter
 
 
 def _jwt(payload):
@@ -47,6 +48,32 @@ def _row(email="user@example.com", account_id="account-123", plan="team"):
 
 
 class ExportFormatTests(unittest.TestCase):
+    def test_sub2_panel_push_stops_when_rt_refresh_fails(self):
+        with patch.object(exporter, "refresh_codex_token", side_effect=RuntimeError("refresh rejected")):
+            with self.assertRaisesRegex(RuntimeError, "已停止导出"):
+                exporter.export_to_sub2api(
+                    _row(),
+                    {"sub2api_url": "https://sub2.example", "sub2api_api_key": "key"},
+                )
+
+    def test_sub2_rejects_mismatched_access_and_id_tokens(self):
+        row = _row()
+        row["id_token"] = _jwt({
+            "at_hash": "belongs-to-another-access-token",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account-123"},
+        })
+        with self.assertRaisesRegex(RuntimeError, "at_hash"):
+            export_formats.render_bytes([row], "sub2api")
+
+    def test_sub2_accepts_matching_oidc_token_pair(self):
+        row = _row()
+        row["id_token"] = _jwt({
+            "at_hash": exporter._oidc_at_hash(row["access_token"]),
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account-123"},
+        })
+        data = json.loads(export_formats.render_bytes([row], "sub2api"))
+        self.assertEqual(data["accounts"][0]["credentials"]["access_token"], row["access_token"])
+
     def test_cpa_single_matches_sample_shape_and_filename(self):
         row = _row()
         fmt = export_formats.get_format("cpa")
@@ -79,29 +106,32 @@ class ExportFormatTests(unittest.TestCase):
         fmt = export_formats.get_format("sub2api")
         data = json.loads(export_formats.render_bytes([row], fmt))
         self.assertEqual(fmt.filename_for([row]), "sub2api-accounts-remaining-1.json")
-        self.assertEqual(list(data), ["type", "version", "exported_at", "workspace_id", "proxies", "accounts"])
+        self.assertEqual(list(data), ["type", "version", "exported_at", "proxies", "accounts"])
         self.assertEqual(data["type"], "sub2api-data")
         self.assertEqual(data["version"], 1)
-        self.assertEqual(data["workspace_id"], "account-123")
         self.assertEqual(data["proxies"], [])
         account = data["accounts"][0]
         self.assertEqual(account["name"], "user@example.com")
         self.assertEqual(account["platform"], "openai")
         self.assertEqual(account["type"], "oauth")
         self.assertEqual(list(account), [
-            "name", "platform", "type", "credentials", "extra", "group_ids",
-            "priority", "concurrency", "rate_multiplier", "auto_pause_on_expired",
+            "name", "type", "extra", "platform", "priority", "plan_type",
+            "concurrency", "credentials", "group_ids", "expires_at",
+            "auto_pause_on_expired",
         ])
         self.assertEqual(account["credentials"]["chatgpt_account_id"], "account-123")
         self.assertEqual(account["credentials"]["email"], "user@example.com")
         self.assertEqual(account["credentials"]["password"], "GptPass!")
         self.assertEqual(account["credentials"]["totp_secret"], "JBSWY3DPEHPK3PXP")
         self.assertEqual(account["credentials"]["plan_type"], "team")
-        self.assertEqual(account["extra"]["source"], "workspace_oauth")
-        self.assertEqual(account["extra"]["workspace_id"], "account-123")
+        self.assertEqual(account["extra"]["source"], "internal_resource_exchange")
+        self.assertEqual(account["credentials"]["expired"], "2026-08-30T10:19:22Z")
+        self.assertEqual(account["credentials"]["expires_at"], "2026-08-30T10:19:22Z")
+        self.assertEqual(account["credentials"]["type"], "codex")
+        self.assertEqual(account["credentials"]["account_id"], "account-123")
         self.assertEqual(account["group_ids"], [4])
         self.assertNotIn("notes", account)
-        self.assertNotIn("organization_id", account["credentials"])
+        self.assertEqual(account["credentials"]["organization_id"], "org-123")
 
 
 if __name__ == "__main__":

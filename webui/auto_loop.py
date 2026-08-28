@@ -567,6 +567,20 @@ class AutoLoopController:
                 ]
                 if alternatives:
                     candidates = alternatives
+
+                # ── 排除正在冷却中的代理 ──
+                non_cooldown = [
+                    i for i in candidates
+                    if not db.is_proxy_in_cooldown(self._proxy_pool[i])
+                ]
+                if non_cooldown:
+                    candidates = non_cooldown
+                else:
+                    # 所有候选都在冷却，记日志但仍从原 candidates 中选
+                    logger.warning(
+                        "[proxy] 所有候选代理均在冷却中，忽略冷却限制继续选择"
+                    )
+
                 min_count = min(self._proxy_usage[i] for i in candidates)
                 # min() 保证同计数时按代理池原始顺序稳定选择。
                 index = next(i for i in candidates if self._proxy_usage[i] == min_count)
@@ -586,7 +600,58 @@ class AutoLoopController:
             should_record = self._state in (AutoLoopState.RUNNING, AutoLoopState.PAUSED)
         if leased_from_pool and should_record:
             proxy_usage.record_lease(proxy, task_type, detail)
+
+        # ── 在锁外测量代理访问延迟（不影响并发）──
+        if proxy:
+            self._log_proxy_latency(proxy, worker_id)
+
         return proxy
+
+    def _log_proxy_latency(self, proxy: str, worker_id: int = 0) -> None:
+        """测试代理到目标站点的访问延迟并打印到日志。
+
+        使用轻量 HEAD 请求，超时 10 秒，不会阻塞太久。
+        测试失败时仅打 warning，不影响后续任务。
+        """
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        _root = str(_Path(__file__).resolve().parents[1])
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        try:
+            from http_client import create_http_session
+        except Exception:
+            logger.debug("[worker-%s] 无法加载 http_client，跳过延迟测试", worker_id)
+            return
+
+        _test_url = "https://api.ipify.org?format=json"
+        t0 = time.perf_counter()
+        try:
+            sess = create_http_session(proxy=proxy)
+            resp = sess.get(_test_url, timeout=10)
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            exit_ip = ""
+            try:
+                exit_ip = resp.json().get("ip", "")
+            except Exception:
+                exit_ip = (resp.text or "").strip()[:64]
+            if resp.status_code == 200:
+                logger.info(
+                    "[worker-%s] 代理延迟测试 OK  latency=%dms  exit_ip=%s  proxy=%s",
+                    worker_id, latency_ms, exit_ip, proxy[:80],
+                )
+            else:
+                logger.warning(
+                    "[worker-%s] 代理延迟测试 HTTP %s  latency=%dms  proxy=%s",
+                    worker_id, resp.status_code, latency_ms, proxy[:80],
+                )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "[worker-%s] 代理延迟测试失败  latency=%dms  error=%s  proxy=%s",
+                worker_id, latency_ms, str(exc)[:200], proxy[:80],
+            )
 
     @staticmethod
     def _account_key(account: Optional[dict]) -> str:
@@ -1111,6 +1176,7 @@ class AutoLoopController:
                                 trash_workspace_candidates_by_email(
                                     account.get("email", ""),
                                     reason="login_403",
+                                    respect_invalid_settings=True,
                                 )
                         except Exception:
                             logger.exception("登录启动阶段垃圾箱处理失败 email=%s", account.get("email", ""))
@@ -1172,6 +1238,7 @@ class AutoLoopController:
                         trash_workspace_candidates_by_email(
                             account.get("email", ""),
                             reason="login_403",
+                            respect_invalid_settings=True,
                         )
                     logger.warning("候选账号标记为已永久失效 workspace=%s email=%s", candidate_workspace_id, account.get("email", ""))
                 except Exception:

@@ -33,6 +33,20 @@ def _flow(response):
 
 
 class PasswordCreationTests(unittest.TestCase):
+    def test_password_creation_reuses_history_before_generating_new_candidate(self):
+        flow = _flow(_Response(409, {"error": "temporary upstream error"}))
+        flow._account_callback = Mock(return_value={"password": "Historical!123"})
+
+        ok = flow.register_password("passwordless@example.com")
+
+        self.assertFalse(ok)
+        self.assertEqual(flow.result.password, "Historical!123")
+        self.assertEqual(
+            flow.session.post.call_args.kwargs["json"]["password"],
+            "Historical!123",
+        )
+        flow._random_password.assert_not_called()
+
     def test_existing_passwordless_uses_user_register_api(self):
         flow = _flow(_Response(200, {"continue_url": "/email-verification"}))
 
@@ -65,7 +79,7 @@ class PasswordCreationTests(unittest.TestCase):
             "Created!Password123",
         )
 
-    def test_failed_creation_does_not_persist_password(self):
+    def test_failed_creation_keeps_password_candidate_for_retry(self):
         flow = _flow(_Response(409, {"error": "already has password"}, "already has password"))
 
         ok = flow.create_password_via_api(
@@ -74,8 +88,10 @@ class PasswordCreationTests(unittest.TestCase):
         )
 
         self.assertFalse(ok)
-        self.assertEqual(flow.result.password, "")
-        flow._on_password.assert_not_called()
+        self.assertEqual(flow.result.password, "Created!Password123")
+        flow._on_password.assert_called_once_with(
+            "passwordless@example.com", "Created!Password123"
+        )
 
     def test_business_invalid_auth_step_on_http_200_is_failure(self):
         flow = _flow(_Response(200, {"code": "invalid_auth_step"}))
@@ -86,8 +102,10 @@ class PasswordCreationTests(unittest.TestCase):
         )
 
         self.assertFalse(ok)
-        self.assertEqual(flow.result.password, "")
-        flow._on_password.assert_not_called()
+        self.assertEqual(flow.result.password, "Created!Password123")
+        flow._on_password.assert_called_once_with(
+            "passwordless@example.com", "Created!Password123"
+        )
 
     def test_plain_text_error_on_http_200_is_failure(self):
         flow = _flow(_Response(200, text="Invalid authorization step."))
@@ -98,8 +116,10 @@ class PasswordCreationTests(unittest.TestCase):
         )
 
         self.assertFalse(ok)
-        self.assertEqual(flow.result.password, "")
-        flow._on_password.assert_not_called()
+        self.assertEqual(flow.result.password, "Created!Password123")
+        flow._on_password.assert_called_once_with(
+            "passwordless@example.com", "Created!Password123"
+        )
 
     def test_callback_continuation_still_opens_registration_password_step(self):
         flow = _flow(_Response(200, {}))

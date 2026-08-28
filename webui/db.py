@@ -110,7 +110,10 @@ def init_db():
             seats_in_use    INTEGER,
             seats_entitled  INTEGER,
             seats_default   INTEGER,
+            seats_default_entitled INTEGER,
             seats_usage_based INTEGER,
+            seats_prolite   INTEGER,
+            seats_prolite_entitled INTEGER,
             seat_cost       TEXT NOT NULL DEFAULT '',
             renewal_date    TEXT NOT NULL DEFAULT '',
             session_token   TEXT NOT NULL UNIQUE,
@@ -146,6 +149,18 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_proxy_lease_usage_last
             ON proxy_lease_usage(last_leased_at DESC);
+
+        CREATE TABLE IF NOT EXISTS proxy_cooldown (
+            proxy           TEXT NOT NULL,
+            error_type      TEXT NOT NULL,
+            error_count     INTEGER NOT NULL DEFAULT 0,
+            last_error_at   REAL NOT NULL DEFAULT 0,
+            cooldown_until  REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (proxy, error_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_proxy_cooldown_until
+            ON proxy_cooldown(cooldown_until DESC);
     """)
     con.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_usage_since', ?)",
@@ -168,7 +183,10 @@ def init_db():
         ("seats_in_use", "INTEGER"),
         ("seats_entitled", "INTEGER"),
         ("seats_default", "INTEGER"),
+        ("seats_default_entitled", "INTEGER"),
         ("seats_usage_based", "INTEGER"),
+        ("seats_prolite", "INTEGER"),
+        ("seats_prolite_entitled", "INTEGER"),
         ("seat_cost", "TEXT NOT NULL DEFAULT ''"),
         ("renewal_date", "TEXT NOT NULL DEFAULT ''"),
         ("settings_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -495,7 +513,7 @@ def count_workspace_masters() -> int:
 
 def list_workspace_masters(limit: int = 20, offset: int = 0) -> list[dict]:
     rows = _conn().execute(
-        "SELECT id, account, email, workspace_id, seats_in_use, seats_entitled, seats_default, seats_usage_based, seat_cost, renewal_date, status, length(session_token) AS session_len, "
+        "SELECT id, account, email, workspace_id, seats_in_use, seats_entitled, seats_default, seats_default_entitled, seats_usage_based, seats_prolite, seats_prolite_entitled, seat_cost, renewal_date, status, length(session_token) AS session_len, "
         "substr(session_token, 1, 8) AS session_head, "
         "substr(session_token, -6) AS session_tail, proxy_url, imported_at, updated_at "
         "FROM workspace_masters ORDER BY updated_at DESC LIMIT ? OFFSET ?",
@@ -750,6 +768,32 @@ def update_workspace_proxy(workspace_id: int, proxy: str) -> bool:
         return rc.rowcount > 0
 
 
+def update_workspace_master_auth(
+    workspace_id: int,
+    access_token: str,
+    session_token: str | None = None,
+) -> bool:
+    """更新母号管理凭证（通常由 session token 刷新得到）。"""
+    access = str(access_token or "").strip()
+    if not access:
+        return False
+    with _lock:
+        con = _conn()
+        if session_token is None:
+            rc = con.execute(
+                "UPDATE workspace_masters SET access_token=?, updated_at=? WHERE id=?",
+                (access, time.time(), int(workspace_id)),
+            )
+        else:
+            session = str(session_token or "").strip()
+            rc = con.execute(
+                "UPDATE workspace_masters SET access_token=?, session_token=?, updated_at=? WHERE id=?",
+                (access, session, time.time(), int(workspace_id)),
+            )
+        con.commit()
+        return rc.rowcount > 0
+
+
 def delete_workspace_masters(ids: list[int]) -> int:
     cleaned = sorted({int(i) for i in (ids or []) if int(i) > 0})
     if not cleaned:
@@ -791,6 +835,7 @@ def _workspace_candidate_option_filters(
     seat_type: str = "",
     trash_status: str = "",
     tag_status: str = "",
+    group_name: str = "",
 ):
     join_status_expr = _workspace_candidate_join_status_expr()
     clauses = ["c.workspace_master_id=?"]
@@ -802,7 +847,7 @@ def _workspace_candidate_option_filters(
         clauses.append(f"({join_status_expr})=?")
         args.append(str(join_status))
     if credential_status == "workspace_credential":
-        clauses.append("(length(COALESCE(wc.access_token,''))>0 OR c.status='workspace_credential')")
+        clauses.append("length(COALESCE(wc.access_token,''))>0")
         clauses.append("COALESCE(r.account_status, 'active') <> 'permanently_invalid'")
     elif credential_status == "personal_credential":
         clauses.append("length(COALESCE(wc.access_token,''))=0 AND length(COALESCE(r.access_token,''))>0")
@@ -824,6 +869,10 @@ def _workspace_candidate_option_filters(
             clauses.append(
                 "LOWER(COALESCE(c.seat_type,'')) IN ('usage_based', 'usagebased', 'usage-based', 'codex席位')"
             )
+        elif normalized == "prolite":
+            clauses.append(
+                "LOWER(COALESCE(c.seat_type,'')) IN ('prolite', 'pro_lite')"
+            )
         else:
             clauses.append("c.seat_type=?")
             args.append(str(seat_type))
@@ -841,6 +890,9 @@ def _workspace_candidate_option_filters(
         args.append(normalized_tag)
     else:
         clauses.append("COALESCE(c.tag_status, 'active')<>'outbound'")
+    if group_name:
+        clauses.append("r.group_name=?")
+        args.append(str(group_name))
     return " AND ".join(clauses), args
 
 
@@ -854,9 +906,10 @@ def list_workspace_candidate_options(
     seat_type: str = "",
     trash_status: str = "",
     tag_status: str = "",
+    group_name: str = "",
 ) -> list[dict]:
     where, args = _workspace_candidate_option_filters(
-        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status,
+        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name,
     )
     join_status_expr = _workspace_candidate_join_status_expr()
     sql = """SELECT r.email, r.group_name, c.seat_type, c.member_id,
@@ -878,7 +931,6 @@ def list_workspace_candidate_options(
         CASE WHEN COALESCE(c.trash_status, 'active')='trashed' THEN 'trashed'
              WHEN COALESCE(c.trash_status, 'active')='scheduled' THEN 'trash_scheduled'
              WHEN COALESCE(r.account_status, 'active')='permanently_invalid' THEN 'unavailable'
-             WHEN c.status='workspace_credential' THEN 'workspace_credential'
              WHEN length(COALESCE(wc.access_token,''))>0 THEN 'workspace_credential'
              WHEN length(COALESCE(r.access_token,''))>0 THEN 'personal_credential'
              ELSE 'none' END AS credential_status,
@@ -886,7 +938,6 @@ def list_workspace_candidate_options(
              WHEN COALESCE(c.trash_status, 'active')='scheduled' THEN 'trash_scheduled'
              WHEN COALESCE(r.account_status, 'active')='permanently_invalid' THEN 'unavailable'
              WHEN c.status LIKE 'quota_error_%' THEN c.status
-             WHEN c.status='workspace_credential' THEN 'workspace_credential'
              WHEN length(COALESCE(wc.access_token,''))>0 THEN 'workspace_credential'
              ELSE CASE WHEN """ + join_status_expr + """ = 'joined' THEN 'joined' ELSE c.workspace_join_status END END AS display_status,
         1 AS assigned
@@ -911,14 +962,28 @@ def count_workspace_candidate_options(
     seat_type: str = "",
     trash_status: str = "",
     tag_status: str = "",
+    group_name: str = "",
 ) -> int:
     where, args = _workspace_candidate_option_filters(
-        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status,
+        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name,
     )
     return int(_conn().execute("""SELECT COUNT(*) FROM registered r
         JOIN workspace_candidates c ON c.email=r.email
         LEFT JOIN workspace_credentials wc ON wc.email=r.email AND wc.workspace_master_id=?
         WHERE """ + where, [int(workspace_master_id), *args]).fetchone()[0])
+
+
+def list_workspace_candidate_groups(workspace_master_id: int) -> list[str]:
+    """返回指定空间候选人中出现的所有分组名（去重、按名排序）。"""
+    rows = _conn().execute(
+        """SELECT DISTINCT r.group_name
+           FROM registered r
+           JOIN workspace_candidates c ON c.email=r.email
+           WHERE c.workspace_master_id=? AND COALESCE(r.group_name, '') <> ''
+           ORDER BY r.group_name COLLATE NOCASE""",
+        (int(workspace_master_id),),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
 
 
 def get_workspace_candidate(workspace_master_id: int, email: str) -> Optional[dict]:
@@ -987,6 +1052,22 @@ def list_workspace_candidate_trash_due(now: float | None = None) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def list_invalid_workspace_candidates_pending_trash(limit: int = 500) -> list[dict]:
+    rows = _conn().execute(
+        """
+        SELECT c.*
+          FROM workspace_candidates c
+          JOIN registered r ON r.email=c.email
+         WHERE r.account_status='permanently_invalid'
+           AND COALESCE(c.trash_status, 'active')<>'trashed'
+         ORDER BY c.updated_at ASC
+         LIMIT ?
+        """,
+        (max(1, min(5000, int(limit or 500))),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def update_workspace_candidate_trash(
     workspace_master_id: int,
     email: str,
@@ -1027,6 +1108,31 @@ def update_workspace_candidate_trash(
         )
         con.commit()
         return rc.rowcount > 0
+
+
+def restore_workspace_candidates_from_trash(
+    workspace_master_id: int,
+    emails: list[str],
+) -> int:
+    """Restore trashed candidate relationships without changing their seat or join state."""
+    cleaned = sorted({str(email or "").strip().lower() for email in emails if str(email or "").strip()})
+    if not cleaned:
+        return 0
+    with _lock:
+        con = _conn()
+        marks = ",".join("?" * len(cleaned))
+        rc = con.execute(
+            f"""
+            UPDATE workspace_candidates
+               SET trash_status='active', trash_due_at=0, trash_reason='', updated_at=?
+             WHERE workspace_master_id=?
+               AND email IN ({marks})
+               AND trash_status='trashed'
+            """,
+            [time.time(), int(workspace_master_id), *cleaned],
+        )
+        con.commit()
+        return rc.rowcount
 
 
 def update_workspace_candidates_trash_by_email(
@@ -1241,7 +1347,7 @@ def update_workspace_candidate_status(workspace_master_id: int, email: str, stat
 
 
 def update_workspace_seat_info(workspace_master_id: int, **values) -> bool:
-    allowed = {k: values[k] for k in ('seats_in_use','seats_entitled','seats_default','seats_usage_based','seat_cost','renewal_date') if k in values}
+    allowed = {k: values[k] for k in ('seats_in_use','seats_entitled','seats_default','seats_default_entitled','seats_usage_based','seats_prolite','seats_prolite_entitled','seat_cost','renewal_date') if k in values}
     if not allowed: return False
     clause = ', '.join(f'{k}=?' for k in allowed)
     with _lock:
@@ -2139,19 +2245,19 @@ def import_2fa_registered(text: str, group_name: str = "") -> dict:
 
 
 def save_password_early(email: str, password: str) -> None:
-    """密码一在 OpenAI 侧生效就落盘，不等整个注册流程跑完。
+    """密码候选一经本地确定就落盘，不等整个注册流程跑完。
 
-    由 AuthFlow 的 on_password 回调触发（register_password 里 POST 200 之后）。
-    此刻账号+密码在 OpenAI 那边已经建好，但本地还要过发码/验证/建账户三关，
+    由 AuthFlow 的 on_password 回调触发（密码候选生成/确定时）。
+    此刻账号+密码可能正在提交，本地还要过发码/验证/建账户三关，
     挂在任何一关都走不到 save_registered ——
-    密码只活在内存里，进程一退号就成了谁也登不进去的孤儿。
+    即使网络响应丢失，下一轮也能使用同一个密码继续流程。
 
     只写 email + password；token 三件套留空，等流程跑通后 save_registered
     用同一个 email 主键覆盖同一行补上。extra_json 打 pending 标记，
     方便一眼认出"有密码没凭证"的半成品行（跑通后会被 save_registered 清掉）。
 
-    ⚠️ 行已存在时**只 UPDATE password**，绝不动已有的 token：
-       重跑一个之前跑通过的邮箱时，不能把人家的凭证清空。
+    ⚠️ 行已存在时只在密码列为空时写入，绝不覆盖已有密码和 token：
+       并发重跑不能把历史候选替换成另一个新候选。
     """
     email = (email or "").strip().lower()
     password = (password or "").strip()
@@ -2167,7 +2273,11 @@ def save_password_early(email: str, password: str) -> None:
             "COALESCE((SELECT kind FROM outlook_accounts WHERE email=?), "
             "(SELECT value FROM settings WHERE key='mail_source'), 'outlook'), "
             "?, '', '', '', '', '', '', '', ?, ?) "
-            "ON CONFLICT(email) DO UPDATE SET password=excluded.password",
+            # 账号密码一旦成功创建就是远端持久状态。并发重试时新流程可能
+            # 重新生成候选密码，但不能覆盖已有历史密码；只有本地为空时才写入。
+            "ON CONFLICT(email) DO UPDATE SET password="
+            "CASE WHEN trim(COALESCE(registered.password, '')) <> '' "
+            "THEN registered.password ELSE excluded.password END",
             (
                 email,
                 email,
@@ -2360,6 +2470,8 @@ def _canonical_workspace_seat_type(value: object) -> str:
         return "usage_based"
     if normalized in {"default", "standard", "standard_seat", "gpt"}:
         return "default"
+    if normalized in {"prolite", "pro_lite"}:
+        return "prolite"
     if "codex席位" in normalized:
         return "usage_based"
     if "gpt席位" in normalized or "标准席位" in normalized:
@@ -2406,9 +2518,14 @@ def update_workspace_candidate_member(workspace_master_id: int, email: str, memb
         wid = int(workspace_master_id)
         key = str(email).lower()
         member = str(member_id or "").strip()
+        canonical_seat = _canonical_workspace_seat_type(seat_type)
+        stored_seat = canonical_seat or str(seat_type or "").strip()
+        codex_seat = "Codex席位" if canonical_seat == "usage_based" else ""
+        gpt_seat = "GPT席位" if canonical_seat == "default" else ""
         con.execute(
-            "UPDATE workspace_candidates SET member_id=?, seat_type=?, updated_at=? WHERE workspace_master_id=? AND email=?",
-            (member, seat_type, time.time(), wid, key),
+            "UPDATE workspace_candidates SET member_id=?, seat_type=?, codex_seat=?, gpt_seat=?, updated_at=? "
+            "WHERE workspace_master_id=? AND email=?",
+            (member, stored_seat, codex_seat, gpt_seat, time.time(), wid, key),
         )
         if member:
             con.execute(
@@ -2447,6 +2564,8 @@ def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[st
         conditions.append("(extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')")
     elif filt == "banned":
         conditions.append("extra_json LIKE '%\"banned\"%'")
+    elif filt == "permanently_invalid":
+        conditions.append("COALESCE(account_status, 'active')='permanently_invalid'")
     elif filt == "token_invalid":
         # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
         # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
@@ -2950,6 +3069,75 @@ def reset_proxy_lease_usage() -> float:
         )
         con.commit()
     return started_at
+
+
+# ─── 代理冷却 (cooldown) ─────────────────────────────────────────────
+
+def record_proxy_error(
+    proxy: str,
+    error_type: str,
+    cooldown_seconds: int = 3600,
+) -> None:
+    """记录一次代理错误事件，并设置冷却到期时间。
+
+    *error_type*: 错误分类，如 ``"unable_to_load_site"``。
+    *cooldown_seconds*: 冷却时长（秒），默认 3600（1 小时）。
+    """
+    proxy_value = str(proxy or "").strip()
+    error_type_value = str(error_type or "").strip().lower()
+    if not proxy_value or not error_type_value:
+        return
+    now = time.time()
+    until = now + cooldown_seconds
+    with _lock:
+        con = _conn()
+        con.execute(
+            """INSERT INTO proxy_cooldown(
+                   proxy, error_type, error_count, last_error_at, cooldown_until
+               ) VALUES (?, ?, 1, ?, ?)
+               ON CONFLICT(proxy, error_type) DO UPDATE SET
+                   error_count=proxy_cooldown.error_count + 1,
+                   last_error_at=excluded.last_error_at,
+                   cooldown_until=excluded.cooldown_until""",
+            (proxy_value, error_type_value, now, until),
+        )
+        con.commit()
+
+
+def is_proxy_in_cooldown(proxy: str, error_type: str = "") -> bool:
+    """判断代理是否仍在冷却期内。
+
+    *error_type* 为空时，任何错误类型只要有一条冷却中即返回 True。
+    """
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value:
+        return False
+    now = time.time()
+    con = _conn()
+    if error_type:
+        row = con.execute(
+            "SELECT cooldown_until FROM proxy_cooldown "
+            "WHERE proxy=? AND error_type=? AND cooldown_until>?",
+            (proxy_value, str(error_type).strip().lower(), now),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT cooldown_until FROM proxy_cooldown "
+            "WHERE proxy=? AND cooldown_until>?",
+            (proxy_value, now),
+        ).fetchone()
+    return row is not None
+
+
+def list_proxy_cooldown() -> list[dict]:
+    """列出所有代理冷却记录（含已过期的）。"""
+    con = _conn()
+    rows = con.execute(
+        """SELECT proxy, error_type, error_count, last_error_at, cooldown_until
+           FROM proxy_cooldown
+           ORDER BY cooldown_until DESC, proxy, error_type"""
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _setting_bool(value) -> bool:
