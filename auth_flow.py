@@ -21,7 +21,15 @@ import time
 import uuid
 from datetime import date, datetime
 from typing import Optional, Any, Callable
-from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    unquote,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
 
 from config import Config
 from fingerprint import (
@@ -350,13 +358,48 @@ class AuthFlow:
     def _camoufox_proxy_config(self) -> tuple[dict | None, str]:
         """返回 Camoufox 使用的当前任务代理及脱敏显示值。"""
         value = str(getattr(self.config, "proxy", None) or "").strip()
-        browser_value = value
-        if browser_value.lower().startswith("socks5h://"):
-            browser_value = "socks5://" + browser_value[len("socks5h://"):]
-        if not browser_value:
+        if not value:
             return None, "直连"
-        shown = re.sub(r"(://)([^/@]+)@", r"\1<credentials>@", browser_value)
-        return {"server": browser_value}, shown
+
+        parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https", "socks5", "socks5h"}:
+            raise ValueError(f"Camoufox 不支持代理协议: {parsed.scheme or '<empty>'}")
+        if not parsed.hostname:
+            raise ValueError("Camoufox 代理地址缺少主机名")
+
+        username = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        authenticated = bool(username or password)
+
+        # Playwright 会从 proxy.server 中剥掉 URL userinfo，却不会自动转填
+        # username/password；更重要的是浏览器层明确不支持认证 SOCKS5。
+        # 当前使用的住宅代理端点同时支持 HTTP CONNECT，因此认证 SOCKS5
+        # 输入需要切换为 HTTP 并拆分凭据。无认证 SOCKS5 可以继续原样使用。
+        if scheme in {"socks5", "socks5h"}:
+            browser_scheme = "http" if authenticated else "socks5"
+        else:
+            browser_scheme = scheme
+
+        host = parsed.hostname
+        host_display = f"[{host}]" if ":" in host else host
+        authority = host_display
+        if parsed.port is not None:
+            authority += f":{parsed.port}"
+        server = f"{browser_scheme}://{authority}"
+
+        proxy: dict[str, str] = {"server": server}
+        if username:
+            proxy["username"] = username
+        if password:
+            proxy["password"] = password
+
+        shown = (
+            f"{browser_scheme}://<credentials>@{authority}"
+            if authenticated
+            else server
+        )
+        return proxy, shown
 
     def _build_chatgpt_cookie_header(self) -> str:
         """
