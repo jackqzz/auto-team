@@ -245,6 +245,9 @@ class AutoLoopController:
             self._last_message = "auto-loop 启动"
             # 解析并发参数
             self._concurrency = max(1, min(20, int(self._options.get("concurrency") or 1)))
+            # 熔断阈值按并发规模放大：并发越高，单个任务的网络抖动越容易
+            # 交错完成，不能仍用固定 3 次全局错误立即暂停。
+            self._circuit_break_threshold = max(3, 3 * self._concurrency)
             pool_text = self._options.get("proxy_pool") or ""
             self._proxy_pool = _parse_proxy_pool(pool_text)
             # 基于近期历史的租借计数（LRU 式），而非从零开始的快照。
@@ -511,6 +514,8 @@ class AutoLoopController:
                 "workers": workers_info,
                 "last_message": self._last_message,
                 "pool_stats": stats,
+                "network_error_count": self._consecutive_network_fails,
+                "network_error_threshold": self._circuit_break_threshold,
             }
 
     def _broadcast(self, kind: str, data):
@@ -846,6 +851,7 @@ class AutoLoopController:
                 self._state = AutoLoopState.PAUSED
                 self._last_break_reason = (
                     f"连续 {self._consecutive_network_fails} 次网络/环境错误，"
+                    f"达到阈值 {self._circuit_break_threshold}（3 × {self._concurrency} worker），"
                     f"自动暂停（号已自动 release，请检查代理后点恢复）"
                 )
                 self._last_message = self._last_break_reason

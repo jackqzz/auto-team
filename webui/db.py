@@ -2490,6 +2490,33 @@ def update_workspace_candidate_seats(workspace_master_id: int, email: str, codex
         con.commit()
 
 
+def update_workspace_candidate_seat_type(workspace_master_id: int, email: str, seat_type: str) -> None:
+    """更新候选人的席位类型并保留现有成员关系。
+
+    待接受邀请尚未有 member_id，不能使用
+    ``update_workspace_candidate_member``；该函数专门用于把邀请记录中的
+    seat_type 写回候选表，供待邀请列表展示。
+    """
+    with _lock:
+        con = _conn()
+        canonical_seat = _canonical_workspace_seat_type(seat_type)
+        codex_seat = "Codex席位" if canonical_seat == "usage_based" else ""
+        gpt_seat = "GPT席位" if canonical_seat == "default" else ""
+        con.execute(
+            "UPDATE workspace_candidates SET seat_type=?, codex_seat=?, gpt_seat=?, updated_at=? "
+            "WHERE workspace_master_id=? AND email=?",
+            (
+                canonical_seat or str(seat_type or "").strip(),
+                codex_seat,
+                gpt_seat,
+                time.time(),
+                int(workspace_master_id),
+                str(email).lower(),
+            ),
+        )
+        con.commit()
+
+
 def update_plus_check(email: str, plus_info: dict) -> None:
     """把 Plus 检查结果写入 extra_json.plus_check。"""
     email = email.lower()
@@ -2562,6 +2589,14 @@ def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[st
         conditions.append("extra_json LIKE '%\"free\"%'")
     elif filt == "plus":
         conditions.append("(extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')")
+    elif filt == "plus_active":
+        conditions.append(
+            "json_valid(extra_json) AND json_extract(extra_json, '$.plus_check.status')='plus_active'"
+        )
+    elif filt == "plus_eligible":
+        conditions.append(
+            "json_valid(extra_json) AND json_extract(extra_json, '$.plus_check.status')='plus_eligible'"
+        )
     elif filt == "banned":
         conditions.append("extra_json LIKE '%\"banned\"%'")
     elif filt == "permanently_invalid":

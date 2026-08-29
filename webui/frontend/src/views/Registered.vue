@@ -68,7 +68,7 @@ function plusOf(row) { return row.plus_check || null }
 
 async function runRollingPool(items, concurrency, worker) {
   let cursor = 0
-  const workerCount = Math.min(Math.max(1, Number(concurrency) || 1), 4, items.length)
+  const workerCount = Math.min(Math.max(1, Number(concurrency) || 1), 20, items.length)
   await Promise.all(Array.from({ length: workerCount }, async () => {
     while (cursor < items.length) {
       const index = cursor++
@@ -684,7 +684,8 @@ onActivated(() => load())
           <el-option label="无 RT" value="no_rt" />
           <el-option label="未检测" value="unchecked" />
           <el-option label="Free" value="free" />
-          <el-option label="可领Plus" value="plus" />
+          <el-option label="Plus试用生效" value="plus_active" />
+          <el-option label="可领取Plus" value="plus_eligible" />
           <el-option label="已永久失效" value="permanently_invalid" />
           <el-option label="凭证失效" value="token_invalid" />
         </el-select>
@@ -703,7 +704,7 @@ onActivated(() => load())
         >
           <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
-        <el-input-number v-model="plusCheckConcurrency" :min="1" :max="4" controls-position="right" />
+        <el-input-number v-model="plusCheckConcurrency" :min="1" :max="20" controls-position="right" />
         <span class="hint">检测并发</span>
         <el-button :loading="checking" @click="doCheck('unchecked')">检查未检测</el-button>
         <el-button :loading="checking" @click="doCheck('all')">重新检查</el-button>

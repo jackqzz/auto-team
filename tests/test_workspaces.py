@@ -144,6 +144,14 @@ class WorkspaceMasterTests(unittest.TestCase):
                 self.assertEqual(row["seat_label"], "Codex席位")
                 self.assertEqual(row["gpt_seat"], "")
 
+                # 待接受邀请没有 member_id，也应能持久化并展示邀请记录中的席位。
+                db.update_workspace_candidate_status(1, "member@example.com", "pending_invite")
+                db.update_workspace_candidate_member(1, "member@example.com", "", "prolite")
+                row = db.list_workspace_candidate_options(1)[0]
+                self.assertEqual(row["workspace_join_status"], "pending_invite")
+                self.assertEqual(row["seat_type"], "prolite")
+                self.assertEqual(row["seat_label"], "prolite")
+
 
 if __name__ == "__main__":
     unittest.main()

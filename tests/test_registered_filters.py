@@ -37,6 +37,32 @@ class RegisteredFilterTests(unittest.TestCase):
         self.assertEqual([row["email"] for row in rows], ["invalid@example.com"])
         self.assertEqual(count, 1)
 
+    def test_plus_active_and_plus_eligible_filters_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.save_registered({"email": "active-plus@example.com", "access_token": "token"})
+                db.save_registered({"email": "eligible-plus@example.com", "access_token": "token"})
+                db.save_registered({"email": "both-plus@example.com", "access_token": "token"})
+                db.save_registered({"email": "free-with-text@example.com", "access_token": "token"})
+                db.update_plus_check("active-plus@example.com", {"status": "plus_active"})
+                db.update_plus_check("eligible-plus@example.com", {"status": "plus_eligible"})
+                db.update_plus_check("both-plus@example.com", {"status": "plus_active"})
+                db.update_plus_check(
+                    "free-with-text@example.com",
+                    {"status": "free", "note": "previous plus_active marker"},
+                )
+
+                active = db.list_registered(filter_rt="plus_active")
+                eligible = db.list_registered(filter_rt="plus_eligible")
+
+        self.assertCountEqual(
+            [row["email"] for row in active],
+            ["both-plus@example.com", "active-plus@example.com"],
+        )
+        self.assertEqual([row["email"] for row in eligible], ["eligible-plus@example.com"])
+
 
 if __name__ == "__main__":
     unittest.main()

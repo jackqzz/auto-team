@@ -2211,6 +2211,7 @@ def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
     if req.seat_type not in {"default", "usage_based", "prolite"}:
         raise HTTPException(400, "席位类型只能是标准席位、Usage-based 或 ProLite")
     invite_error = ""
+    seats: dict[str, dict] = {}
     try:
         result = workspace_membership.invite_candidates(req.workspace_id, req.emails, seat_type=req.seat_type)
     except Exception as e:
@@ -2226,11 +2227,18 @@ def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
         time.sleep(_INVITE_STATUS_RECHECK_DELAY_SECONDS)
     recheck_error = ""
     try:
-        states = workspace_membership.check_candidate_membership(
+        membership_result = workspace_membership.check_candidate_membership(
             req.workspace_id,
             req.emails,
             prefer_invites=True,
+            include_seats=True,
         )
+        if isinstance(membership_result, tuple):
+            states, seats = membership_result
+        else:
+            # 兼容旧的替身/插件实现：即使只返回状态，也继续完成邀请状态写回。
+            states = membership_result
+            seats = {}
     except Exception as exc:
         recheck_error = str(exc)
         logger.exception("候选邀请后状态校验失败 workspace_db_id=%s", req.workspace_id)
@@ -2238,11 +2246,24 @@ def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
     if not recheck_error:
         for email in req.emails:
             db.update_workspace_candidate_status(req.workspace_id, email, states.get(email.lower(), "not_invited"))
+            seat_info = seats.get(email.lower()) or {}
+            raw_seat_type = str(seat_info.get("raw_seat_type") or "").strip()
+            # 邀请列表返回席位时优先使用上游真实值；部分上游版本不返回
+            # seat_type，此时批量邀请请求中的目标席位是待邀请成员的可靠回退。
+            if (
+                not raw_seat_type
+                and not invite_error
+                and states.get(email.lower()) in {"pending_invite", "pending_request"}
+            ):
+                raw_seat_type = req.seat_type
+            if raw_seat_type:
+                db.update_workspace_candidate_seat_type(req.workspace_id, email, raw_seat_type)
     final_ok = not recheck_error and not any(value == "not_invited" for value in states.values())
     return {
         "ok": final_ok,
         "result": result if not invite_error else None,
         "states": states,
+        "seats": seats,
         "invite_error": invite_error,
         "recheck_error": recheck_error,
     }

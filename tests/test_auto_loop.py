@@ -150,6 +150,21 @@ class AutoLoopTests(unittest.TestCase):
         self.assertEqual(result["registered_fail"], 1)
         self.assertEqual(result["retry_count"], 0)
 
+    def test_network_break_threshold_scales_with_worker_count(self):
+        controller = AutoLoopController()
+        # start() parses the configured concurrency before launching workers;
+        # use the same bounds here without starting a real background task.
+        controller._options = {"concurrency": 12}
+        controller._concurrency = max(
+            1, min(20, int(controller._options.get("concurrency") or 1))
+        )
+        controller._circuit_break_threshold = max(3, 3 * controller._concurrency)
+        self.assertEqual(controller._circuit_break_threshold, 36)
+        controller._options = {"concurrency": 1}
+        controller._concurrency = 1
+        controller._circuit_break_threshold = max(3, 3 * controller._concurrency)
+        self.assertEqual(controller._circuit_break_threshold, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

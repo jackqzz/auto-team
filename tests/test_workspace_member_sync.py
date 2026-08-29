@@ -17,6 +17,37 @@ except ModuleNotFoundError as exc:
 
 @unittest.skipIf(app is None, "当前测试环境未安装 fastapi")
 class WorkspaceMemberSyncApiTests(unittest.TestCase):
+    def test_invite_persists_pending_invite_seat_type(self):
+        request = app.WorkspaceCandidatesReq(
+            workspace_id=5,
+            emails=["member@example.com"],
+            seat_type="usage_based",
+        )
+        states = {"member@example.com": "pending_invite"}
+        seats = {
+            "member@example.com": {
+                "raw_seat_type": "usage_based",
+                "codex_seat": "Codex席位",
+                "gpt_seat": "",
+                "member_id": "",
+            },
+        }
+        with (
+            patch.object(app, "_reject_permanently_invalid"),
+            patch.object(app, "_reject_trashed_candidates"),
+            patch.object(app.db, "list_workspace_candidates", return_value=[{"email": "member@example.com"}]),
+            patch.object(app.workspace_membership, "invite_candidates", return_value={"ok": True}),
+            patch.object(app.workspace_membership, "check_candidate_membership", return_value=(states, seats)),
+            patch.object(app.db, "update_workspace_candidate_status") as update_status,
+            patch.object(app.db, "update_workspace_candidate_seat_type") as update_seat,
+            patch.object(app, "_INVITE_STATUS_RECHECK_DELAY_SECONDS", 0),
+        ):
+            result = app.api_invite_workspace_candidates(request)
+
+        self.assertEqual(result["states"], states)
+        update_status.assert_called_once_with(5, "member@example.com", "pending_invite")
+        update_seat.assert_called_once_with(5, "member@example.com", "usage_based")
+
     def test_seat_statistics_sync_does_not_refresh_members(self):
         seat_info = {
             "seats_in_use": 2,
@@ -179,8 +210,8 @@ class WorkspaceMembershipThrottleTests(unittest.TestCase):
         response = Mock(status_code=200, headers={})
         response.json.return_value = {
             "items": [
-                {"email": "one@example.com", "status": 2},
-                {"email": "two@example.com", "status": 2},
+                {"email": "one@example.com", "status": 2, "seat_type": "default"},
+                {"email": "two@example.com", "status": 2, "seatType": "usage_based"},
             ],
         }
         session = Mock()
@@ -195,10 +226,11 @@ class WorkspaceMembershipThrottleTests(unittest.TestCase):
             ),
             patch.object(workspace_membership, "WORKSPACE_ADMIN_REQUEST_INTERVAL_SECONDS", 0),
         ):
-            states = workspace_membership.check_candidate_membership(
+            states, seats = workspace_membership.check_candidate_membership(
                 11,
                 ["one@example.com", "two@example.com"],
                 prefer_invites=True,
+                include_seats=True,
             )
 
         self.assertEqual(
@@ -208,6 +240,10 @@ class WorkspaceMembershipThrottleTests(unittest.TestCase):
                 "two@example.com": "pending_invite",
             },
         )
+        self.assertEqual(seats["one@example.com"]["raw_seat_type"], "default")
+        self.assertEqual(seats["one@example.com"]["gpt_seat"], "GPT席位")
+        self.assertEqual(seats["two@example.com"]["raw_seat_type"], "usage_based")
+        self.assertEqual(seats["two@example.com"]["codex_seat"], "Codex席位")
         session.get.assert_called_once()
         self.assertTrue(session.get.call_args.args[0].endswith("/invites"))
 

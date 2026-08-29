@@ -393,7 +393,7 @@ def check_candidate_membership(
     prefer_invites: bool = False,
     include_seats: bool = False,
 ) -> dict[str, str] | tuple[dict[str, str], dict[str, dict[str, str]]]:
-    """通过 invites/users 确认状态；同一母号的查询严格串行并节流。"""
+    """通过 invites/users 确认状态和席位；同一母号的查询严格串行并节流。"""
     session, master = create_workspace_http_session(workspace_db_id)
     workspace_id, token = master.get("workspace_id") or "", master.get("access_token") or ""
     if not workspace_id or not token:
@@ -445,6 +445,23 @@ def check_candidate_membership(
         if not remaining:
             return
         try:
+            def invite_seat_type(value: dict) -> str:
+                # 邀请接口不同版本使用过 snake_case / camelCase；保留常见
+                # 别名，避免待接受邀请的席位信息因字段命名变化而丢失。
+                for key in (
+                    "seat_type",
+                    "seatType",
+                    "seat",
+                    "workspace_seat_type",
+                    "workspaceSeatType",
+                ):
+                    raw = value.get(key)
+                    if isinstance(raw, dict):
+                        raw = raw.get("type") or raw.get("value") or raw.get("name")
+                    if str(raw or "").strip():
+                        return str(raw).strip()
+                return ""
+
             def walk(value):
                 if isinstance(value, dict):
                     candidates = [value.get("email"), value.get("email_address"), value.get("invitee_email"), value.get("recipient_email")]
@@ -459,6 +476,11 @@ def check_candidate_membership(
                         state = "pending_invite" if str(raw_status) == "2" else ("pending_request" if str(raw_status) == "1" else "pending_invite")
                         for email in matched:
                             states[email] = state
+                            raw_seat_type = invite_seat_type(value)
+                            if raw_seat_type:
+                                # 邀请记录没有 member_id，不能套用成员快照中的
+                                # id 字段；这里只返回席位信息，供候选表持久化展示。
+                                seats[email] = _candidate_seat_snapshot({"seat_type": raw_seat_type})
                     for child in value.values():
                         walk(child)
                 elif isinstance(value, list):
@@ -539,15 +561,16 @@ def check_candidate_membership(
     return states
 
 def _candidate_seat_snapshot(item: dict) -> dict[str, str]:
-    seat = str(item.get("seat_type") or item.get("seatType") or item.get("seat") or "").lower()
+    raw_seat = str(item.get("seat_type") or item.get("seatType") or item.get("seat") or "").strip()
+    seat = _canonical_candidate_seat_type(raw_seat)
     # API 的 seat_type：default=标准席位（GPT），usage_based=Usage-based（Codex）。
-    gpt_label = "GPT席位" if seat in {"default", "standard", "standard-seat"} else ""
-    codex_label = "Codex席位" if seat in {"usage_based", "usage-based", "usagebased"} else ""
+    gpt_label = "GPT席位" if seat == "default" else ""
+    codex_label = "Codex席位" if seat == "usage_based" else ""
     return {
         "gpt_seat": gpt_label,
         "codex_seat": codex_label,
         "member_id": str(item.get("id") or item.get("account_user_id") or ""),
-        "raw_seat_type": seat,
+        "raw_seat_type": seat or raw_seat.lower(),
     }
 
 
