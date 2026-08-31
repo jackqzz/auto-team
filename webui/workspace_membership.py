@@ -710,7 +710,7 @@ def _canonical_candidate_seat_type(value: object) -> str:
         return "usage_based"
     if normalized in {"default", "standard", "standard_seat", "gpt"} or "gpt席位" in normalized or "标准席位" in normalized:
         return "default"
-    if normalized in {"prolite", "pro_lite"}:
+    if normalized in {"prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"}:
         return "prolite"
     return normalized
 
@@ -746,7 +746,7 @@ def resolve_candidate_seat_type(
     2. 本次登录/凭证结果里携带的席位字段；
     3. 远端 Team 管理接口查询；
 
-    返回 canonical seat_type：default / usage_based / ""。
+    返回 canonical seat_type：default / usage_based / prolite / ""。
     """
     email = str(email or "").strip().lower()
     if not email:
@@ -767,7 +767,7 @@ def resolve_candidate_seat_type(
         ])
     for value in sources:
         seat = _canonical_candidate_seat_type(value)
-        if seat in {"default", "usage_based"}:
+        if seat in {"default", "usage_based", "prolite"}:
             return seat
     row = db.get_workspace_candidate(workspace_db_id, email) or {}
     # 已经拿到当前空间凭证时，说明该成员已经成功进入空间；
@@ -775,16 +775,16 @@ def resolve_candidate_seat_type(
     if db.list_workspace_credentials_by_emails(workspace_db_id, [email]):
         for value in (row.get("seat_type"), row.get("gpt_seat"), row.get("codex_seat")):
             seat = _canonical_candidate_seat_type(value)
-            if seat in {"default", "usage_based"}:
+            if seat in {"default", "usage_based", "prolite"}:
                 return seat
         return ""
     refreshed = _refresh_candidate_seat_snapshot(workspace_db_id, email)
     seat = _canonical_candidate_seat_type(refreshed.get("raw_seat_type") or refreshed.get("seat_type"))
-    if seat in {"default", "usage_based"}:
+    if seat in {"default", "usage_based", "prolite"}:
         return seat
     for value in (row.get("seat_type"), row.get("gpt_seat"), row.get("codex_seat")):
         seat = _canonical_candidate_seat_type(value)
-        if seat in {"default", "usage_based"}:
+        if seat in {"default", "usage_based", "prolite"}:
             return seat
     return ""
 
@@ -1065,7 +1065,15 @@ def sync_seat_info(workspace_db_id: int) -> dict:
     if isinstance(seat_counts, dict):
         result["seats_default"] = int(seat_counts.get("default") or 0)
         result["seats_usage_based"] = int(seat_counts.get("usage_based") or 0)
-        result["seats_prolite"] = int(seat_counts.get("prolite") or 0)
+        result["seats_prolite"] = int(
+            seat_counts.get("prolite")
+            or seat_counts.get("pro_lite")
+            or seat_counts.get("advanced")
+            or seat_counts.get("advanced_seat")
+            or seat_counts.get("premium")
+            or seat_counts.get("premium_seat")
+            or 0
+        )
         logger.info("席位分类同步 workspace_db_id=%s workspace_id=%s default=%s usage_based=%s prolite=%s automation=%s", workspace_db_id, workspace_id, result["seats_default"], result["seats_usage_based"], result["seats_prolite"], seat_counts.get("automation", 0))
     if entitled is not None:
         preview = _json(_workspace_admin_request(

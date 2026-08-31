@@ -23,6 +23,12 @@ export const quotaScheduleStatus = (workspace_id) => http.get('/api/workspace-ca
 export const startAutoStandardSeatSchedule = (workspace_id) => http.post('/api/workspace-candidates/auto-standard-seat/start', { workspace_id })
 export const stopAutoStandardSeatSchedule = (workspace_id) => http.post('/api/workspace-candidates/auto-standard-seat/stop', { workspace_id })
 export const autoStandardSeatScheduleStatus = (workspace_id) => http.get('/api/workspace-candidates/auto-standard-seat', { params: { workspace_id } })
+export const startAutoProliteSeatSchedule = (workspace_id) => http.post('/api/workspace-candidates/auto-prolite-seat/start', { workspace_id })
+export const stopAutoProliteSeatSchedule = (workspace_id) => http.post('/api/workspace-candidates/auto-prolite-seat/stop', { workspace_id })
+export const autoProliteSeatScheduleStatus = (workspace_id) => http.get('/api/workspace-candidates/auto-prolite-seat', { params: { workspace_id } })
+export const startAutoAdvancedSeatSchedule = startAutoProliteSeatSchedule
+export const stopAutoAdvancedSeatSchedule = stopAutoProliteSeatSchedule
+export const autoAdvancedSeatScheduleStatus = autoProliteSeatScheduleStatus
 export const listWorkspaceTaskLogs = (workspace_id, limit = 120) => http.get('/api/workspace-candidates/task-logs', { params: { workspace_id, limit } })
 export const saveCandidateSettings = (payload) => http.post('/api/workspace-candidates/settings', payload)
 export const fetchWorkspaceCredentials = (workspace_id, emails, proxy_pool, seat_type = 'default', auto_push = false, params = {}) => http.post('/api/workspace-candidates/credentials', { workspace_id, emails, proxy_pool, seat_type, auto_push, ...params })

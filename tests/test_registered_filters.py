@@ -37,6 +37,40 @@ class RegisteredFilterTests(unittest.TestCase):
         self.assertEqual([row["email"] for row in rows], ["invalid@example.com"])
         self.assertEqual(count, 1)
 
+    def test_permanently_invalid_filter_includes_plus_check_banned_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.save_registered({"email": "banned@example.com", "access_token": "banned-token"})
+                db.update_plus_check("banned@example.com", {"status": "banned", "label": "封号"})
+
+                rows = db.list_registered(filter_rt="permanently_invalid")
+
+                self.assertEqual([row["email"] for row in rows], ["banned@example.com"])
+                self.assertEqual(rows[0]["account_status"], "permanently_invalid")
+                self.assertEqual(rows[0]["at_len"], 0)
+                self.assertEqual(db.count_registered(filter_rt="permanently_invalid"), 1)
+
+    def test_init_db_migrates_legacy_banned_plus_check_to_permanently_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.save_registered({"email": "legacy-banned@example.com", "access_token": "token"})
+                con = db._conn()
+                con.execute(
+                    "UPDATE registered SET extra_json=? WHERE email=?",
+                    ('{"plus_check":{"status":"banned","label":"封号"}}', "legacy-banned@example.com"),
+                )
+                con.commit()
+                con.close()
+
+                db.init_db()
+
+                row = db.get_registered("legacy-banned@example.com")
+                self.assertEqual(row["account_status"], "permanently_invalid")
+
     def test_plus_active_and_plus_eligible_filters_are_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "test.db"

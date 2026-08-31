@@ -3,7 +3,7 @@
 设计：
   - 主控线程 manage_loop：监听 stop/pause、根据 concurrency 启停 worker
   - 多个 worker 线程：claim_next() → 注册 → 完成 → 继续
-  - 代理池：基于近期历史租借计数（LRU 式）挑选使用次数最少的代理
+  - 代理池：基于本次任务快照挑选使用次数最少的代理；全局历史另行统计
   - 状态机：stopped → running → paused → running / stopped
   - 优雅暂停/停止：当前 worker 跑完才退出，不强杀
   - 复用 registrar.start_registration：每个号开一个 run，由 worker 等其结束
@@ -250,22 +250,14 @@ class AutoLoopController:
             self._circuit_break_threshold = max(3, 3 * self._concurrency)
             pool_text = self._options.get("proxy_pool") or ""
             self._proxy_pool = _parse_proxy_pool(pool_text)
-            # 基于近期历史的租借计数（LRU 式），而非从零开始的快照。
-            # 默认统计最近 3 小时内的租借记录。
-            self._proxy_history_window = float(
-                self._options.get("proxy_history_window") or 10800
-            )
             if self._proxy_pool:
-                since = time.time() - self._proxy_history_window
-                historical = db.proxy_lease_counts_since(
-                    self._proxy_pool, since,
-                )
-                self._proxy_usage = [
-                    historical.get(p, 0) for p in self._proxy_pool
-                ]
+                # 任务内代理计数必须是本次任务的快照，从 0 开始；不能把
+                # 全局历史计数混进来。否则某条代理历史上少用几十次时，
+                # 并发任务会连续把它选中几十次，出现“所有 worker 都用同一条”。
+                # 全局累计次数仍由 proxy_usage.record_lease() 独立记录。
+                self._proxy_usage = [0 for _ in self._proxy_pool]
                 logger.info(
-                    "[auto-loop] 代理池已加载历史计数 (window=%.0fs): %s",
-                    self._proxy_history_window,
+                    "[auto-loop] 代理任务快照已初始化（本次从零计数）: %s",
                     list(zip(self._proxy_pool, self._proxy_usage)),
                 )
             else:
@@ -555,8 +547,8 @@ class AutoLoopController:
     ) -> str:
         """为新任务领取当前租取次数最少的代理。
 
-        初始计数基于近期历史（LRU 式），选择和计数递增在同一把锁内完成，
-        避免并发 worker 同时拿到同一个最小计数。
+        初始计数来自本次任务快照，选择和计数递增在同一把锁内完成，避免并发
+        worker 同时拿到同一个最小计数。全局历史次数不参与本次任务调度。
         """
         leased_from_pool = False
         should_record = False
@@ -1324,6 +1316,29 @@ def login_controller_for(
 def all_login_controllers() -> list[AutoLoopController]:
     with _LOGIN_CONTROLLERS_LOCK:
         return list(_LOGIN_CONTROLLERS.values())
+
+
+def stop_login_controllers_for_workspace(workspace_db_id) -> int:
+    """Request stop for every login queue belonging to a deleted workspace."""
+    prefix = f"workspace:{workspace_db_id}:"
+    with _LOGIN_CONTROLLERS_LOCK:
+        controllers = [
+            controller
+            for key, controller in _LOGIN_CONTROLLERS.items()
+            if str(key).startswith(prefix)
+        ]
+    stopped = 0
+    for controller in controllers:
+        try:
+            result = controller.stop()
+            if result.get("ok"):
+                stopped += 1
+        except Exception:
+            logger.exception(
+                "停止已删除 Workspace 的登录任务失败 workspace_db_id=%s",
+                workspace_db_id,
+            )
+    return stopped
 
 
 # 兼容普通个人登录入口；空间登录通过 login_controller_for() 选择对应队列。

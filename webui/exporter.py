@@ -25,6 +25,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,63 @@ MAX_ATTEMPTS = 3
 RETRY_DELAYS_S = [3.0, 7.0]
 
 # ──────────────────────── 工具函数 ────────────────────────
+
+
+def normalize_proxy_url(proxy: str) -> str:
+    """Normalize a proxy URL before handing it to curl-cffi.
+
+    The rest of the application uses ``socks5h`` for SOCKS proxies so DNS is
+    resolved by the proxy endpoint.  OAuth refresh used to bypass that shared
+    session setup and send the raw ``socks5://`` value directly.  Keep the
+    conversion local to this module as the refresh request is intentionally a
+    one-shot curl-cffi call (there is no reusable HTTP session here).
+    """
+    value = str(proxy or "").strip()
+    if value.lower().startswith("socks5://"):
+        return "socks5h://" + value[len("socks5://") :]
+    return value
+
+
+def _proxy_log_label(proxy: str) -> str:
+    """Return a safe proxy label for logs (never include user/password)."""
+    value = str(proxy or "").strip()
+    if not value:
+        return "direct"
+    try:
+        parsed = urlsplit(value if "://" in value else f"http://{value}")
+        scheme = parsed.scheme.lower() or "http"
+        host = parsed.hostname or "?"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{scheme}://{host}{port}"
+    except Exception:
+        # A malformed proxy will be rejected by curl-cffi; do not echo any
+        # credentials while reporting it.
+        return "configured"
+
+
+def _proxy_from_config(cfg: dict | None) -> str:
+    """Read a refresh proxy from an export config.
+
+    Task callers normally provide the already-leased ``proxy`` value.  Accept
+    ``proxy_pool`` as a compatibility fallback so a direct exporter call does
+    not silently discard a configured pool and make the OAuth request direct.
+    The pool is intentionally not balanced here; lease selection belongs to
+    the caller that owns the task snapshot.
+    """
+    config = cfg if isinstance(cfg, dict) else {}
+    direct = str(config.get("proxy") or "").strip()
+    if direct:
+        return direct
+    raw_pool = config.get("proxy_pool")
+    if isinstance(raw_pool, str):
+        values = [line.strip() for line in raw_pool.replace(",", "\n").splitlines() if line.strip()]
+    elif isinstance(raw_pool, (list, tuple, set)):
+        values = [str(item or "").strip() for item in raw_pool if str(item or "").strip()]
+    else:
+        values = []
+    return values[0] if values else ""
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -185,13 +243,21 @@ def refresh_codex_token(
         "Referer": "https://auth.openai.com/",
     }
 
-    proxy_text = str(proxy or "").strip()
-    proxies = {"http": proxy_text, "https": proxy_text} if proxy_text else None
+    # Use curl-cffi's explicit ``proxy`` argument rather than relying on a
+    # per-scheme ``proxies`` mapping.  The latter is valid for normal requests,
+    # but it made this one-shot OAuth call easy to accidentally run direct
+    # when the endpoint/proxy scheme differed.  Normalising SOCKS5 to SOCKS5H
+    # also keeps DNS resolution on the proxy, matching create_http_session().
+    proxy_text = normalize_proxy_url(proxy)
+    if proxy_text:
+        logger.info("OAuth token 刷新使用代理: %s", _proxy_log_label(proxy_text))
+    else:
+        logger.warning("OAuth token 刷新未配置代理，使用直连")
     resp = cffi.post(
         OPENAI_TOKEN_ENDPOINT,
         headers=headers,
         data=body,
-        proxies=proxies,
+        proxy=proxy_text or None,
         verify=False,
         timeout=timeout,
         impersonate="chrome110",
@@ -306,7 +372,8 @@ def build_cpa_token_json(cred: dict) -> dict:
     """生成 CPA `/v0/management/auth-files` 的 multipart 文件内容。
 
     严格对齐 any-auto-register/cpa_upload.py:generate_token_json：
-    8 个字段，UTC+8 时区。
+    保留原有 token 字段，并附带本地登录所需的 password / totp_secret。
+    CPA 会忽略未知字段；保留在文件中可供公开重登页继续使用。
     """
     access_token = str(cred.get("access_token") or "").strip()
     if not access_token:
@@ -314,13 +381,61 @@ def build_cpa_token_json(cred: dict) -> dict:
     refresh_token = str(cred.get("refresh_token") or "").strip()
     id_token = str(cred.get("id_token") or "").strip()
     email = str(cred.get("email") or "").strip()
+    nested_credentials = cred.get("credentials")
+    if isinstance(nested_credentials, str):
+        try:
+            nested_credentials = json.loads(nested_credentials) if nested_credentials.strip() else {}
+        except Exception:
+            nested_credentials = {}
+    if not isinstance(nested_credentials, dict):
+        nested_credentials = {}
+    notes = cred.get("notes") or {}
+    if isinstance(notes, str):
+        try:
+            notes = json.loads(notes) if notes.strip() else {}
+        except Exception:
+            notes = {}
+    if not isinstance(notes, dict):
+        notes = {}
+    gpt_notes = notes.get("gpt") or {}
+    two_factor_notes = notes.get("two_factor") or notes.get("twoFactor") or {}
+    if not isinstance(gpt_notes, dict):
+        gpt_notes = {}
+    if not isinstance(two_factor_notes, dict):
+        two_factor_notes = {}
+    password = str(
+        cred.get("password")
+        or nested_credentials.get("password")
+        or nested_credentials.get("passwd")
+        or gpt_notes.get("password")
+        or ""
+    ).strip()
+    totp_secret = str(
+        cred.get("totp_secret")
+        or nested_credentials.get("totp_secret")
+        or nested_credentials.get("totpSecret")
+        or nested_credentials.get("two_factor_secret")
+        or two_factor_notes.get("secret")
+        or ""
+    ).strip()
 
     if not id_token:
         id_token = _build_compat_id_token(access_token=access_token, email=email)
 
     payload = _decode_jwt_payload(access_token)
     auth_info = _get_auth(payload)
-    account_id = str(auth_info.get("chatgpt_account_id") or "").strip()
+    # ``account_id`` is also the only workspace hint carried by the CPA
+    # document.  Preserve an explicit row value for legacy/token-light
+    # records so an encrypted CPA export can be imported and keyed again.
+    account_id = str(
+        auth_info.get("chatgpt_account_id")
+        or auth_info.get("account_id")
+        or cred.get("workspace_id")
+        or cred.get("workspaceId")
+        or cred.get("chatgpt_account_id")
+        or cred.get("account_id")
+        or ""
+    ).strip()
 
     tz_cn = timezone(timedelta(hours=8))
     expired_str = ""
@@ -338,6 +453,8 @@ def build_cpa_token_json(cred: dict) -> dict:
         "access_token": access_token,
         "last_refresh": last_refresh,
         "refresh_token": refresh_token,
+        "password": password,
+        "totp_secret": totp_secret,
     }
 
 
@@ -626,7 +743,7 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     if refresh_oauth and rt:
         try:
             refresh_timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
-            proxy_text = str(cfg.get("proxy") or "").strip()
+            proxy_text = _proxy_from_config(cfg)
             log("[SUB2API] 用 refresh_token 换新的 Codex access_token...", "info")
             # Sub2/CLIProxy uses the official Codex OAuth client for RT
             # rotation. Do not fall back to the stale access token when this
@@ -871,7 +988,7 @@ def run_exports(cred: dict, *,
         fresh = refresh_codex_token(
             cred.get("refresh_token", ""),
             timeout=int(refresh_timeout),
-            proxy=str(refresh_cfg.get("proxy") or ""),
+            proxy=_proxy_from_config(refresh_cfg),
             client_id=CODEX_CLIENT_ID,
         )
         cred = {

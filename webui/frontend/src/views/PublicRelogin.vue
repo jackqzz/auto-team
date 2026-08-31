@@ -16,6 +16,12 @@ import {
   testCpaConnection,
   testSub2ApiConnection,
 } from '@/utils/publicPoolPush'
+import {
+  credentialForExport,
+  decryptAccountCredentials,
+  isEncryptedCredential,
+  PLAIN_CREDENTIAL_MODE_STORAGE_KEY,
+} from '@/utils/credentialCrypto'
 
 const fileInput = ref(null)
 const proxyStore = useProxyStore()
@@ -27,13 +33,9 @@ const accounts = ref([])
 const lastResults = ref({})
 const checkProgress = ref({ done: 0, total: 0 })
 const reloginProgress = ref({ done: 0, total: 0 })
-const import2faVisible = ref(false)
-const import2faText = ref('')
-const import2faErrors = ref([])
-const ACCESS_KEY_CACHE = 'gpt_auto_register_public_relogin_access_key'
 const INSPECTION_SETTINGS_CACHE = 'gpt_auto_register_public_relogin_inspection'
 const POOL_PUSH_CONFIG_CACHE = 'gpt_auto_register_public_relogin_pool_push'
-const accessKey = ref('')
+const SUB2_REFRESH_OAUTH_CACHE = 'gpt_auto_register_public_relogin_sub2_refresh_oauth'
 const inspectionBatchSize = ref(8)
 const inspectionIntervalMinutes = ref(5)
 const inspectionRunning = ref(false)
@@ -46,6 +48,13 @@ const poolPushDrawerVisible = ref(false)
 const testingPoolTarget = ref('')
 const manualPoolPushing = ref(false)
 const downloading = ref(false)
+// Sub2 导出前是否调用公开后端的 RT→Codex AT/ID 刷新接口；默认关闭，避免
+// 每次下载都旋转 RT。选择会保存在当前浏览器，历史混合凭证需要修复时再开启。
+const sub2RefreshOauth = ref(false)
+// CPA / Sub2 的 password 与 2FA 必须始终使用同一种导出模式。默认关闭，
+// 即导出受保护字段；勾选后按明文导入/导出，用于兼容旧文件。
+const plainCredentialMode = ref(false)
+const encryptCredentials = computed(() => !plainCredentialMode.value)
 const aliveOnly = ref(false)
 const poolPushResults = ref({})
 const poolPushStats = reactive({ queued: 0, running: 0, success: 0, failed: 0, lastMessage: '' })
@@ -110,81 +119,11 @@ const poolPushConfigIssue = computed(() => {
 
 const openFile = () => fileInput.value?.click()
 
-const import2faLineCount = computed(
-  () => import2faText.value.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).length,
-)
-
-function doImport2FA() {
-  const text = import2faText.value.trim()
-  if (!text) return ElMessage.warning('请输入要导入的账号')
-  import2faErrors.value = []
-  const lines = text.split('\n')
-  const prepared = []
-  const errors = []
-  for (let idx = 0; idx < lines.length; idx++) {
-    const line = lines[idx].trim()
-    if (!line || line.startsWith('#')) continue
-    const parts = line.split('----')
-    if (parts.length < 2 || parts.length > 3) {
-      errors.push({ line: idx + 1, error: `需要 2~3 段（邮箱----密码 或 邮箱----密码----2FA），实际 ${parts.length} 段` })
-      continue
-    }
-    const email = parts[0].trim().toLowerCase()
-    const password = parts[1].trim()
-    const secret = parts.length === 3 ? parts[2].trim() : ''
-    if (!email || !email.includes('@')) {
-      errors.push({ line: idx + 1, error: '邮箱格式不对' })
-      continue
-    }
-    if (!password) {
-      errors.push({ line: idx + 1, error: '密码不能为空' })
-      continue
-    }
-    prepared.push({ email, password, totp_secret: secret })
-  }
-  if (errors.length) {
-    import2faErrors.value = errors
-    ElMessage.error(`有 ${errors.length} 行不合法，请修正后重试`)
-    return
-  }
-  if (!prepared.length) {
-    ElMessage.warning('没有有效行可导入')
-    return
-  }
-  // 将解析结果合并到 accounts 列表（和 JSON 导入一样，纯前端，不写库）
-  const newAccounts = prepared.map((item, idx) => normalizeAccount({
-    email: item.email,
-    password: item.password,
-    totp_secret: item.totp_secret,
-  }, `2fa-${accounts.value.length + idx}`))
-  accounts.value = [...accounts.value, ...newAccounts]
-  lastResults.value = {}
-  ElMessage.success(`已导入 ${prepared.length} 个 2FA 账号`)
-  import2faText.value = ''
-  import2faVisible.value = false
-}
-
 async function loadQueueStatus() {
   try {
     const result = await getPublicReloginQueueStatus()
     queueStatus.value = result.queues || { quota: null, relogin: null }
   } catch (_) { /* 页面未启用或服务重启时保留上一次状态 */ }
-}
-
-function handleAuthError(e) {
-  if (e?.status === 403 && String(e.message || '').includes('访问密钥')) {
-    accessKey.value = ''
-    localStorage.removeItem(ACCESS_KEY_CACHE)
-  }
-}
-
-function requireAccessKey() {
-  const key = accessKey.value.trim()
-  if (!key) {
-    ElMessage.warning('请先输入公开重登访问密钥')
-    return ''
-  }
-  return key
 }
 
 function poolTargetConfig(target) {
@@ -378,7 +317,13 @@ const normalizeAccount = (item, idx) => {
   const credentials = asObject(raw.credentials)
   const data = asObject(raw.data)
   const extra = asObject(raw.extra)
-  const sources = [credentials, data, raw, extra]
+  // Older Sub2/CPA exports keep the login fields in notes.gpt and
+  // notes.two_factor instead of directly under credentials. Include those
+  // variants so CPA re-exports retain the values as well.
+  const notes = asObject(raw.notes)
+  const gptNotes = asObject(notes.gpt)
+  const twoFactorNotes = asObject(notes.two_factor || notes.twoFactor)
+  const sources = [credentials, data, raw, extra, gptNotes, twoFactorNotes]
   const first = (...keys) => {
     for (const source of sources) {
       for (const key of keys) {
@@ -400,14 +345,19 @@ const normalizeAccount = (item, idx) => {
   const idToken = String(first('id_token', 'idToken')).trim()
   const idTokenAuth = decodeJwtPayload(idToken)?.['https://api.openai.com/auth'] || {}
   const password = String(first('password', 'passwd')).trim()
-  const totpSecret = String(first('totp_secret', 'totpSecret', 'two_factor_secret', 'twoFactorSecret', '2fa')).trim()
+  const totpSecret = String(
+    first('totp_secret', 'totpSecret', 'two_factor_secret', 'twoFactorSecret', '2fa')
+      || twoFactorNotes.secret
+      || '',
+  ).trim()
   const workspaceId = String(
-    first('chatgpt_account_id', 'chatgptAccountId', 'workspace_id', 'workspaceId')
+    first('workspace_id', 'workspaceId', 'workspace-id')
+      || first('account_id', 'accountId')
+      || first('chatgpt_account_id', 'chatgptAccountId')
       || tokenAuth.chatgpt_account_id
       || tokenAuth.account_id
       || idTokenAuth.chatgpt_account_id
       || idTokenAuth.account_id
-      || first('account_id', 'accountId')
       || '',
   ).trim()
   const userId = String(
@@ -460,7 +410,7 @@ const normalizeAccount = (item, idx) => {
   }
 }
 
-const parsePayload = (payload) => {
+const extractPayloadRows = (payload) => {
   const root = asObject(payload)
   const nestedData = asObject(root.data)
   let rows = []
@@ -472,7 +422,78 @@ const parsePayload = (payload) => {
   else if (nestedData.credentials || nestedData.access_token || nestedData.accessToken || nestedData.refresh_token || nestedData.refreshToken) rows = [nestedData]
   else if (root.credentials || root.access_token || root.accessToken || root.refresh_token || root.refreshToken || root.type === 'codex') rows = [root]
   if (!rows.length) throw new Error('不支持的导入格式，未找到账号列表（accounts / items / data）')
-  return rows.map((a, idx) => normalizeAccount(a, idx))
+  return rows
+}
+
+const parsePayload = (payload) => extractPayloadRows(payload).map((a, idx) => normalizeAccount(a, idx))
+
+const accountImportLabel = (row, index) => {
+  const raw = asObject(row)
+  const credentials = asObject(raw.credentials)
+  const candidate = String(credentials.email || raw.email || raw.name || `第 ${index + 1} 个账号`).trim()
+  // Legacy Sub2 names can be ``email----pickup----password``; never echo the
+  // remainder into an error toast when that row fails decryption.
+  return candidate.split('----', 1)[0].trim() || `第 ${index + 1} 个账号`
+}
+
+// Keep implementation details out of the public page.  Users only need to
+// know that the selected import/export mode does not match the file (or that
+// its protected value is invalid), not which keying/encoding scheme is used.
+const publicCredentialError = (error) => {
+  const message = String(error?.message || '')
+  if (/workspace\s*id|加密凭证|解密|base64/i.test(message)) {
+    return '凭证无法读取，请确认导入/导出开关与文件格式一致'
+  }
+  return message || '账号凭证无法读取'
+}
+
+// Detect the encrypted credential marker without assuming a particular Sub2
+// nesting shape (credentials/data/notes or a JSON-encoded nested object).
+// This lets plaintext files coexist with files produced by Workspace's
+// encrypted Sub2 export.
+const hasEncryptedCredentialFields = (value, seen = new Set()) => {
+  if (typeof value === 'string') {
+    if (isEncryptedCredential(value)) return true
+    const parsed = asObject(value)
+    if (parsed !== value && Object.keys(parsed).length) return hasEncryptedCredentialFields(parsed, seen)
+    return false
+  }
+  if (!value || typeof value !== 'object') return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) return value.some((item) => hasEncryptedCredentialFields(item, seen))
+  return Object.values(value).some((item) => hasEncryptedCredentialFields(item, seen))
+}
+
+/**
+ * Decrypt workspace hand-off credentials in the browser before normalizing
+ * them.  A bad/missing workspace key only rejects that row; other accounts in
+ * the same file remain importable and the caller reports the skipped rows.
+ */
+const parsePayloadWithDecryption = async (payload, plainMode = false) => {
+  const rows = extractPayloadRows(payload)
+  const imported = []
+  const skipped = []
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]
+    try {
+      // Plaintext rows are returned unchanged by decryptAccountCredentials.
+      // In plain mode the caller explicitly asked for an unencrypted import;
+      // leave encrypted rows out instead of feeding ciphertext into login.
+      const encrypted = hasEncryptedCredentialFields(row)
+      if (encrypted && plainMode) {
+        throw new Error('当前按明文模式导入，请取消勾选后重新导入')
+      }
+      const decrypted = encrypted ? await decryptAccountCredentials(row) : row
+      imported.push(normalizeAccount(decrypted, index))
+    } catch (error) {
+      skipped.push({
+        label: accountImportLabel(row, index),
+        error: publicCredentialError(error),
+      })
+    }
+  }
+  return { accounts: imported, skipped }
 }
 
 const handleFile = async (event) => {
@@ -483,9 +504,27 @@ const handleFile = async (event) => {
   try {
     rawText.value = await file.text()
     const payload = JSON.parse(rawText.value)
-    accounts.value = parsePayload(payload)
+    const parsed = await parsePayloadWithDecryption(payload, plainCredentialMode.value)
+    accounts.value = parsed.accounts
     lastResults.value = {}
     stopInspection(false)
+    if (parsed.skipped.length) {
+      const details = parsed.skipped
+        .slice(0, 3)
+        .map((item) => `${item.label}：${item.error}`)
+        .join('；')
+      const suffix = parsed.skipped.length > 3 ? '；其余账号略' : ''
+      const message = `已跳过 ${parsed.skipped.length} 个无法导入的账号${details ? `（${details}${suffix}）` : ''}`
+      if (!accounts.value.length) {
+        ElMessage.error(`${message}，没有账号成功导入`)
+        return
+      }
+      ElMessage.warning(`${message}；成功导入 ${accounts.value.length} 个`)
+    }
+    if (!accounts.value.length) {
+      ElMessage.warning('文件中没有可导入的账号')
+      return
+    }
     const missingTokenCount = accounts.value.filter((item) => !item.access_token).length
     if (missingTokenCount) {
       ElMessage.warning(`已导入 ${accounts.value.length} 个账号，其中 ${missingTokenCount} 个缺少 access_token，无法查询额度`)
@@ -533,8 +572,6 @@ const applyCheckResult = (item, result, checkedAt = Date.now()) => {
 const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => {
   if (!items.length) return false
   if (checking.value || relogining.value) return false
-  const key = requireAccessKey()
-  if (!key) return false
   checking.value = true
   checkProgress.value = { done: 0, total: items.length }
   const ids = new Set(items.map((item) => item.id))
@@ -569,7 +606,6 @@ const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => 
       try {
         const response = await checkPublicRelogin({
           accounts: [plainItem],
-          access_key: key,
           concurrency: 0,
           proxy_pool: proxyStore.text,
           auto_relogin_on_401: autoReloginOn401,
@@ -586,7 +622,6 @@ const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => 
         processResult(original, result, response.queues)
         return { original, result, queues: response.queues }
       } catch (error) {
-        handleAuthError(error)
         const result = {
           ok: false,
           status: error.status === 401 ? '401' : error.status === 429 ? 'queue_full' : 'error',
@@ -614,7 +649,6 @@ const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => 
     if (notify) ElMessage.success(`额度检查完成，共 ${items.length} 个`)
     return true
   } catch (e) {
-    handleAuthError(e)
     if (e.status === 429) {
       for (const item of items) {
         updateOne(item.id, {
@@ -684,10 +718,6 @@ async function runInspectionBatch() {
     .slice(0, size)
     .map(({ item }) => item)
   const completed = await checkAccounts(batch, false, true)
-  if (!accessKey.value.trim()) {
-    stopInspection(false)
-    return
-  }
   if (completed) {
     inspectionRound.value += 1
     inspectionLastBatch.value = batch.length
@@ -699,7 +729,6 @@ async function runInspectionBatch() {
 
 function startInspection() {
   if (!checkableAccounts.value.length) return ElMessage.warning('没有可巡检的账号（停用账号已过滤）')
-  if (!requireAccessKey()) return
   inspectionRunning.value = true
   inspectionRound.value = 0
   inspectionLastBatch.value = 0
@@ -724,8 +753,6 @@ const doRelogin = async (onlyRevived = true) => {
     && (item.status === '401' || !onlyRevived)
   ))
   if (!list.length) return ElMessage.warning('没有可重新登录的账号')
-  const key = requireAccessKey()
-  if (!key) return
   relogining.value = true
   reloginProgress.value = { done: 0, total: list.length }
   const targetIds = new Set(list.map((item) => item.id))
@@ -769,7 +796,6 @@ const doRelogin = async (onlyRevived = true) => {
       try {
         const res = await runPublicRelogin({
           accounts: [plainItem],
-          access_key: key,
           concurrency: 0,
           proxy_pool: proxyStore.text,
         })
@@ -785,7 +811,6 @@ const doRelogin = async (onlyRevived = true) => {
         applyReloginResult(original, result)
         if (res.queues) queueStatus.value = res.queues
       } catch (e) {
-        handleAuthError(e)
         const result = {
           ok: false,
           status: e.status === 401 ? '401' : e.status === 429 ? 'queue_full' : 'failed',
@@ -807,15 +832,44 @@ const doRelogin = async (onlyRevived = true) => {
   }
 }
 
-const buildSub2Export = (rows) => {
-  const accountsOut = rows.map((item) => {
-    const workspaceId = item.workspace_id || ''
+const exportWorkspaceIdFor = (item, tokenPayload = null) => {
+  const payload = tokenPayload || decodeJwtPayload(item?.access_token || '')
+  const auth = payload?.['https://api.openai.com/auth'] || {}
+  return String(
+    item?.workspace_id
+    || item?.workspaceId
+    || item?.account_id
+    || item?.accountId
+    || item?.chatgpt_account_id
+    || item?.chatgptAccountId
+    || auth.chatgpt_account_id
+    || auth.account_id
+    || '',
+  ).trim()
+}
+
+const buildSub2Export = async (rows, encryptCredentials = true) => {
+  const accountsOut = await Promise.all(rows.map(async (item) => {
     const expiresAt = item.expires_at || 0
     const expiresIn = Math.max(0, Math.floor(expiresAt - Date.now() / 1000))
     const tokenPayload = decodeJwtPayload(item.access_token || '')
     const tokenAuth = tokenPayload?.['https://api.openai.com/auth'] || {}
     const tokenProfile = tokenPayload?.['https://api.openai.com/profile'] || {}
-    const accountId = tokenAuth.chatgpt_account_id || tokenAuth.account_id || workspaceId
+    const credentialWorkspaceId = exportWorkspaceIdFor(item, tokenPayload)
+    const accountId = tokenAuth.chatgpt_account_id || tokenAuth.account_id || credentialWorkspaceId
+    if (encryptCredentials && !credentialWorkspaceId && (item.password || item.totp_secret)) {
+      throw new Error(`${item.email || '复活账号'} 缺少 workspace ID，无法安全加密密码和 2FA`)
+    }
+    const exportedPassword = await credentialForExport(
+      item.password || '',
+      credentialWorkspaceId,
+      encryptCredentials,
+    )
+    const exportedTotpSecret = await credentialForExport(
+      item.totp_secret || '',
+      credentialWorkspaceId,
+      encryptCredentials,
+    )
     const userId = item.chatgpt_user_id || tokenAuth.chatgpt_user_id || tokenAuth.user_id || tokenPayload.sub || ''
     const planType = item.plan_type || tokenAuth.chatgpt_plan_type || 'free'
     const exportedAt = new Date().toISOString()
@@ -826,7 +880,7 @@ const buildSub2Export = (rows) => {
       plan: planType,
       email: item.email || tokenProfile.email || '',
       user_id: userId,
-    client_id: tokenPayload.client_id || item.client_id || '',
+      client_id: tokenPayload.client_id || item.client_id || '',
       account_id: accountId,
       plan_source: 'oauth_access_token_claim',
       verified_at: exportedAt,
@@ -864,15 +918,15 @@ const buildSub2Export = (rows) => {
         disabled: false,
         access_token: item.access_token || '',
         email: item.email || '',
-        password: item.password || '',
-        totp_secret: item.totp_secret || '',
+        password: exportedPassword,
+        totp_secret: exportedTotpSecret,
         id_token: item.id_token || '',
         client_id: tokenPayload.client_id || item.client_id || '',
         plan_type: planType,
         account_id: accountId,
         email_source: 'oauth_userinfo_email',
         last_refresh: exportedAt,
-        workspace_id: accountId,
+        workspace_id: credentialWorkspaceId,
         live_identity: liveIdentity,
         outlook_email: item.email || '',
         refresh_token: item.refresh_token || '',
@@ -891,7 +945,7 @@ const buildSub2Export = (rows) => {
       auto_pause_on_expired: true,
       expires_at: expiresAt,
     }
-  })
+  }))
   return {
     type: 'sub2api-data',
     version: 1,
@@ -975,11 +1029,16 @@ function makeZip(entries) {
   return new Blob([concatBytes([...local, centralBytes, end])], { type: 'application/zip' })
 }
 
-async function buildCpaExport(rows) {
+async function buildCpaExport(rows, encryptCredentials = true) {
   const entries = []
   const filenameCounts = new Map()
   for (let index = 0; index < rows.length; index++) {
-    const item = await buildCpaTokenJson(rows[index])
+    const row = rows[index]
+    const workspaceId = exportWorkspaceIdFor(row)
+    const item = await buildCpaTokenJson(row, {
+      workspaceId,
+      encryptCredentials,
+    })
     const data = { ...item, disabled: false }
     const baseName = String(data.email || rows[index].email || `account-${index + 1}`).replace(/[\\/:*?"<>|]/g, '_') || `account-${index + 1}`
     const occurrence = (filenameCounts.get(baseName) || 0) + 1
@@ -997,8 +1056,6 @@ function buildPassword2faExport(rows) {
 }
 
 async function refreshRowsForExport(rows) {
-  const key = requireAccessKey()
-  if (!key) throw new Error('缺少公开重登访问密钥')
   const refreshed = new Array(rows.length)
   const errors = []
   let cursor = 0
@@ -1013,8 +1070,10 @@ async function refreshRowsForExport(rows) {
         const plain = JSON.parse(JSON.stringify(original))
         const response = await refreshPublicReloginExport({
           account: plain,
-          access_key: key,
           proxy: proxies.length ? proxies[index % proxies.length] : '',
+          // Keep the complete browser-side pool in the request as a fallback
+          // for older/server-side deployments that need to lease a proxy.
+          proxy_pool: proxyStore.text,
         })
         const normalized = normalizeAccount(response.account || {}, index)
         refreshed[index] = {
@@ -1038,6 +1097,46 @@ async function refreshRowsForExport(rows) {
   return refreshed
 }
 
+function base64UrlBytes(bytes) {
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+async function oidcAtHash(accessToken) {
+  if (!globalThis.crypto?.subtle) throw new Error('当前浏览器不支持 Web Crypto，无法校验 Sub2 凭证')
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(accessToken || '')))
+  return base64UrlBytes(new Uint8Array(digest).slice(0, 16))
+}
+
+async function validateExistingSub2Rows(rows) {
+  const errors = []
+  for (const item of rows) {
+    const email = item.email || '未知账号'
+    const accessToken = String(item.access_token || '').trim()
+    const idToken = String(item.id_token || '').trim()
+    if (!accessToken || !idToken) {
+      errors.push(`${email}：缺少 access_token 或 id_token`)
+      continue
+    }
+    const idPayload = decodeJwtPayload(idToken)
+    const claimedHash = String(idPayload.at_hash || '').trim()
+    if (claimedHash && claimedHash !== await oidcAtHash(accessToken)) {
+      errors.push(`${email}：id_token 与 access_token 不匹配`)
+      continue
+    }
+    const accessClient = String(decodeJwtPayload(accessToken).client_id || '').trim()
+    const audience = Array.isArray(idPayload.aud) ? idPayload.aud : [idPayload.aud]
+    const audiences = audience.map((value) => String(value || '').trim()).filter(Boolean)
+    if (accessClient && audiences.length && !audiences.includes(accessClient)) {
+      errors.push(`${email}：client_id 与 id_token.aud 不匹配`)
+    }
+  }
+  if (errors.length) {
+    throw new Error(`现有 Sub2 凭证校验失败：${errors.slice(0, 3).join('；')}${errors.length > 3 ? '；其余账号略' : ''}。请开启“导出前用 RT 刷新 OAuth”修复。`)
+  }
+}
+
 const download = async (format = 'sub2api', mode = 'all') => {
   const filtered = aliveAccounts.value
   const rows = mode === 'revived' ? filtered.filter((item) => item.status === 'revived') : filtered
@@ -1050,27 +1149,29 @@ const download = async (format = 'sub2api', mode = 'all') => {
       downloadBlob(result.blob, result.filename)
       ElMessage.success(`账号----密码----2FA 导出完成，共 ${rows.length} 个`)
     } else {
-      // CPA 文件可直接使用当前账号凭证；Sub2 导出仍刷新并校验 AT/RT/ID 一致性。
-      const exportRows = format === 'cpa' ? rows : await refreshRowsForExport(rows)
+      // One switch controls both CPA and Sub2.  Keep the decision outside the
+      // format-specific builders so password and 2FA can never diverge.
+      const useEncryption = encryptCredentials.value
+      // CPA 文件可直接使用当前账号凭证；Sub2 是否用 RT 刷新由页面开关决定。
+      // 关闭时仅校验现有 AT/ID，避免每次下载都旋转 refresh_token。
+      const exportRows = format === 'cpa'
+        ? rows
+        : sub2RefreshOauth.value
+          ? await refreshRowsForExport(rows)
+          : (await validateExistingSub2Rows(rows), rows)
       const result = format === 'cpa'
-        ? await buildCpaExport(exportRows)
-        : { blob: new Blob([JSON.stringify(buildSub2Export(exportRows), null, 2)], { type: 'application/json' }), filename: mode === 'revived' ? 'sub2api-revived.json' : `sub2api-accounts-remaining-${exportRows.length}.json` }
+        ? await buildCpaExport(exportRows, useEncryption)
+        : { blob: new Blob([JSON.stringify(await buildSub2Export(exportRows, useEncryption), null, 2)], { type: 'application/json' }), filename: mode === 'revived' ? 'sub2api-revived.json' : `sub2api-accounts-remaining-${exportRows.length}.json` }
       downloadBlob(result.blob, result.filename)
-      ElMessage.success(`${format === 'cpa' ? 'CPA' : 'Sub2'} 凭证刷新并下载完成，共 ${exportRows.length} 个`)
+      const modeNote = plainCredentialMode.value ? '（密码和 2FA 为明文）' : '（密码和 2FA 已保护）'
+      ElMessage.success(`${format === 'cpa' ? 'CPA' : 'Sub2'} 凭证${format === 'cpa' || !sub2RefreshOauth.value ? '' : '刷新并'}下载完成${modeNote}，共 ${exportRows.length} 个`)
     }
   } catch (error) {
-    handleAuthError(error)
-    ElMessage.error(error.message || 'Sub2 导出失败')
+    ElMessage.error(publicCredentialError(error) || '导出失败')
   } finally {
     downloading.value = false
   }
 }
-
-watch(accessKey, (value) => {
-  const key = String(value || '').trim()
-  if (key) localStorage.setItem(ACCESS_KEY_CACHE, key)
-  else localStorage.removeItem(ACCESS_KEY_CACHE)
-})
 
 watch([inspectionBatchSize, inspectionIntervalMinutes], ([batchSize, interval]) => {
   localStorage.setItem(INSPECTION_SETTINGS_CACHE, JSON.stringify({ batchSize, interval }))
@@ -1079,7 +1180,8 @@ watch([inspectionBatchSize, inspectionIntervalMinutes], ([batchSize, interval]) 
 watch(poolPushConfig, savePoolPushConfig, { deep: true })
 
 onMounted(() => {
-  accessKey.value = localStorage.getItem(ACCESS_KEY_CACHE) || ''
+  sub2RefreshOauth.value = localStorage.getItem(SUB2_REFRESH_OAUTH_CACHE) === '1'
+  plainCredentialMode.value = localStorage.getItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY) === '1'
   try {
     const saved = JSON.parse(localStorage.getItem(INSPECTION_SETTINGS_CACHE) || '{}')
     inspectionBatchSize.value = Math.max(1, Number(saved.batchSize) || 8)
@@ -1089,6 +1191,14 @@ onMounted(() => {
   clockTimer = setInterval(() => { clockNow.value = Date.now() }, 1000)
   loadQueueStatus()
   queueStatusTimer = setInterval(loadQueueStatus, 5000)
+})
+
+watch(sub2RefreshOauth, (value) => {
+  localStorage.setItem(SUB2_REFRESH_OAUTH_CACHE, value ? '1' : '0')
+})
+
+watch(plainCredentialMode, (value) => {
+  localStorage.setItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY, value ? '1' : '0')
 })
 
 onBeforeUnmount(() => {
@@ -1106,26 +1216,9 @@ onBeforeUnmount(() => {
       </template>
       <p class="hint">导入 sub2api / cpa JSON 后，在浏览器内完成解析、检查 401、密码 + 2FA 重登录和下载。</p>
 
-      <el-alert
-        type="info"
-        show-icon
-        :closable="false"
-        style="margin-bottom: 12px"
-        title="访问密钥会缓存在当前浏览器本地；后端只接受有效且未过期的密钥。"
-      />
-      <el-input
-        v-model="accessKey"
-        type="password"
-        show-password
-        clearable
-        placeholder="公开重登访问密钥"
-        style="max-width: 520px; margin-bottom: 12px"
-      />
-
       <div class="toolbar">
         <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="handleFile" />
         <el-button :loading="loading" @click="openFile">导入 JSON</el-button>
-        <el-button type="warning" @click="import2faVisible = true">导入 2FA 账号</el-button>
         <el-button :loading="checking" type="primary" @click="doCheck">检查额度 / 401</el-button>
         <el-button :loading="relogining" type="success" @click="doRelogin(true)">一键重新登录</el-button>
         <el-button @click="poolPushDrawerVisible = true">
@@ -1135,6 +1228,15 @@ onBeforeUnmount(() => {
         <el-button :type="aliveOnly ? 'primary' : 'default'" @click="aliveOnly = !aliveOnly">
           仅查看存活账号
         </el-button>
+        <el-checkbox v-model="sub2RefreshOauth" :disabled="loading || downloading">
+          导出 Sub2 前用 RT 刷新 OAuth
+        </el-checkbox>
+        <el-tooltip placement="top" content="关闭：直接使用现有 AT/ID，不请求 OAuth；开启：每个账号用 RT 换取新的 Codex AT/ID/RT，适合修复历史混合凭证">
+          <span class="hint" style="cursor: help">ⓘ</span>
+        </el-tooltip>
+        <el-checkbox v-model="plainCredentialMode" :disabled="loading || downloading">
+          导入/导出密码和 2FA 不加密
+        </el-checkbox>
         <el-dropdown>
           <el-button :loading="downloading">
             下载
@@ -1255,14 +1357,18 @@ onBeforeUnmount(() => {
 
       <el-table :data="visibleAccounts" style="margin-top: 16px" height="640" row-key="id">
         <el-table-column prop="email" label="邮箱" min-width="220" />
-        <el-table-column label="密码" min-width="180">
+        <el-table-column label="密码" width="90">
           <template #default="{ row }">
-            <el-input v-model="row.password" size="small" show-password placeholder="password" @change="updateOne(row.id, { password: row.password })" />
+            <el-tag :type="row.password ? 'success' : 'info'" effect="plain">
+              {{ row.password ? '有' : '无' }}
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="2FA" min-width="180">
+        <el-table-column label="2FA" width="90">
           <template #default="{ row }">
-            <el-input v-model="row.totp_secret" size="small" placeholder="totp secret" @change="updateOne(row.id, { totp_secret: row.totp_secret })" />
+            <el-tag :type="row.totp_secret ? 'success' : 'info'" effect="plain">
+              {{ row.totp_secret ? '有' : '无' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="代理" min-width="220">
@@ -1414,33 +1520,6 @@ onBeforeUnmount(() => {
       </div>
     </el-drawer>
 
-    <!-- 导入 2FA 账号对话框 -->
-    <el-dialog v-model="import2faVisible" title="导入 2FA 账号" width="600px" destroy-on-close>
-      <el-alert type="info" show-icon :closable="false" style="margin-bottom:12px">
-        <template #title>每行一个，格式：<code>邮箱----密码----2FA</code>（2FA 可选）</template>
-        <p style="margin:0">以 <code>#</code> 开头的行视为注释。如有任何一行格式不对，全部拒绝。</p>
-      </el-alert>
-      <el-input
-        v-model="import2faText"
-        type="textarea"
-        :rows="10"
-        placeholder="user@example.com----P@ssw0rd----JBSWY3DPEHPK3PXP"
-      />
-      <div style="text-align:right;margin-top:4px;color:var(--el-text-color-secondary);font-size:12px">
-        有效行：{{ import2faLineCount }}
-      </div>
-      <div v-if="import2faErrors.length" style="margin-top:8px">
-        <el-alert type="error" :closable="false" show-icon title="以下行不合法">
-          <ul class="err-list">
-            <li v-for="e in import2faErrors" :key="e.line">第 {{ e.line }} 行：{{ e.error }}</li>
-          </ul>
-        </el-alert>
-      </div>
-      <template #footer>
-        <el-button @click="import2faVisible = false">取消</el-button>
-        <el-button type="primary" @click="doImport2FA">导入</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
@@ -1530,12 +1609,5 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 8px;
   padding-top: 18px;
-}
-.err-list {
-  margin: 4px 0 0;
-  padding-left: 18px;
-  font-size: 12px;
-  max-height: 160px;
-  overflow-y: auto;
 }
 </style>

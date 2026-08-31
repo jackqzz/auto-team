@@ -261,7 +261,7 @@ def account_workspace_id(account: dict) -> str:
     sources = [credentials, data, raw, extra]
     token = _text(_field(sources, "access_token", "accessToken", "access-token", "token"))
     auth = _jwt_auth(token)
-    workspace_id = _field(sources, "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId")
+    workspace_id = _field(sources, "workspace_id", "workspaceId", "chatgpt_account_id", "chatgptAccountId")
     return _text(
         workspace_id
         or extra.get("chatgpt_account_id")
@@ -285,7 +285,7 @@ def normalized_account(raw: dict) -> dict:
         or profile.get("email")
     )
     workspace_id = _text(
-        _field(sources, "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId")
+        _field(sources, "workspace_id", "workspaceId", "chatgpt_account_id", "chatgptAccountId")
         or auth.get("chatgpt_account_id")
         or auth.get("account_id")
         or _field(sources, "account_id", "accountId")

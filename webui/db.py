@@ -43,6 +43,10 @@ def _conn() -> sqlite3.Connection:
     con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
+    # Workspace child rows must be removed with their deleted master.  Without
+    # this connection-local pragma, SQLite silently leaves orphan candidates
+    # behind and the background trash sweeper can keep using a deleted master.
+    con.execute("PRAGMA foreign_keys=ON")
     return con
 
 
@@ -262,6 +266,42 @@ def init_db():
     con.commit()
 
     _repair_workspace_candidate_join_statuses(con)
+    # Older connections did not enable SQLite foreign-key enforcement.  Purge
+    # orphaned workspace rows once during migration so background workers can
+    # no longer process candidates whose mother account was deleted.
+    con.execute(
+        "DELETE FROM workspace_credentials WHERE workspace_master_id NOT IN (SELECT id FROM workspace_masters)"
+    )
+    con.execute(
+        "DELETE FROM workspace_candidates WHERE workspace_master_id NOT IN (SELECT id FROM workspace_masters)"
+    )
+    # Plus 检测较早版本只把封号写进 extra_json.plus_check，未同步账号主状态。
+    # 启动时补齐为统一的“已永久失效”类型，保证历史数据和新检测结果一致。
+    con.execute(
+        """
+        UPDATE registered
+         SET account_status='permanently_invalid'
+         WHERE COALESCE(account_status, 'active') <> 'permanently_invalid'
+           AND COALESCE(
+               CASE WHEN json_valid(extra_json)
+                    THEN json_extract(extra_json, '$.plus_check.status')
+                    ELSE '' END,
+               ''
+           )='banned'
+        """
+    )
+    con.execute(
+        """
+        UPDATE workspace_candidates
+           SET status='permanently_invalid', updated_at=?
+         WHERE email IN (
+             SELECT email FROM registered
+              WHERE account_status='permanently_invalid'
+         )
+           AND COALESCE(status, '') <> 'permanently_invalid'
+        """,
+        (time.time(),),
+    )
     con.commit()
 
 
@@ -575,6 +615,7 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "seat_protect_used_count": 0,
     "seat_protect_window_key": "",
     "auto_standard_seat_enabled": False,
+    "auto_prolite_seat_enabled": False,
 }
 
 _CST = timezone(timedelta(hours=8))
@@ -751,6 +792,16 @@ def release_workspace_seat_protect_quota(workspace_id: int, amount: int = 1) -> 
 def delete_workspace_master(workspace_id: int) -> bool:
     with _lock:
         con = _conn()
+        # Keep deletion safe even for databases created before PRAGMA
+        # foreign_keys=ON was enabled; explicitly remove child rows first.
+        con.execute(
+            "DELETE FROM workspace_credentials WHERE workspace_master_id=?",
+            (int(workspace_id),),
+        )
+        con.execute(
+            "DELETE FROM workspace_candidates WHERE workspace_master_id=?",
+            (int(workspace_id),),
+        )
         rc = con.execute("DELETE FROM workspace_masters WHERE id=?", (int(workspace_id),))
         con.commit()
         return rc.rowcount > 0
@@ -800,8 +851,17 @@ def delete_workspace_masters(ids: list[int]) -> int:
         return 0
     with _lock:
         con = _conn()
+        marks = ",".join("?" * len(cleaned))
+        con.execute(
+            f"DELETE FROM workspace_credentials WHERE workspace_master_id IN ({marks})",
+            cleaned,
+        )
+        con.execute(
+            f"DELETE FROM workspace_candidates WHERE workspace_master_id IN ({marks})",
+            cleaned,
+        )
         rc = con.execute(
-            f"DELETE FROM workspace_masters WHERE id IN ({','.join('?' * len(cleaned))})", cleaned
+            f"DELETE FROM workspace_masters WHERE id IN ({marks})", cleaned
         )
         con.commit()
         return rc.rowcount
@@ -871,7 +931,7 @@ def _workspace_candidate_option_filters(
             )
         elif normalized == "prolite":
             clauses.append(
-                "LOWER(COALESCE(c.seat_type,'')) IN ('prolite', 'pro_lite')"
+                "LOWER(COALESCE(c.seat_type,'')) IN ('prolite', 'pro_lite', 'advanced', 'advanced_seat', 'premium', 'premium_seat', 'pro', '高级', '高级席位')"
             )
         else:
             clauses.append("c.seat_type=?")
@@ -1058,6 +1118,7 @@ def list_invalid_workspace_candidates_pending_trash(limit: int = 500) -> list[di
         SELECT c.*
           FROM workspace_candidates c
           JOIN registered r ON r.email=c.email
+          JOIN workspace_masters m ON m.id=c.workspace_master_id
          WHERE r.account_status='permanently_invalid'
            AND COALESCE(c.trash_status, 'active')<>'trashed'
          ORDER BY c.updated_at ASC
@@ -2470,7 +2531,7 @@ def _canonical_workspace_seat_type(value: object) -> str:
         return "usage_based"
     if normalized in {"default", "standard", "standard_seat", "gpt"}:
         return "default"
-    if normalized in {"prolite", "pro_lite"}:
+    if normalized in {"prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"}:
         return "prolite"
     if "codex席位" in normalized:
         return "usage_based"
@@ -2519,7 +2580,9 @@ def update_workspace_candidate_seat_type(workspace_master_id: int, email: str, s
 
 def update_plus_check(email: str, plus_info: dict) -> None:
     """把 Plus 检查结果写入 extra_json.plus_check。"""
-    email = email.lower()
+    email = str(email or "").strip().lower()
+    if not email:
+        return
     con = _conn()
     cur = con.execute("SELECT extra_json FROM registered WHERE email=?", (email,))
     row = cur.fetchone()
@@ -2532,11 +2595,26 @@ def update_plus_check(email: str, plus_info: dict) -> None:
         except Exception:
             extra = {}
     extra["plus_check"] = plus_info
+    is_banned = str(plus_info.get("status") or "").strip().lower() == "banned"
+    if is_banned:
+        # 封号与永久失效是同一个账号状态；保留检测详情，同时同步候选关系。
+        extra["permanently_invalid"] = True
+        extra.setdefault("permanently_invalid_reason", "Plus 检测判定封号")
     with _lock:
-        con.execute(
-            "UPDATE registered SET extra_json=? WHERE email=?",
-            (json.dumps(extra, ensure_ascii=False), email),
-        )
+        if is_banned:
+            con.execute(
+                "UPDATE registered SET account_status='permanently_invalid', extra_json=? WHERE email=?",
+                (json.dumps(extra, ensure_ascii=False), email),
+            )
+            con.execute(
+                "UPDATE workspace_candidates SET status='permanently_invalid', updated_at=? WHERE email=?",
+                (time.time(), email),
+            )
+        else:
+            con.execute(
+                "UPDATE registered SET extra_json=? WHERE email=?",
+                (json.dumps(extra, ensure_ascii=False), email),
+            )
         con.commit()
 
 def update_workspace_candidate_member(workspace_master_id: int, email: str, member_id: str, seat_type: str) -> None:
@@ -2574,9 +2652,10 @@ def get_workspace_candidate_seat_type(workspace_master_id: int, email: str) -> s
 def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[str, list]:
     conditions: list[str] = []
     args: list = []
+    banned_check = "(COALESCE(CASE WHEN json_valid(extra_json) THEN json_extract(extra_json, '$.plus_check.status') ELSE '' END, '')='banned')"
     if filt == "has_at":
         conditions.append(
-            "COALESCE(account_status, 'active') <> 'permanently_invalid' "
+            f"COALESCE(account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
             "AND length(COALESCE(access_token, '')) > 0"
         )
     elif filt == "has_rt":
@@ -2598,9 +2677,14 @@ def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[st
             "json_valid(extra_json) AND json_extract(extra_json, '$.plus_check.status')='plus_eligible'"
         )
     elif filt == "banned":
-        conditions.append("extra_json LIKE '%\"banned\"%'")
+        # 兼容旧筛选值；封号与永久失效现在属于同一类型。
+        conditions.append(
+            f"(COALESCE(account_status, 'active')='permanently_invalid' OR {banned_check})"
+        )
     elif filt == "permanently_invalid":
-        conditions.append("COALESCE(account_status, 'active')='permanently_invalid'")
+        conditions.append(
+            f"(COALESCE(account_status, 'active')='permanently_invalid' OR {banned_check})"
+        )
     elif filt == "token_invalid":
         # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
         # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
@@ -2624,13 +2708,15 @@ def list_registered(
 ) -> list[dict]:
     con = _conn()
     where, args = _registered_conditions(filter_rt, group_name)
+    invalid_check = "(COALESCE(account_status, 'active')='permanently_invalid' OR (COALESCE(CASE WHEN json_valid(extra_json) THEN json_extract(extra_json, '$.plus_check.status') ELSE '' END, '')='banned'))"
     cur = con.execute(
         f"SELECT email, group_name, "
-        f"CASE WHEN account_status='permanently_invalid' THEN '' ELSE password END AS password, "
-        f"CASE WHEN account_status='permanently_invalid' THEN '' ELSE totp_secret END AS totp_secret, account_status, "
-        f"CASE WHEN account_status='permanently_invalid' THEN 0 ELSE length(access_token) END AS at_len, "
-        f"CASE WHEN account_status='permanently_invalid' THEN 0 ELSE length(session_token) END AS st_len, "
-        f"CASE WHEN account_status='permanently_invalid' THEN 0 ELSE length(refresh_token) END AS rt_len, extra_json, created_at FROM registered "
+        f"CASE WHEN {invalid_check} THEN '' ELSE password END AS password, "
+        f"CASE WHEN {invalid_check} THEN '' ELSE totp_secret END AS totp_secret, "
+        f"CASE WHEN {invalid_check} THEN 'permanently_invalid' ELSE account_status END AS account_status, "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(access_token) END AS at_len, "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(session_token) END AS st_len, "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(refresh_token) END AS rt_len, extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         [*args, limit, offset],
     )

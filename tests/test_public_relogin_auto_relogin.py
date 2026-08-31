@@ -13,6 +13,14 @@ except ModuleNotFoundError as exc:
 
 @unittest.skipIf(app is None, "当前测试环境未安装 fastapi")
 class PublicReloginAutoReloginTests(unittest.TestCase):
+    def test_public_relogin_access_key_is_temporarily_ignored(self):
+        with patch.object(
+            app.db,
+            "validate_public_relogin_access_key",
+            side_effect=AssertionError("public relogin must not validate the key"),
+        ):
+            self.assertEqual(app._validate_public_relogin_access_key("anything"), {})
+
     def test_check_401_starts_relogin_inside_check_worker(self):
         account = {
             "id": "account-1",

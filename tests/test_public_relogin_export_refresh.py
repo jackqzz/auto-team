@@ -51,6 +51,32 @@ class PublicReloginExportRefreshTests(unittest.TestCase):
         self.assertEqual(refresh.call_args.kwargs["client_id"], exporter.CODEX_CLIENT_ID)
         self.assertEqual(refresh.call_args.kwargs["proxy"], "socks5://proxy.example:1080")
 
+    def test_refresh_export_leases_browser_pool_when_proxy_is_omitted(self):
+        request = app.PublicReloginExportRefreshReq(
+            account={
+                "email": "candidate@example.com",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "id_token": "old-id",
+            },
+            proxy_pool="proxy-one\nproxy-two",
+        )
+        with (
+            patch.object(public_relogin, "get_effective_config", return_value={"enabled": True, "quota_timeout": 30}),
+            patch.object(app, "_validate_public_relogin_access_key", return_value={}),
+            patch.object(exporter, "refresh_codex_token", return_value={
+                "access_token": "fresh-access",
+                "refresh_token": "rotated-refresh",
+                "id_token": "fresh-id",
+            }) as refresh,
+            patch.object(exporter, "validate_sub2_token_pair"),
+            patch.object(public_relogin.db, "proxy_lease_counts_since", return_value={}),
+            patch.object(public_relogin.proxy_usage, "record_lease"),
+        ):
+            app.api_public_relogin_refresh_export(request)
+
+        self.assertEqual(refresh.call_args.kwargs["proxy"], "proxy-one")
+
 
 if __name__ == "__main__":
     unittest.main()

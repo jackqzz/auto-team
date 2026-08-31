@@ -1,3 +1,5 @@
+import { credentialForExport } from './credentialCrypto'
+
 const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const SUB2API_DEFAULT_EXPIRES_IN = 863999
 const OPENAI_AUTH_KEY = 'https://api.openai.com/auth'
@@ -7,23 +9,63 @@ function text(value) {
   return String(value ?? '').trim()
 }
 
+function booleanOption(value) {
+  if (typeof value === 'string') return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+  return Boolean(value)
+}
+
+function objectValue(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch (_) { return {} }
+  }
+  return {}
+}
+
 function accountFields(account) {
-  const raw = account && typeof account === 'object' ? account : {}
-  const credentials = raw.credentials && typeof raw.credentials === 'object' ? raw.credentials : raw
-  const extra = raw.extra && typeof raw.extra === 'object' ? raw.extra : {}
+  const raw = objectValue(account)
+  const nestedCredentials = objectValue(raw.credentials)
+  const credentials = Object.keys(nestedCredentials).length ? nestedCredentials : raw
+  const extra = objectValue(raw.extra)
+  const notes = objectValue(raw.notes)
+  const gptNotes = objectValue(notes.gpt)
+  const twoFactorNotes = objectValue(notes.two_factor || notes.twoFactor)
   return {
     email: text(credentials.email || raw.email || raw.name || extra.email).toLowerCase(),
     accessToken: text(credentials.access_token || raw.access_token),
     refreshToken: text(credentials.refresh_token || raw.refresh_token),
     sessionToken: text(credentials.session_token || raw.session_token),
     idToken: text(credentials.id_token || raw.id_token),
+    password: text(
+      credentials.password
+      || credentials.passwd
+      || raw.password
+      || raw.passwd
+      || gptNotes.password,
+    ),
+    totpSecret: text(
+      credentials.totp_secret
+      || raw.totp_secret
+      || credentials.totpSecret
+      || raw.totpSecret
+      || credentials.two_factor_secret
+      || raw.two_factor_secret
+      || credentials.twoFactorSecret
+      || raw.twoFactorSecret
+      || credentials['2fa']
+      || raw['2fa']
+      || twoFactorNotes.secret,
+    ),
     workspaceId: text(
-      credentials.chatgpt_account_id
-      || raw.chatgpt_account_id
-      || credentials.workspace_id
+      credentials.workspace_id
       || raw.workspace_id
       || credentials.account_id
       || raw.account_id
+      || credentials.chatgpt_account_id
+      || raw.chatgpt_account_id
       || extra.workspace_id,
     ),
     userId: text(credentials.chatgpt_user_id || raw.chatgpt_user_id),
@@ -164,21 +206,53 @@ function formatUtc8(timestampMs) {
   return `${shifted.toISOString().slice(0, 19)}+08:00`
 }
 
-export async function buildCpaTokenJson(account) {
+export async function buildCpaTokenJson(account, options = {}) {
   const fields = accountFields(account)
   if (!fields.accessToken) throw new Error('账号缺少 access_token')
   const payload = decodeJwtPayload(fields.accessToken)
   const auth = authPayload(payload)
   const expiresAt = Number(payload.exp)
+  const exportOptions = typeof options === 'boolean'
+    ? { encryptCredentials: options }
+    : (options || {})
+  const encryptCredentials = booleanOption(exportOptions.encryptCredentials)
+  const credentialWorkspaceId = text(
+    exportOptions.workspaceId
+    || fields.workspaceId
+    || auth.chatgpt_account_id
+    || auth.account_id,
+  )
+  if (encryptCredentials && !credentialWorkspaceId && (fields.password || fields.totpSecret)) {
+    throw new Error(`${fields.email || '账号'} 缺少 workspace ID，无法加密密码和 2FA`)
+  }
+  const password = await credentialForExport(
+    fields.password,
+    credentialWorkspaceId,
+    encryptCredentials,
+  )
+  const totpSecret = await credentialForExport(
+    fields.totpSecret,
+    credentialWorkspaceId,
+    encryptCredentials,
+  )
   return {
     type: 'codex',
     email: fields.email,
     expired: Number.isInteger(expiresAt) && expiresAt > 0 ? formatUtc8(expiresAt * 1000) : '',
     id_token: fields.idToken || await buildCompatIdToken(fields.accessToken, fields.email),
-    account_id: text(auth.chatgpt_account_id || fields.workspaceId),
+    // CPA has no dedicated workspace_id property. In protected mode its
+    // existing account_id slot carries the key hint used by the public
+    // importer; plaintext exports preserve the token/account claim.
+    account_id: text(
+      encryptCredentials
+        ? credentialWorkspaceId
+        : (auth.chatgpt_account_id || auth.account_id || fields.workspaceId),
+    ),
     access_token: fields.accessToken,
     last_refresh: formatUtc8(Date.now()),
     refresh_token: fields.refreshToken,
+    password,
+    totp_secret: totpSecret,
   }
 }
 

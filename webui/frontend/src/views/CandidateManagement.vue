@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from "vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { Icon } from "@iconify/vue";
 import { useRoute } from "vue-router";
 import { storeToRefs } from "pinia";
@@ -11,6 +11,7 @@ import {
   exportRegistered,
   pushRegisteredToCpa,
 } from "@/api/register";
+import { PLAIN_CREDENTIAL_MODE_STORAGE_KEY } from "@/utils/credentialCrypto";
 import {
   listCandidateOptions,
   listCandidateGroups,
@@ -30,6 +31,9 @@ import {
   startAutoStandardSeatSchedule,
   stopAutoStandardSeatSchedule,
   autoStandardSeatScheduleStatus,
+  startAutoProliteSeatSchedule,
+  stopAutoProliteSeatSchedule,
+  autoProliteSeatScheduleStatus,
   listWorkspaceTaskLogs,
   saveCandidateSettings,
   trashCandidates,
@@ -52,17 +56,22 @@ const exportFormats = ref([]),
   exportLabel = ref("导出结果"),
   exportCount = ref(0),
   pushing = ref(false);
+// CPA/Sub2 的 password 与 2FA 共用一个导出模式。默认不勾选时导出受保护
+// 字段；勾选后导出明文，用于兼容旧的明文文件。
+const plainCredentialMode = ref(false),
+  encryptCredentials = computed(() => !plainCredentialMode.value);
 const taskLogs = ref([]), taskLogLoading = ref(false), taskLogAutoRefresh = ref(true), taskLogBoxRef = ref(null);
 let taskLogTimer = null;
 const quotaRunning = ref(false), quotaInterval = ref(30), reloginOn401 = ref(false), autoPush = ref(false), nextQuotaAt = ref(0), taskConcurrency = ref(1), taskOtpTimeout = ref(180), taskRetry = ref(1), taskCooldown = ref(0);
 const trashEnabled = ref(true), trashInvalidEnabled = ref(true), trashZeroDelayMinutes = ref(60);
 const seatProtectEnabled = ref(false), seatProtectThreshold = ref(8), seatProtectRefreshTime = ref("00:00"), seatProtectUsedCount = ref(0);
 const autoStandardSeatEnabled = ref(false), autoStandardSeatNextAt = ref(0);
+const autoProliteSeatEnabled = ref(false), autoProliteSeatNextAt = ref(0);
 const operationStatus = ref({});
 const quotaTaskRunning = ref(false);
 const quotaProgress = ref({ done: 0, total: 0, active: 0, succeeded: 0, failed: 0, relogged: 0 });
 const page = ref(1), pageSize = ref(100), total = ref(0);
-const accountStatusFilter = ref(""), joinStatusFilter = ref(""), credentialStatusFilter = ref(""), seatTypeFilter = ref(""), trashStatusFilter = ref(""), tagStatusFilter = ref(""), groupNameFilter = ref("");
+const accountStatusFilter = ref(""), joinStatusFilter = ref(""), credentialStatusFilter = ref(""), seatTypeFilter = ref(""), trashStatusFilter = ref("active"), tagStatusFilter = ref(""), groupNameFilter = ref("");
 const candidateGroups = ref([]);
 const settingsReady = ref(false);
 const settingsWorkspaceId = ref(null);
@@ -70,9 +79,11 @@ const syncingWorkspace = ref(false);
 const syncingWorkspaceMembers = ref(false);
 const membershipTaskRunning = ref(false);
 const candidateCheckRunning = ref(false);
-const candidateMembershipBusy = computed(() => membershipTaskRunning.value || candidateCheckRunning.value);
+const seatSwitchRunning = ref(false);
+const candidateMembershipBusy = computed(() => membershipTaskRunning.value || candidateCheckRunning.value || seatSwitchRunning.value);
 let settingsLoadGeneration = 0;
 let settingsSaveTimer = null;
+let credentialModeLoaded = false;
 function setOperation(emails, text) { const next = { ...operationStatus.value }; emails.forEach((e) => { next[e] = text }); operationStatus.value = next }
 function clearOperation(emails) { const next = { ...operationStatus.value }; emails.forEach((e) => { delete next[e] }); operationStatus.value = next }
 function setOneOperation(email, text) { operationStatus.value = { ...operationStatus.value, [email]: text } }
@@ -96,7 +107,13 @@ function activeSelectedEmails() {
 function accountStatusLabel(value) { return value === "permanently_invalid" ? "已永久失效" : "正常" }
 function displayStatus(row) { if (operationStatus.value[row.email]) return operationStatus.value[row.email]; const status = row.display_status || "not_invited"; if (status.startsWith("quota_error_")) return `额度查询失败（${status.slice(12)}）`; return ({ not_invited: "未邀请", pending_invite: "待接受邀请", pending_request: "待处理申请", joined: "已加入", workspace_credential: "已获得空间凭证", trash_scheduled: "垃圾箱待处理", trashed: "已入垃圾箱", candidate: "未邀请" }[status] || "未邀请") }
 function workspaceJoinStatusLabel(value) { if (String(value || "").startsWith("quota_error_")) return `额度查询失败（${String(value).slice(12)}）`; return ({ not_invited: "未邀请", pending_invite: "待接受邀请", pending_request: "待处理申请", joined: "已加入", join_requested: "已申请加入", approved: "已批准，待加入" }[value] || "未邀请") }
-function seatLabel(value) { const v = String(value || "").toLowerCase().replace("-", "_"); return (v === "default" || v === "gpt席位" || v === "标准席位") ? "标准席位" : ((v === "usage_based" || v === "usagebased" || v === "codex席位") ? "Codex席位" : ((v === "prolite" || v === "pro_lite") ? "ProLite席位" : "—")) }
+function seatLabel(value) {
+  const v = String(value || "").toLowerCase().replace("-", "_");
+  if (v === "default" || v === "gpt席位" || v === "标准席位") return "标准席位";
+  if (v === "usage_based" || v === "usagebased" || v === "codex席位") return "Codex席位";
+  if (["prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"].includes(v)) return "高级席位（ProLite）";
+  return "—";
+}
 function trashStatusLabel(value) { return ({ active: "正常", scheduled: "待入箱", trashed: "已入箱" }[String(value || "active")] || "正常") }
 function trashStatusHint(row) { if (!row || row.trash_status !== "scheduled" || !row.trash_due_at) return ""; return `到期 ${new Date(row.trash_due_at * 1000).toLocaleString()}` }
 function tagStatusLabel(value) { return String(value || "active") === "outbound" ? "已出库" : "正常" }
@@ -133,7 +150,7 @@ function cst(value) {
     hour12: false,
   }).format(new Date(value));
 }
-function seatSummary(row) { return row ? `标准${row.seats_default ?? "-"}/${row.seats_default_entitled ?? "-"} · ProLite${row.seats_prolite ?? "-"}/${row.seats_prolite_entitled ?? "-"} · Codex${row.seats_usage_based ?? "-"}（已购合计${row.seats_entitled ?? "-"} 在用${row.seats_in_use ?? "-"}）` : "—" }
+function seatSummary(row) { return row ? `标准${row.seats_default ?? "-"}/${row.seats_default_entitled ?? "-"} · 高级(ProLite)${row.seats_prolite ?? "-"}/${row.seats_prolite_entitled ?? "-"} · Codex${row.seats_usage_based ?? "-"}（已购合计${row.seats_entitled ?? "-"} 在用${row.seats_in_use ?? "-"}）` : "—" }
 function quotaUpdated(row) { try { const q = JSON.parse(row.quota_json || ""); return q.error_code ? `失败（HTTP ${q.error_code}）` : (q.updated_at ? new Date(q.updated_at * 1000).toLocaleString() : "未查询") } catch (_) { return "未查询" } }
 function quotaRemainingPercent(row) {
   try {
@@ -349,7 +366,7 @@ async function invite() {
     const states = Object.values(r.states || {});
     const confirmed = states.filter((x) => x !== "not_invited").length;
     const pending = states.filter((x) => x === "not_invited").length;
-    const seatName = seatType.value === "default" ? "标准席位" : (seatType.value === "prolite" ? "ProLite席位" : "Codex席位");
+    const seatName = seatType.value === "default" ? "标准席位" : (seatType.value === "prolite" ? "高级席位（ProLite）" : "Codex席位");
     if (r.recheck_error) {
       ElMessage.warning(`邀请已提交，但状态复查受上游限流影响，请稍后执行候选状态校验`);
     } else if (pending === 0) {
@@ -386,7 +403,7 @@ async function join() {
       { concurrency: taskConcurrency.value },
     );
     ElMessage.success(
-      `申请完成（${seatType.value === "default" ? "标准席位" : (seatType.value === "prolite" ? "ProLite席位" : "Codex席位")}）：成功 ${r.succeeded}，失败 ${r.failed}`,
+      `申请完成（${seatType.value === "default" ? "标准席位" : (seatType.value === "prolite" ? "高级席位（ProLite）" : "Codex席位")}）：成功 ${r.succeeded}，失败 ${r.failed}`,
     );
     await load();
   } catch (e) {
@@ -564,19 +581,26 @@ async function quota() {
     clearOperation(emails);
   }
 }
-async function changeSeat() {
+async function changeSeat(targetSeat = seatType.value) {
+  const target = String(targetSeat || "").trim().toLowerCase().replace(/-/g, "_");
+  if (!["default", "usage_based", "prolite"].includes(target)) {
+    return ElMessage.warning("请选择目标席位");
+  }
+  if (seatSwitchRunning.value) return;
   const candidates = selected.value.filter((x) =>
     x.workspace_join_status === "joined"
   );
   if (!candidates.length) return ElMessage.warning("请选择已加入当前空间的候选人");
   const emails = candidates.map((x) => x.email);
+  const targetLabel = target === "default" ? "标准席位" : (target === "prolite" ? "高级席位（ProLite）" : "Codex席位");
   let succeeded = 0, skipped = 0, failed = 0;
+  seatSwitchRunning.value = true;
   // 规范化席位名，用于本地比较
   const canonicalSeat = (v) => {
     const s = String(v || "").trim().toLowerCase().replace(/-/g, "_");
     if (["usage_based", "usagebased", "codex席位"].includes(s)) return "usage_based";
     if (["default", "standard", "standard_seat", "gpt席位", "标准席位"].includes(s)) return "default";
-    if (["prolite", "pro_lite"].includes(s)) return "prolite";
+    if (["prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"].includes(s)) return "prolite";
     return s;
   };
   setOperation(emails, "排队中…");
@@ -586,7 +610,7 @@ async function changeSeat() {
       // 先检查本地席位信息，已经是目标席位则直接跳过
       const localRow = options.value.find((r) => String(r.email || "").toLowerCase() === email.toLowerCase());
       const localSeat = canonicalSeat(localRow?.seat_label || localRow?.seat_type);
-      if (["default", "usage_based", "prolite"].includes(localSeat) && localSeat === seatType.value) {
+      if (["default", "usage_based", "prolite"].includes(localSeat) && localSeat === target) {
         skipped += 1;
         clearOperation([email]);
         continue;
@@ -595,9 +619,9 @@ async function changeSeat() {
       if (requestCount > 0) {
         await new Promise((r) => setTimeout(r, 3000));
       }
-      setOneOperation(email, "席位切换中…");
+      setOneOperation(email, `切换为${targetLabel}中…`);
       try {
-        const r = await updateCandidateSeat(workspaceId.value, [email], seatType.value);
+        const r = await updateCandidateSeat(workspaceId.value, [email], target);
         const item = (r.results || [])[0] || {};
         if (item.skipped) {
           skipped += 1;
@@ -606,7 +630,7 @@ async function changeSeat() {
           // 就地更新行的 seat_label
           options.value = options.value.map((row) => {
             if (String(row.email || "").toLowerCase() !== email.toLowerCase()) return row;
-            return { ...row, seat_label: seatType.value, seat_type: seatType.value };
+            return { ...row, seat_label: target, seat_type: target };
           });
         } else {
           failed += 1;
@@ -618,12 +642,13 @@ async function changeSeat() {
       clearOperation([email]);
     }
     ElMessage[failed ? "warning" : "success"](
-      `席位切换完成：已切换 ${succeeded}，跳过 ${skipped}，失败 ${failed}`,
+      `席位切换完成（${targetLabel}）：已切换 ${succeeded}，跳过 ${skipped}，失败 ${failed}`,
     );
     await load();
   } catch (e) {
     ElMessage.error("席位切换失败: " + e.message);
   } finally {
+    seatSwitchRunning.value = false;
     clearOperation(emails);
   }
 }
@@ -632,7 +657,6 @@ async function runCandidateAction(command) {
   if (command === "quota") return quota();
   if (command === "credentials") return credentials();
   if (command === "login_only") return loginOnly();
-  if (command === "seat") return changeSeat();
   if (command === "select_full_quota") return selectFullQuotaCandidates();
   if (command === "select_quota_401") return selectQuota401Candidates();
   if (command === "trash") return moveToTrash();
@@ -672,6 +696,7 @@ async function runMembershipAction(command) {
 }
 async function runExportAction(command) {
   if (command === "push") return push();
+  if (command === "export_outbound") return exportAndOutbound();
   return doExport(command);
 }
 async function runAssignAction(command) {
@@ -702,6 +727,7 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       seat_protect_threshold: seatProtectThreshold.value,
       seat_protect_refresh_time: seatProtectRefreshTime.value,
       auto_standard_seat_enabled: autoStandardSeatEnabled.value,
+      auto_prolite_seat_enabled: autoProliteSeatEnabled.value,
     });
   } catch (e) {
     ElMessage.error("空间设置保存失败: " + e.message);
@@ -744,10 +770,16 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     seatProtectRefreshTime.value = String(c.seat_protect_refresh_time || "00:00");
     seatProtectUsedCount.value = Number(c.seat_protect_used_count || 0);
     autoStandardSeatEnabled.value = Boolean(c.auto_standard_seat_enabled);
+    autoProliteSeatEnabled.value = Boolean(c.auto_prolite_seat_enabled);
     try {
       const seatStatus = await autoStandardSeatScheduleStatus(targetId);
       autoStandardSeatNextAt.value = seatStatus.next_at || 0;
       autoStandardSeatEnabled.value = Boolean((seatStatus.settings || {}).auto_standard_seat_enabled);
+    } catch (_) {}
+    try {
+      const seatStatus = await autoProliteSeatScheduleStatus(targetId);
+      autoProliteSeatNextAt.value = seatStatus.next_at || 0;
+      autoProliteSeatEnabled.value = Boolean((seatStatus.settings || {}).auto_prolite_seat_enabled);
     } catch (_) {}
     settingsWorkspaceId.value = targetId;
     loaded = true;
@@ -773,25 +805,43 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       seatProtectUsedCount.value = 0;
       autoStandardSeatEnabled.value = false;
       autoStandardSeatNextAt.value = 0;
+      autoProliteSeatEnabled.value = false;
+      autoProliteSeatNextAt.value = 0;
     }
   } finally {
     if (generation === settingsLoadGeneration && workspaceId.value === targetId) settingsReady.value = loaded;
   }
 }
-async function toggleQuotaSchedule() { try { if (!quotaRunning.value) { await stopQuotaSchedule(workspaceId.value); nextQuotaAt.value = 0; ElMessage.success('已停止定时额度查询'); } else { const r = await startQuotaSchedule(workspaceId.value, quotaInterval.value, reloginOn401.value, proxyList.value.join('\n'), autoPush.value, { concurrency: taskConcurrency.value, otp_timeout: taskOtpTimeout.value, account_retry_count: taskRetry.value, cool_down_seconds: taskCooldown.value, trash_enabled: trashEnabled.value, trash_invalid_enabled: trashInvalidEnabled.value, trash_zero_delay_minutes: trashZeroDelayMinutes.value, seat_protect_enabled: seatProtectEnabled.value, seat_protect_threshold: seatProtectThreshold.value, seat_protect_refresh_time: seatProtectRefreshTime.value }); nextQuotaAt.value = r.next_at || (Date.now()/1000 + quotaInterval.value*60); ElMessage.success(`已启动定时额度查询（每 ${quotaInterval.value} 分钟）`); } } catch (e) { quotaRunning.value = !quotaRunning.value; ElMessage.error(e.message) } }
+async function toggleQuotaSchedule() { try { if (!quotaRunning.value) { await stopQuotaSchedule(workspaceId.value); nextQuotaAt.value = 0; ElMessage.success('已停止定时额度查询'); } else { const r = await startQuotaSchedule(workspaceId.value, quotaInterval.value, reloginOn401.value, proxyList.value.join('\n'), autoPush.value, { concurrency: taskConcurrency.value, otp_timeout: taskOtpTimeout.value, account_retry_count: taskRetry.value, cool_down_seconds: taskCooldown.value, trash_enabled: trashEnabled.value, trash_invalid_enabled: trashInvalidEnabled.value, trash_zero_delay_minutes: trashZeroDelayMinutes.value, seat_protect_enabled: seatProtectEnabled.value, seat_protect_threshold: seatProtectThreshold.value, seat_protect_refresh_time: seatProtectRefreshTime.value, auto_standard_seat_enabled: autoStandardSeatEnabled.value, auto_prolite_seat_enabled: autoProliteSeatEnabled.value }); nextQuotaAt.value = r.next_at || (Date.now()/1000 + quotaInterval.value*60); ElMessage.success(`已启动定时额度查询（每 ${quotaInterval.value} 分钟）`); } } catch (e) { quotaRunning.value = !quotaRunning.value; ElMessage.error(e.message) } }
 async function toggleAutoStandardSeat() {
   try {
     if (!autoStandardSeatEnabled.value) {
       await stopAutoStandardSeatSchedule(workspaceId.value)
       autoStandardSeatNextAt.value = 0
-      ElMessage.success('已停止自动补标准席位')
+      ElMessage.success('已停止自动补齐标准席位')
     } else {
       const r = await startAutoStandardSeatSchedule(workspaceId.value)
       autoStandardSeatNextAt.value = r.next_at || (Date.now()/1000 + 300)
-      ElMessage.success('已启动自动补标准席位（每 5 分钟轮询）')
+      ElMessage.success('已启动自动补齐标准席位（每 5 分钟轮询）')
     }
   } catch (e) {
     autoStandardSeatEnabled.value = !autoStandardSeatEnabled.value
+    ElMessage.error(e.message)
+  }
+}
+async function toggleAutoProliteSeat() {
+  try {
+    if (!autoProliteSeatEnabled.value) {
+      await stopAutoProliteSeatSchedule(workspaceId.value)
+      autoProliteSeatNextAt.value = 0
+      ElMessage.success('已停止自动补齐高级席位')
+    } else {
+      const r = await startAutoProliteSeatSchedule(workspaceId.value)
+      autoProliteSeatNextAt.value = r.next_at || (Date.now()/1000 + 300)
+      ElMessage.success('已启动自动补齐高级席位（每 5 分钟轮询）')
+    }
+  } catch (e) {
+    autoProliteSeatEnabled.value = !autoProliteSeatEnabled.value
     ElMessage.error(e.message)
   }
 }
@@ -863,33 +913,79 @@ function saveBlob(data, filename, mime) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-async function doExport(fmt) {
+async function doExport(fmt, exportOptions = {}) {
   const emails = selected.value.map((x) => x.email).filter(Boolean);
   if (!emails.length) return ElMessage.warning("请选择候选人");
   exporting.value = true;
   try {
+    const credentialFormat = fmt.id === "cpa" || fmt.id === "sub2api";
     const r = await exportRegistered({
       format: fmt.id,
       emails,
       workspace_id: workspaceId.value,
       proxy_pool: proxyList.value.join("\n"),
+      ...(credentialFormat
+        ? { encrypt_credentials: encryptCredentials.value }
+        : {}),
+      ...(exportOptions.encryptCredentials !== undefined
+        ? { encrypt_credentials: Boolean(exportOptions.encryptCredentials) }
+        : {}),
+      ...(exportOptions.markOutbound ? { mark_outbound: true } : {}),
     });
     if (r.mode === "download") {
       saveBlob(b64ToBytes(r.b64), r.filename, r.mime);
       ElMessage.success(
         `已下载 ${r.filename}（${r.count || emails.length} 个号）`,
       );
-      return;
+      return r;
     }
     exportText.value = r.text || "";
     exportFilename.value = r.filename || "export.txt";
     exportLabel.value = r.label || fmt.label;
     exportCount.value = r.count || emails.length;
     exportVisible.value = true;
+    return r;
   } catch (e) {
     ElMessage.error("导出失败: " + e.message);
   } finally {
     exporting.value = false;
+  }
+}
+
+async function exportAndOutbound() {
+  const rows = selected.value.filter((row) => (
+    String(row?.tag_status || "active") !== "outbound"
+    && row?.trash_status !== "trashed"
+    && row?.account_status !== "permanently_invalid"
+  ));
+  if (!rows.length) return ElMessage.warning("请选择正常候选人");
+  if (!workspaceId.value) return ElMessage.warning("请选择母号空间");
+  try {
+    await ElMessageBox.confirm(
+      `将 ${rows.length} 个候选人加密导出为 Sub2 文件，并标记为已出库。导出后可在 401 页面使用 Workspace ID 解密密码和 2FA，确定继续吗？`,
+      "出库并导出",
+      { type: "warning", confirmButtonText: "加密导出并出库", cancelButtonText: "取消" },
+    );
+  } catch (_) {
+    return;
+  }
+  const previousSelection = selected.value;
+  selected.value = rows;
+  let succeeded = false;
+  try {
+    const result = await doExport(
+      { id: "sub2api", label: "加密 Sub2API" },
+      { encryptCredentials: true, markOutbound: true },
+    );
+    if (result?.outbound_marked !== undefined) {
+      succeeded = true;
+      selected.value = [];
+      await load();
+      ElMessage.success(`加密导出完成，已标记出库 ${result.outbound_marked} 个`);
+    }
+  } finally {
+    // 导出失败时保留原选择，方便用户修正后重试；成功后由上面的刷新清空。
+    if (!succeeded) selected.value = previousSelection;
   }
 }
 async function push() {
@@ -930,7 +1026,7 @@ watch(workspaceId, async (id) => {
   await startTaskLogPolling();
 });
 watch([quotaInterval, reloginOn401, autoPush, taskConcurrency, taskOtpTimeout, taskRetry, taskCooldown, trashEnabled, trashInvalidEnabled, trashZeroDelayMinutes, seatProtectEnabled, seatProtectThreshold, seatProtectRefreshTime], queueSpaceSettingsSave);
-watch([autoStandardSeatEnabled], queueSpaceSettingsSave);
+watch([autoStandardSeatEnabled, autoProliteSeatEnabled], queueSpaceSettingsSave);
 watch([accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter], () => {
   page.value = 1;
   selected.value = [];
@@ -940,12 +1036,23 @@ watch([page, pageSize], () => {
   selected.value = [];
   if (workspaceId.value) load();
 });
+watch(plainCredentialMode, (value) => {
+  try {
+    localStorage.setItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY, value ? "1" : "0");
+  } catch (_) { /* 浏览器禁用本地存储时仍可使用当前页面开关 */ }
+});
 watch(taskLogAutoRefresh, async () => {
   if (!workspaceId.value) return;
   await loadTaskLogs(true);
   await startTaskLogPolling();
 });
 onActivated(async () => {
+  if (!credentialModeLoaded) {
+    try {
+      plainCredentialMode.value = localStorage.getItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY) === "1";
+    } catch (_) { /* 使用默认的保护模式 */ }
+    credentialModeLoaded = true;
+  }
   await loadSpaces();
   if (workspaceId.value) {
     await load();
@@ -996,12 +1103,12 @@ onBeforeUnmount(() => {
               :key="s.id"
               :value="s.id"
               :label="`${s.account} · ${s.workspace_id || '无空间ID'}`" /></el-select></el-form-item
-        ><el-form-item label="席位类型"
+        ><el-form-item label="邀请/申请席位"
           ><el-select v-model="seatType" style="width: 180px"
             ><el-option label="标准席位" value="default" /><el-option
               label="Codex席位"
               value="usage_based" /><el-option
-              label="ProLite席位"
+              label="高级席位（ProLite）"
               value="prolite" /></el-select></el-form-item
         ><el-form-item
           ><span class="hint"
@@ -1046,7 +1153,7 @@ onBeforeUnmount(() => {
         </el-form-item>
         <el-form-item label="席位类型">
           <el-select v-model="seatTypeFilter" clearable style="width: 150px" placeholder="全部">
-            <el-option label="标准席位" value="default" /><el-option label="Codex席位" value="usage_based" /><el-option label="ProLite席位" value="prolite" /><el-option label="未设置" value="none" />
+            <el-option label="标准席位" value="default" /><el-option label="Codex席位" value="usage_based" /><el-option label="高级席位（ProLite）" value="prolite" /><el-option label="未设置" value="none" />
           </el-select>
         </el-form-item>
         <el-form-item label="垃圾箱">
@@ -1096,8 +1203,7 @@ onBeforeUnmount(() => {
               ><el-dropdown-item command="quota">查询额度</el-dropdown-item
               ><el-dropdown-item command="credentials">空间凭证获取</el-dropdown-item
               ><el-dropdown-item command="login_only">仅登录空间</el-dropdown-item
-              ><el-dropdown-item command="seat">切换成员席位</el-dropdown-item
-              ><el-dropdown-item command="trash">一键手动入箱</el-dropdown-item
+              ><el-dropdown-item command="trash">移入垃圾箱</el-dropdown-item
               ><el-dropdown-item command="restore_trash">移出垃圾箱</el-dropdown-item
             ></el-dropdown-menu></template
           ></el-dropdown
@@ -1115,12 +1221,35 @@ onBeforeUnmount(() => {
                 :command="fmt"
                 >{{ fmt.label }}</el-dropdown-item
               ><el-dropdown-item command="push">推送到 CPA</el-dropdown-item
+              ><el-dropdown-item command="export_outbound">出库并导出加密 Sub2（成功后标记）</el-dropdown-item
               ><el-dropdown-item v-if="!exportFormats.length" disabled
                 >加载中...</el-dropdown-item
               ></el-dropdown-menu
             ></template
           ></el-dropdown
           >
+          <el-dropdown
+            :disabled="candidateMembershipBusy"
+            @command="changeSeat"
+          >
+            <el-button type="primary" :loading="seatSwitchRunning">
+              切换成员席位<i class="el-icon-arrow-down el-icon--right" />
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="default">切换为标准席位</el-dropdown-item>
+                <el-dropdown-item command="usage_based">切换为 Codex 席位</el-dropdown-item>
+                <el-dropdown-item command="prolite">切换为高级席位（ProLite）</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <el-checkbox
+            v-model="plainCredentialMode"
+            :disabled="exporting || pushing"
+            title="仅影响 CPA 和 Sub2 导出"
+          >
+            CPA/Sub2 密码和 2FA 不加密
+          </el-checkbox>
         </div>
         <div class="tool-right">
           <el-dropdown @command="runAssignAction">
@@ -1128,7 +1257,7 @@ onBeforeUnmount(() => {
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="remove">移除候选划分</el-dropdown-item>
-                <el-dropdown-item command="trash">一键手动入箱</el-dropdown-item>
+                <el-dropdown-item command="trash">移入垃圾箱</el-dropdown-item>
                 <el-dropdown-item command="restore_trash">移出垃圾箱</el-dropdown-item>
                 <el-dropdown-item command="outbound">标记为出库</el-dropdown-item>
                 <el-dropdown-item v-if="tagStatusFilter === 'outbound'" command="restore_outbound">恢复为正常</el-dropdown-item>
@@ -1172,10 +1301,14 @@ onBeforeUnmount(() => {
           <div class="hint">仅限制 Usage-based → 标准席位切换；标准席位 → Usage-based 不受影响。</div>
           <div class="hint">当前周期已用 {{ seatProtectUsedCount }} / {{ seatProtectThreshold }}</div>
           <el-form label-position="top" style="margin-top:20px"><el-form-item label="保护阈值"><el-input-number v-model="seatProtectThreshold" :min="1" :max="1000" /></el-form-item><el-form-item label="阈值刷新时间"><el-time-picker v-model="seatProtectRefreshTime" format="HH:mm" value-format="HH:mm" placeholder="每天刷新时间" style="width:100%" /></el-form-item></el-form>
-          <el-divider>自动补标准席位</el-divider>
-          <div class="setting-row"><span>开启自动补标准席位</span><el-switch v-model="autoStandardSeatEnabled" @change="toggleAutoStandardSeat" /></div>
+          <el-divider>自动补齐标准席位</el-divider>
+          <div class="setting-row"><span>自动补齐标准席位</span><el-switch v-model="autoStandardSeatEnabled" @change="toggleAutoStandardSeat" /></div>
           <div class="hint">每 5 分钟轮询一次 seats_type_counts，按缺口串行补齐标准席位，并在补齐后自动触发 Team 凭证获取。</div>
           <div v-if="autoStandardSeatEnabled && autoStandardSeatNextAt" class="hint">下次轮询：{{ new Date(autoStandardSeatNextAt * 1000).toLocaleString() }}</div>
+          <el-divider>自动补齐高级席位</el-divider>
+          <div class="setting-row"><span>自动补齐高级席位（ProLite）</span><el-switch v-model="autoProliteSeatEnabled" @change="toggleAutoProliteSeat" /></div>
+          <div class="hint">每 5 分钟轮询一次 ProLite 席位缺口，将已加入空间的标准席位候选人串行升级，并在升级后自动触发 Team 凭证获取。</div>
+          <div v-if="autoProliteSeatEnabled && autoProliteSeatNextAt" class="hint">下次轮询：{{ new Date(autoProliteSeatNextAt * 1000).toLocaleString() }}</div>
         </div>
       </el-drawer>
       <el-table

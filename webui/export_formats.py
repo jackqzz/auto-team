@@ -29,6 +29,11 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from . import exporter
+from .credential_crypto import (
+    decrypt_credential,
+    encrypt_credential,
+    is_encrypted_credential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,41 @@ def _s(row: dict, key: str) -> str:
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _bool_option(value: object, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _export_credential(value: object, workspace_id: str, encrypt_credentials: bool) -> str:
+    """Apply one shared export mode to a password or TOTP value.
+
+    Turning encryption off means plaintext output, not merely "do not encrypt
+    again".  This matters when an imported hand-off value is rendered again.
+    Empty fields stay empty in both modes.
+    """
+    credential = str(value or "").strip()
+    if not credential:
+        return ""
+    key = str(workspace_id or "").strip()
+    if encrypt_credentials:
+        if not key:
+            raise ValueError("加密凭证必须指定 Workspace ID")
+        if is_encrypted_credential(credential):
+            # Validate/recover an already protected value before applying the
+            # selected mode.  This keeps both fields tied to the current
+            # workspace key instead of silently carrying an unknown marker.
+            credential = decrypt_credential(credential, key)
+        return encrypt_credential(credential, key)
+    if is_encrypted_credential(credential):
+        if not key:
+            raise ValueError("取消凭证加密必须指定 Workspace ID")
+        return decrypt_credential(credential, key)
+    return credential
 
 
 def _jwt_parts(row: dict) -> tuple[dict, dict, dict]:
@@ -82,15 +122,38 @@ def _safe_filename_part(value: str, fallback: str = "unknown") -> str:
     return cleaned or fallback
 
 
-def _cpa_data(row: dict) -> dict:
-    """生成与 codex-<hash>-<email>-<plan>.json 示例一致的 CPA 内容。"""
+def _cpa_data(
+    row: dict,
+    workspace_id: str = "",
+    *,
+    encrypt_credentials: bool = False,
+) -> dict:
+    """生成与 codex-<hash>-<email>-<plan>.json 示例一致的 CPA 内容。
+
+    ``password`` 和 ``totp_secret`` 仍放在现有的 CPA 顶层字段中。调用方只
+    提供一个开关，两个字段始终一起加密或一起保持明文，避免 CPA/Sub2 的
+    凭证模式不一致。
+    """
     data = exporter.build_cpa_token_json(row)
     # CPA 自身导出的文件包含 disabled；上传构造器为了兼容旧 API 没有该字段。
     data["disabled"] = False
     # 保持示例的字段顺序，方便肉眼 diff（JSON 消费方并不依赖顺序）。
+    password = _export_credential(
+        data.get("password", ""), workspace_id, encrypt_credentials,
+    )
+    totp_secret = _export_credential(
+        data.get("totp_secret", ""), workspace_id, encrypt_credentials,
+    )
+    account_id = data.get("account_id", "")
+    if encrypt_credentials and str(workspace_id or "").strip():
+        # CPA has no separate workspace_id field.  Reuse its existing
+        # account_id slot as the portable key hint, so the public importer can
+        # recover the exact Workspace ID even when a token carries a different
+        # child/account claim.
+        account_id = str(workspace_id or "").strip()
     return {
         "access_token": data.get("access_token", ""),
-        "account_id": data.get("account_id", ""),
+        "account_id": account_id,
         "disabled": False,
         "email": data.get("email", ""),
         "expired": data.get("expired", ""),
@@ -98,24 +161,56 @@ def _cpa_data(row: dict) -> dict:
         "last_refresh": data.get("last_refresh", ""),
         "refresh_token": data.get("refresh_token", ""),
         "type": "codex",
+        "password": password,
+        "totp_secret": totp_secret,
     }
 
 
 def _cpa_entry_name(row: dict, data: Optional[dict] = None) -> str:
-    data = data or _cpa_data(row)
-    _, access_auth, _ = _jwt_parts(row)
-    account_id = str(data.get("account_id") or "").strip()
-    digest_source = account_id or str(data.get("email") or "unknown")
+    if data is None:
+        # Filename generation must not inspect/transform password or TOTP
+        # fields.  In particular, an already protected row may not have a key
+        # available at this stage; the actual renderer handles that explicitly.
+        access_payload, access_auth, _ = _jwt_parts(row)
+        profile = exporter._get_profile(access_payload)
+        email = _s(row, "email") or str(profile.get("email") or "")
+        account_id = str(
+            access_auth.get("chatgpt_account_id")
+            or access_auth.get("account_id")
+            or row.get("workspace_id")
+            or row.get("account_id")
+            or ""
+        ).strip()
+    else:
+        _, access_auth, _ = _jwt_parts(row)
+        email = str(data.get("email") or "")
+        account_id = str(data.get("account_id") or "").strip()
+    digest_source = account_id or email or "unknown"
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:8]
     plan = str(access_auth.get("chatgpt_plan_type") or "free").strip().lower() or "free"
     return (
-        f"codex-{digest}-{_safe_filename_part(data.get('email', ''))}-"
+        f"codex-{digest}-{_safe_filename_part(email)}-"
         f"{_safe_filename_part(plan, 'free')}.json"
     )
 
 
-def _render_cpa(rows: list) -> bytes:
-    entries = [(row, _cpa_data(row)) for row in rows]
+def _render_cpa(
+    rows: list,
+    workspace_id: str = "",
+    *,
+    encrypt_credentials: bool = False,
+) -> bytes:
+    entries = [
+        (
+            row,
+            _cpa_data(
+                row,
+                workspace_id=workspace_id,
+                encrypt_credentials=encrypt_credentials,
+            ),
+        )
+        for row in rows
+    ]
     if len(entries) == 1:
         return json.dumps(
             entries[0][1], ensure_ascii=False, separators=(",", ":")
@@ -170,7 +265,12 @@ def _mailbox_info(row: dict) -> tuple[dict, str]:
     return mailbox, pickup
 
 
-def _sub2_account(row: dict) -> dict:
+def _sub2_account(
+    row: dict,
+    workspace_id: str = "",
+    *,
+    encrypt_credentials: bool = False,
+) -> dict:
     email = _s(row, "email")
     access_payload, access_auth, _id_auth = _jwt_parts(row)
     profile = exporter._get_profile(access_payload)
@@ -206,7 +306,7 @@ def _sub2_account(row: dict) -> dict:
         or row.get("chatgpt_plan_type")
         or "free"
     ).strip() or "free"
-    workspace_id_value = account_id or str(
+    workspace_id_value = str(workspace_id or "").strip() or account_id or str(
         row.get("workspace_id") or row.get("chatgpt_account_id") or ""
     ).strip()
     session_token = _s(row, "session_token")
@@ -224,6 +324,13 @@ def _sub2_account(row: dict) -> dict:
 
     last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     display_name = str(profile.get("name") or account_email or "").strip()
+
+    password = _export_credential(
+        _s(row, "password"), workspace_id, encrypt_credentials,
+    )
+    totp_secret = _export_credential(
+        _s(row, "totp_secret"), workspace_id, encrypt_credentials,
+    )
 
     cred_extra = {
         "email": account_email,
@@ -276,8 +383,8 @@ def _sub2_account(row: dict) -> dict:
             "expired": expired_str,
             "disabled": False,
             "id_token": _s(row, "id_token"),
-            "password": _s(row, "password"),
-            "totp_secret": _s(row, "totp_secret"),
+            "password": password,
+            "totp_secret": totp_secret,
             "client_id": client_id,
             "plan_type": plan_type,
             "account_id": account_id,
@@ -307,8 +414,20 @@ def _sub2_account(row: dict) -> dict:
     }
 
 
-def _render_sub2(rows: list) -> bytes:
-    accounts = [_sub2_account(row) for row in rows]
+def _render_sub2(
+    rows: list,
+    workspace_id: str = "",
+    *,
+    encrypt_credentials: bool = False,
+) -> bytes:
+    accounts = [
+        _sub2_account(
+            row,
+            workspace_id=workspace_id,
+            encrypt_credentials=encrypt_credentials,
+        )
+        for row in rows
+    ]
     document = {
         "type": "sub2api-data",
         "version": 1,
@@ -431,13 +550,48 @@ def render_text(rows: list, fmt: "ExportFormat | str") -> str:
     return "\n".join(lines)
 
 
-def render_bytes(rows: list, fmt: "ExportFormat | str") -> bytes:
-    """mode=download：整份文件字节。"""
+def render_bytes(
+    rows: list,
+    fmt: "ExportFormat | str",
+    workspace_id: str = "",
+    *,
+    encrypt_credentials: bool | None = None,
+) -> bytes:
+    """mode=download：整份文件字节。
+
+    ``workspace_id`` is intentionally optional: ordinary Personal exports
+    retain their historical plaintext fields, while a Team hand-off passes
+    the external Workspace ID.  For CPA and Sub2 the same
+    ``encrypt_credentials`` decision is applied to both login fields.
+    """
     f = get_format(fmt) if isinstance(fmt, str) else fmt
     if f is None:
         raise KeyError(f"未知导出格式: {fmt}")
     if not f.render_all:
         raise RuntimeError(f"格式 {f.id} 不是下载格式")
+    key = str(workspace_id or "").strip()
+    if f.id in {"cpa", "sub2api"}:
+        # A workspace key historically implied protected Team exports.  Keep
+        # that default for old API callers, while an explicit bool (the UI
+        # switch) always wins and is shared by CPA and Sub2.
+        should_encrypt = (
+            bool(key)
+            if encrypt_credentials is None
+            else _bool_option(encrypt_credentials)
+        )
+        if f.id == "cpa":
+            return _render_cpa(
+                rows or [],
+                workspace_id=key,
+                encrypt_credentials=should_encrypt,
+            )
+        return _render_sub2(
+            rows or [],
+            workspace_id=key,
+            encrypt_credentials=should_encrypt,
+        )
+    if encrypt_credentials:
+        raise ValueError(f"格式 {f.id} 不支持凭证加密")
     return f.render_all(rows or [])
 
 
