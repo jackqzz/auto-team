@@ -165,16 +165,42 @@ onUnmounted(() => {
 .brand .logo {
   width: 30px;
   height: 30px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-md);
   background: var(--brand);
   color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  box-shadow: var(--app-shadow-brand);
 }
 .brand.mini { justify-content: center; padding: 0; }
-.side-menu { border-right: none; }
+.side-menu { border-right: none; padding: 8px; }
+
+/* 菜单项从通栏方块改成带圆角的悬浮块，收起时也保持方形圆角 */
+.side-menu :deep(.el-menu-item) {
+  height: 42px;
+  line-height: 42px;
+  margin-bottom: 2px;
+  border-radius: var(--app-radius-md);
+  font-size: 13.5px;
+  transition: background-color 0.18s var(--app-ease), color 0.18s var(--app-ease);
+}
+.side-menu :deep(.el-menu-item.is-active) {
+  background: var(--el-color-primary-light-9);
+  font-weight: 600;
+}
+.side-menu :deep(.el-menu-item-group__title) {
+  padding: 12px 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--el-text-color-placeholder);
+}
+.side-menu :deep(.el-menu-item .el-icon) { font-size: 17px; }
+.side-menu.el-menu--collapse :deep(.el-menu-item) { padding: 0 11px; }
+
 .topbar {
   display: flex;
   align-items: center;
@@ -188,7 +214,17 @@ onUnmounted(() => {
 .search-box { width: 180px; }
 .pills { display: flex; gap: 6px; }
 .pills b { color: inherit; }
-.avatar { display: flex; align-items: center; gap: 6px; cursor: pointer; outline: none; }
+.avatar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  outline: none;
+  padding: 4px 8px;
+  border-radius: 999px;
+  transition: background-color 0.18s var(--app-ease);
+}
+.avatar:hover { background: var(--el-fill-color-light); }
 .avatar-img { background: var(--el-fill-color-darker); color: var(--el-text-color-regular); }
 .avatar-name { font-size: 13px; color: var(--el-text-color-regular); }
 .content { background: var(--app-content-bg); padding: 16px; }
@@ -199,7 +235,7 @@ onUnmounted(() => {
   justify-content: space-between;
   padding: 8px 14px;
   margin-bottom: 14px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-md);
   background: linear-gradient(135deg, #fff7e6 0%, #fff1d6 100%);
   border: 1px solid #ffd88a;
   font-size: 13px;

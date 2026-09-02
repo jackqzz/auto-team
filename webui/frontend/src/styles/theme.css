@@ -10,6 +10,33 @@
   --el-color-primary-light-9: #e8f0fd;
   --el-color-primary-dark-2: #1d4fc4;
 
+  /* ---- 圆角标度 ----
+     Element Plus 默认 4px 太硬，和页面里手写的 8/10/12px 卡片对不上。
+     这里把基准抬到 8px，让整站只有一套圆角语言。
+     注意：--el-card-border-radius 这类令牌 EP 是声明在组件选择器自身上的，
+     写在 :root 会被组件声明覆盖，必须在下面按组件选择器改。 */
+  --app-radius-xs: 4px;
+  --app-radius-sm: 6px;
+  --app-radius-md: 10px;
+  --app-radius-lg: 12px;
+  --app-radius-xl: 16px;
+
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+
+  /* ---- 阴影标度 ----
+     页面里原本各写各的 rgba(0,0,0,.04)，深色模式下等于没有阴影。
+     统一成令牌后，深色模式只要覆盖变量就能整站生效。 */
+  --app-shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --app-shadow-sm: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+  --app-shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08), 0 2px 4px rgba(16, 24, 40, 0.04);
+  --app-shadow-lg: 0 12px 28px rgba(16, 24, 40, 0.12), 0 4px 8px rgba(16, 24, 40, 0.05);
+  --app-shadow-brand: 0 1px 2px rgba(37, 99, 235, 0.24);
+  --app-shadow-brand-hover: 0 4px 10px rgba(37, 99, 235, 0.26);
+
+  --app-ring: 0 0 0 3px var(--el-color-primary-light-8);
+  --app-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
   /* 自定义变量 */
   --brand: #2563eb;
   --brand-dark: #1d4fc4;
@@ -31,6 +58,15 @@ html.dark {
   --app-header-bg: #1d1e1f;
   --app-content-bg: #141414;
   --app-log-bg: #141414;
+
+  /* 深色底上黑色阴影几乎不可见，需要显著加深不透明度 */
+  --app-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --app-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.48), 0 2px 4px rgba(0, 0, 0, 0.32);
+  --app-shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.56), 0 4px 8px rgba(0, 0, 0, 0.36);
+  --app-shadow-brand: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --app-shadow-brand-hover: 0 4px 10px rgba(0, 0, 0, 0.5);
+  --app-ring: 0 0 0 3px rgba(75, 131, 240, 0.28);
 }
 
 * { box-sizing: border-box; }
@@ -44,10 +80,135 @@ html, body, #app {
 body {
   background: var(--app-content-bg);
   color: var(--el-text-color-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
+/* ============ 全局滚动条 ============
+   默认滚动条在浅色卡片上很突兀，这里换成随内容淡入的细条。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--el-border-color) transparent;
+}
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--el-border-color);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--el-border-color-darker); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ============ 按钮 ============ */
+.el-button {
+  --el-button-font-weight: 500;
+  letter-spacing: 0.2px;
+  transition:
+    background-color 0.18s var(--app-ease),
+    border-color 0.18s var(--app-ease),
+    color 0.18s var(--app-ease),
+    box-shadow 0.18s var(--app-ease),
+    transform 0.18s var(--app-ease);
+}
+
+/* 实心按钮：给一层极淡的投影，让主操作从平面里浮起来 */
+.el-button--primary:not(.is-text):not(.is-link):not(.is-plain),
+.el-button--success:not(.is-text):not(.is-link):not(.is-plain),
+.el-button--warning:not(.is-text):not(.is-link):not(.is-plain),
+.el-button--danger:not(.is-text):not(.is-link):not(.is-plain),
+.el-button--info:not(.is-text):not(.is-link):not(.is-plain) {
+  box-shadow: var(--app-shadow-brand);
+}
+
+/* transform 不触发重排，密集表格里也不会把同行按钮挤动 */
+.el-button:not(.is-disabled):not(.is-text):not(.is-link):hover {
+  transform: translateY(-1px);
+  box-shadow: var(--app-shadow-brand-hover);
+}
+.el-button:not(.is-disabled):not(.is-text):not(.is-link):active {
+  transform: translateY(0);
+  box-shadow: var(--app-shadow-xs);
+}
+.el-button.is-disabled { box-shadow: none; }
+
+/* 描边按钮不需要投影，靠边框和底色变化即可 */
+.el-button.is-plain:not(.is-disabled):hover { box-shadow: var(--app-shadow-xs); }
+
+/* 文字/链接按钮：悬停给一块柔和底色，点击区域更明确 */
+.el-button.is-text,
+.el-button.is-link { border-radius: var(--app-radius-sm); }
+.el-button.is-text:not(.is-disabled):hover { background-color: var(--el-fill-color-light); }
+
+.el-button:focus-visible { outline: none; box-shadow: var(--app-ring); }
+
+/* 图标与文字的间距统一（EP 默认 6px 在小号按钮里偏挤） */
+.el-button [class*="el-icon"] + span { margin-left: 5px; }
+.el-button-group > .el-button:not(:first-child):not(:last-child) { border-radius: 0; }
+
+/* ============ 卡片 / 容器 ============ */
+.el-card {
+  --el-card-border-radius: var(--app-radius-lg);
+  border-color: var(--el-border-color-lighter);
+  box-shadow: var(--app-shadow-sm);
+}
+.el-card__header { padding: 14px 18px; font-weight: 600; }
+
+/* ============ 表单控件 ============ */
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner {
+  transition: box-shadow 0.18s var(--app-ease);
+}
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--el-color-primary) inset, var(--app-ring);
+}
+
+/* ============ 标签 ============ */
+.el-tag {
+  --el-tag-border-radius: var(--app-radius-sm);
+  font-weight: 500;
+}
+
+/* ============ 表格 ============ */
+.el-table th.el-table__cell {
+  background: var(--el-fill-color-lighter);
+  font-weight: 600;
+  color: var(--el-text-color-regular);
+}
+.el-table__body tr:hover > td.el-table__cell { background: var(--el-fill-color-light); }
+
+/* ============ 下拉 / 弹层 ============ */
+.el-dropdown-menu { padding: 5px; }
+.el-dropdown-menu__item {
+  border-radius: var(--app-radius-sm);
+  padding: 6px 12px;
+}
+.el-select-dropdown__item { border-radius: var(--app-radius-sm); margin: 0 5px; padding: 0 12px; }
+.el-select-dropdown__list { padding: 5px 0; }
+.el-popover { --el-popover-border-radius: var(--app-radius-md); }
+.el-popper.is-light { box-shadow: var(--app-shadow-md); }
+
+/* ============ 弹窗 / 抽屉 ============ */
+.el-dialog { --el-dialog-border-radius: var(--app-radius-xl); box-shadow: var(--app-shadow-lg); }
+.el-message-box { --el-messagebox-border-radius: var(--app-radius-xl); }
+.el-notification { --el-notification-radius: var(--app-radius-lg); }
+.el-drawer { box-shadow: var(--app-shadow-lg); }
+.el-drawer__header { margin-bottom: 0; padding: 16px 20px; border-bottom: 1px solid var(--app-border); font-weight: 600; color: var(--app-title); }
+
+/* ============ 其他小件 ============ */
+.el-alert { border-radius: var(--app-radius-md); }
+.el-pagination.is-background .el-pager li,
+.el-pagination.is-background .btn-prev,
+.el-pagination.is-background .btn-next { border-radius: var(--app-radius-sm); }
+.el-progress-bar__outer, .el-progress-bar__inner { border-radius: 999px; }
+.el-message { border-radius: var(--app-radius-md); box-shadow: var(--app-shadow-md); }
+
 /* 统计卡片 */
-.stat-card { border-radius: 8px; overflow: hidden; }
+.stat-card { border-radius: var(--app-radius-lg); overflow: hidden; }
 .stat-card .stat-value { font-size: 28px; font-weight: 600; line-height: 1.1; }
 .stat-card .stat-label { font-size: 13px; color: var(--el-text-color-secondary); margin-top: 4px; }
 
@@ -56,7 +217,7 @@ body {
   background: var(--app-log-bg);
   color: var(--app-log-text);
   border: 1px solid var(--app-border);
-  border-radius: 6px;
+  border-radius: var(--app-radius-md);
   padding: 10px 12px;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px;
@@ -90,7 +251,7 @@ body {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 13px;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--app-radius-sm);
   background: var(--el-fill-color-light);
   user-select: all;
   word-break: break-all;

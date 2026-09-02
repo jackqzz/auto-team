@@ -22,8 +22,8 @@
   padding: 12px 20px;
   background: var(--app-header-bg);
   border: 1px solid var(--app-border);
-  border-radius: 8px;
-  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.06);
+  border-radius: var(--app-radius-lg);
+  box-shadow: var(--app-shadow-lg);
 }
 .ft-left { color: var(--el-text-color-secondary); font-size: 12px; }
 .ft-right { display: flex; align-items: center; gap: 10px; margin-left: auto; }

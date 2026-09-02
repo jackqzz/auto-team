@@ -3,18 +3,29 @@ import { computed, onActivated, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Icon } from '@iconify/vue'
 import {
-  listAccounts, deleteAccount, bulkDeleteAccounts, resetFailed,
-  resetAccount, bulkResetAccounts, releaseStale, setAccountsGroup,
-  createAccountGroup, renameAccountGroup, deleteAccountGroup, updateAccountPassword,
+  listAccounts,
+  deleteAccount,
+  bulkDeleteAccounts,
+  resetFailed,
+  resetAccount,
+  bulkResetAccounts,
+  releaseStale,
+  setAccountsGroup,
+  createAccountGroup,
+  renameAccountGroup,
+  deleteAccountGroup,
+  updateAccountPassword,
 } from '@/api/accounts'
 import { getMailProviders } from '@/api/settings'
 import { useStatsStore } from '@/stores/stats'
 import { useRuntimeStore } from '@/stores/runtime'
-import StatusDot from '@/components/StatusDot.vue'
+import { copyText } from '@/api/request'
 
 const router = useRouter()
 const statsStore = useStatsStore()
+const { stats } = storeToRefs(statsStore)
 const runtime = useRuntimeStore()
 const { dataVersion } = storeToRefs(runtime)
 
@@ -25,24 +36,30 @@ const page = ref(1)
 const statusFilter = ref('')
 const kindFilter = ref('')
 const groupFilter = ref('__all__')
-const bulkStatus = ref('')
 const selected = ref([])
 const loading = ref(false)
-// 号池现在可以混放多种邮箱，这两个用来显示「来源」列和按来源过滤
+
 const providers = ref([])
 const byKind = ref({})
 const groups = ref([])
 const groupManagerVisible = ref(false)
 
-const STATUS_TYPE = { available: 'success', in_use: 'warning', done: 'primary', failed: 'danger' }
+const statusTabs = [
+  { label: '全部', value: '', icon: 'lucide:layers' },
+  { label: '可用 available', value: 'available', icon: 'lucide:check-circle-2' },
+  { label: '进行中 in_use', value: 'in_use', icon: 'lucide:loader-2' },
+  { label: '已完成 done', value: 'done', icon: 'lucide:badge-check' },
+  { label: '失败 failed', value: 'failed', icon: 'lucide:alert-octagon' },
+]
 
-// 列表里只列池子里真有号的来源，免得下拉框塞一堆空选项
 const kindOptions = computed(() =>
-  providers.value.filter((p) => p.pooled).map((p) => ({
-    kind: p.kind,
-    label: p.display_name,
-    count: byKind.value[p.kind]?.total || 0,
-  })),
+  providers.value
+    .filter((p) => p.pooled)
+    .map((p) => ({
+      kind: p.kind,
+      label: p.display_name,
+      count: byKind.value[p.kind]?.total || 0,
+    })),
 )
 
 function kindLabel(k) {
@@ -52,7 +69,9 @@ function kindLabel(k) {
 async function loadProviders() {
   try {
     providers.value = (await getMailProviders()).providers || []
-  } catch (_) { /* 拿不到就退化成显示原始 kind 字符串 */ }
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 async function load(resetPage) {
@@ -77,36 +96,71 @@ async function load(resetPage) {
   }
 }
 
-function afterMutate() { load(); statsStore.refresh() }
+function afterMutate() {
+  load()
+  statsStore.refresh()
+}
 
 async function confirm(msg, title = '确认') {
-  try { await ElMessageBox.confirm(msg, title, { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' }); return true }
-  catch (_) { return false }
+  try {
+    await ElMessageBox.confirm(msg, title, {
+      type: 'warning',
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+    })
+    return true
+  } catch (_) {
+    return false
+  }
 }
 
 async function resetFailedAll() {
   if (!(await confirm('把所有 failed 号重置为 available？'))) return
-  try { const r = await resetFailed(); ElMessage.success(`重置 ${r.reset} 个`); afterMutate() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    const r = await resetFailed()
+    ElMessage.success(`重置 ${r.reset} 个`)
+    afterMutate()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function releaseStaleAll() {
-  try { const r = await releaseStale(); ElMessage.success(`释放 ${r.released} 个卡死号`); afterMutate() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    const r = await releaseStale()
+    ElMessage.success(`释放 ${r.released} 个卡死号`)
+    afterMutate()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function resetSelected() {
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) return
   if (!(await confirm(`重置选中的 ${emails.length} 个号为 available？（已保存凭证不变）`))) return
-  try { const r = await bulkResetAccounts(emails); ElMessage.success(`已重置 ${r.reset} 个`); afterMutate() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    const r = await bulkResetAccounts(emails)
+    ElMessage.success(`已重置 ${r.reset} 个`)
+    afterMutate()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function deleteSelected() {
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) return
   if (!(await confirm(`确定删除选中的 ${emails.length} 个号？(不可恢复)`))) return
-  try { const r = await bulkDeleteAccounts({ emails }); ElMessage.success(`已删除 ${r.deleted} 个`); afterMutate() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    const r = await bulkDeleteAccounts({ emails })
+    ElMessage.success(`已删除 ${r.deleted} 个`)
+    afterMutate()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function moveSelectedToGroup(groupName) {
   if (groupName === '__manage__') {
     groupManagerVisible.value = true
@@ -119,12 +173,17 @@ async function moveSelectedToGroup(groupName) {
     const r = await setAccountsGroup(emails, groupName)
     ElMessage.success(`已更新 ${r.updated} 个邮箱的分组`)
     afterMutate()
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function addGroup() {
   try {
     const { value } = await ElMessageBox.prompt('分组可先为空，之后再移动账号进去。', '新增分组', {
-      inputPlaceholder: '例如：8月采购', confirmButtonText: '新增', cancelButtonText: '取消',
+      inputPlaceholder: '例如：8月采购',
+      confirmButtonText: '新增',
+      cancelButtonText: '取消',
       inputValidator: (v) => String(v || '').trim().length > 0 || '分组名称不能为空',
     })
     await createAccountGroup(value.trim())
@@ -134,10 +193,13 @@ async function addGroup() {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
   }
 }
+
 async function renameGroup(group) {
   try {
     const { value } = await ElMessageBox.prompt('账号会保留在改名后的分组。', '重命名分组', {
-      inputValue: group.name, confirmButtonText: '保存', cancelButtonText: '取消',
+      inputValue: group.name,
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
       inputValidator: (v) => String(v || '').trim().length > 0 || '分组名称不能为空',
     })
     const r = await renameAccountGroup(group.name, value.trim())
@@ -148,41 +210,63 @@ async function renameGroup(group) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
   }
 }
+
 async function removeGroup(group) {
-  if (!(await confirm(`删除分组“${group.name}”？其中 ${group.total} 个账号会保留并归入未分组。`, '删除分组'))) return
+  if (
+    !(await confirm(`删除分组“${group.name}”？其中 ${group.total} 个账号会保留并归入未分组。`, '删除分组'))
+  )
+    return
   try {
     const r = await deleteAccountGroup(group.name)
     if (groupFilter.value === group.name) groupFilter.value = ''
     ElMessage.success(`已删除分组，${r.ungrouped} 个账号归入未分组`)
     afterMutate()
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
-async function bulkDeleteByStatus() {
-  if (!bulkStatus.value) { ElMessage.warning('请先选择要删除的状态'); return }
-  const tip = bulkStatus.value === 'all'
-    ? '这会删除邮箱列表里所有号（含未注册的），确定？'
-    : `确定删除全部 ${bulkStatus.value} 状态的号？`
+
+async function bulkDeleteByStatus(statusVal) {
+  const tip =
+    statusVal === 'all'
+      ? '这会删除邮箱列表里所有号（含未注册的），确定？'
+      : `确定删除全部 ${statusVal} 状态的号？`
   if (!(await confirm(tip))) return
   try {
-    const r = await bulkDeleteAccounts({ status: bulkStatus.value })
-    ElMessage.success(`已删除 ${r.deleted} 个 ${bulkStatus.value} 号`)
-    bulkStatus.value = ''
+    const r = await bulkDeleteAccounts({ status: statusVal })
+    ElMessage.success(`已删除 ${r.deleted} 个 ${statusVal} 号`)
     afterMutate()
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 function useAccount(email) {
   router.push({ path: '/register', query: { email } })
 }
+
 async function resetOne(email) {
   if (!(await confirm(`重置 ${email} 为 available？`))) return
-  try { await resetAccount(email); ElMessage.success('已重置'); afterMutate() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    await resetAccount(email)
+    ElMessage.success('已重置')
+    afterMutate()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function deleteOne(email) {
   if (!(await confirm(`删除 ${email}？`))) return
-  try { await deleteAccount(email); ElMessage.success('已删除'); afterMutate() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    await deleteAccount(email)
+    ElMessage.success('已删除')
+    afterMutate()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
 }
+
 async function enterPassword(row) {
   try {
     const { value } = await ElMessageBox.prompt(
@@ -211,144 +295,624 @@ watch(dataVersion, () => load())
 onActivated(() => load())
 loadProviders()
 </script>
-<template>
-  <div class="page">
-    <el-card shadow="never">
-      <template #header>
-        <span class="section-title" style="margin: 0">邮箱列表</span>
-      </template>
 
-      <el-space wrap style="margin-bottom: 12px">
-        <el-select v-model="statusFilter" placeholder="全部" style="width: 130px" @change="load(true)">
-          <el-option label="全部" value="" />
-          <el-option label="available" value="available" />
-          <el-option label="in_use" value="in_use" />
-          <el-option label="done" value="done" />
-          <el-option label="failed" value="failed" />
-        </el-select>
-        <!-- 号池混放多种邮箱时才有意义，只有一种来源就不显示 -->
+<template>
+  <div class="page-container">
+    <!-- Hero KPI Metrics Grid -->
+    <div class="hero-kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">邮箱总数</span>
+          <Icon icon="lucide:mail" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val">{{ stats.total || 0 }}</div>
+          <div class="kpi-hint">系统当前导入的待注册/已注册邮箱</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item"><i class="dot dot-success" /> 可用: {{ stats.available || 0 }}</span>
+          <span class="kpi-sub-item"><i class="dot dot-warning" /> 占用: {{ stats.in_use || 0 }}</span>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">已完成注册</span>
+          <Icon icon="lucide:check-circle-2" class="kpi-type-icon text-success" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val text-success">{{ stats.done || 0 }}</div>
+          <div class="kpi-hint">已转为已注册账号托管</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item">
+            完成率: {{ stats.total ? Math.round(((stats.done || 0) / stats.total) * 100) : 0 }}%
+          </span>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">失败或异常</span>
+          <Icon icon="lucide:alert-circle" class="kpi-type-icon text-danger" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val text-danger">{{ stats.failed || 0 }}</div>
+          <div class="kpi-hint">支持一键重置为 available 重跑</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item"><i class="dot dot-danger" /> 待重置: {{ stats.failed || 0 }}</span>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">分组及来源分类</span>
+          <Icon icon="lucide:folder-tree" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val text-primary">{{ groups.length }} <span style="font-size: 14px; font-weight: normal; color: var(--el-text-color-secondary)">个分组</span></div>
+          <div class="kpi-hint">{{ kindOptions.length > 1 ? `${kindOptions.length} 种邮箱协议混放` : '单一协议邮箱池' }}</div>
+        </div>
+        <div class="kpi-footer">
+          <el-button link size="small" type="primary" @click="groupManagerVisible = true">管理分组</el-button>
+          <el-button link size="small" @click="router.push('/import')">导入新号</el-button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Segment Filter Bar -->
+    <div class="filter-segment-bar">
+      <div class="segment-tabs">
+        <button
+          v-for="item in statusTabs"
+          :key="item.value"
+          class="segment-tab-btn"
+          :class="{ active: statusFilter === item.value }"
+          @click="statusFilter = item.value; load(true)"
+        >
+          <Icon :icon="item.icon" class="tab-icon" />
+          <span>{{ item.label }}</span>
+        </button>
+      </div>
+
+      <div class="filter-selectors">
+        <!-- Mail Provider Source Select -->
         <el-select
           v-if="kindOptions.length > 1"
-          v-model="kindFilter" placeholder="全部来源" style="width: 190px" @change="load(true)"
+          v-model="kindFilter"
+          placeholder="全部来源"
+          size="small"
+          style="width: 170px"
+          @change="load(true)"
         >
           <el-option label="全部来源" value="" />
           <el-option
-            v-for="o in kindOptions" :key="o.kind"
-            :label="`${o.label} (${o.count})`" :value="o.kind"
+            v-for="o in kindOptions"
+            :key="o.kind"
+            :label="`${o.label} (${o.count})`"
+            :value="o.kind"
           />
         </el-select>
-        <el-select v-model="groupFilter" style="width: 170px" @change="load(true)">
+
+        <!-- Group Selector -->
+        <el-select v-model="groupFilter" size="small" style="width: 170px" @change="load(true)">
           <el-option label="全部分组" value="__all__" />
           <el-option label="未分组" value="" />
           <el-option
-            v-for="g in groups.filter((g) => g.name)" :key="g.name"
-            :label="`${g.name} (${g.total})`" :value="g.name"
+            v-for="g in groups.filter((g) => g.name)"
+            :key="g.name"
+            :label="`${g.name} (${g.total})`"
+            :value="g.name"
           />
         </el-select>
-        <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
-        <el-button @click="resetFailedAll">重试 failed</el-button>
-        <el-button @click="releaseStaleAll">释放卡死号</el-button>
-      </el-space>
 
-      <el-space wrap style="margin-bottom: 12px">
-        <el-button type="primary" plain :disabled="!selected.length" @click="resetSelected">
-          重置选中 ({{ selected.length }})
+        <el-button size="small" class="refresh-btn" :loading="loading" @click="load(false)">
+          <Icon icon="lucide:refresh-cw" />
         </el-button>
-        <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
-          删除选中 ({{ selected.length }})
-        </el-button>
-        <el-dropdown trigger="click" :disabled="!selected.length" @command="moveSelectedToGroup">
-          <el-button plain :disabled="!selected.length">
-            移动分组 ({{ selected.length }})<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+      </div>
+    </div>
+
+    <!-- Main Table & Actions Card -->
+    <el-card shadow="never" class="main-card">
+      <!-- Toolbar Section -->
+      <div class="workflow-action-bar">
+        <div class="action-left">
+          <el-button type="primary" plain :disabled="!selected.length" @click="resetSelected" class="action-btn">
+            <Icon icon="lucide:refresh-ccw" class="btn-icon" /> 重置选中 ({{ selected.length }})
           </el-button>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item command="__ungrouped__">移动到未分组</el-dropdown-item>
-              <el-dropdown-item v-for="g in groups" :key="g.name" :command="g.name">
-                移动到 {{ g.name }}
-              </el-dropdown-item>
-              <el-dropdown-item divided command="__manage__">
-                管理分组
-              </el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
-        <el-button plain @click="groupManagerVisible = true">编辑分组</el-button>
-        <el-select v-model="bulkStatus" placeholder="— 按状态批量删 —" style="width: 180px">
-          <el-option label="删全部 failed" value="failed" />
-          <el-option label="删全部 done" value="done" />
-          <el-option label="删全部 available" value="available" />
-          <el-option label="删全部 in_use" value="in_use" />
-          <el-option label="删全部（危险）" value="all" />
-        </el-select>
-        <el-button @click="bulkDeleteByStatus">执行</el-button>
-      </el-space>
 
-      <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
+          <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected" class="action-btn">
+            <Icon icon="lucide:trash-2" class="btn-icon" /> 删除选中 ({{ selected.length }})
+          </el-button>
+
+          <el-dropdown trigger="click" :disabled="!selected.length" @command="moveSelectedToGroup">
+            <el-button plain :disabled="!selected.length" class="action-btn">
+              <Icon icon="lucide:folder-input" class="btn-icon" /> 移动分组
+              <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="__ungrouped__">移动到未分组</el-dropdown-item>
+                <el-dropdown-item v-for="g in groups" :key="g.name" :command="g.name">
+                  移动到 {{ g.name }}
+                </el-dropdown-item>
+                <el-dropdown-item divided command="__manage__">
+                  <Icon icon="lucide:settings" style="margin-right: 4px" /> 管理分组
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+
+          <el-button @click="resetFailedAll" class="action-btn">
+            <Icon icon="lucide:rotate-ccw" class="btn-icon" /> 一键重置 Failed
+          </el-button>
+
+          <el-button @click="releaseStaleAll" class="action-btn">
+            <Icon icon="lucide:unlock" class="btn-icon" /> 释放卡死号
+          </el-button>
+        </div>
+
+        <div class="action-right">
+          <el-dropdown @command="bulkDeleteByStatus">
+            <el-button type="danger" plain size="small" class="action-btn">
+              <Icon icon="lucide:trash" class="btn-icon" /> 批量按状态清理
+              <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="failed">删除全部 failed 邮箱</el-dropdown-item>
+                <el-dropdown-item command="done">删除全部 done 邮箱</el-dropdown-item>
+                <el-dropdown-item command="available">删除全部 available 邮箱</el-dropdown-item>
+                <el-dropdown-item command="in_use">删除全部 in_use 邮箱</el-dropdown-item>
+                <el-dropdown-item divided command="all" style="color: var(--el-color-danger)">
+                  删除全部邮箱（清空池）
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+      </div>
+
+      <!-- Account Table -->
       <el-table
-        v-else
-        v-loading="loading" :data="rows" size="small" stripe
+        v-loading="loading"
+        :data="rows"
+        style="width: 100%; margin-top: 12px"
+        height="600"
+        row-key="email"
+        class="modern-table"
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="44" />
-        <el-table-column prop="email" label="邮箱" min-width="220" show-overflow-tooltip />
-        <el-table-column label="分组" width="130" show-overflow-tooltip>
+        <el-table-column type="selection" width="46" align="center" />
+
+        <el-table-column prop="email" label="邮箱地址" min-width="260">
           <template #default="{ row }">
-            <el-tag v-if="row.group_name" size="small">{{ row.group_name }}</el-tag>
-            <span v-else class="hint">未分组</span>
+            <div class="account-cell">
+              <div class="email-row">
+                <span class="email-text">{{ row.email }}</span>
+                <el-button link size="small" class="mini-copy-btn" @click="copyText(row.email)" title="复制邮箱">
+                  <Icon icon="lucide:copy" />
+                </el-button>
+              </div>
+              <div class="meta-row">
+                <span v-if="row.group_name" class="meta-tag group-tag">
+                  <Icon icon="lucide:folder" style="font-size: 11px" /> {{ row.group_name }}
+                </span>
+                <span v-else class="meta-tag ungrouped-tag">未分组</span>
+                <span v-if="kindOptions.length > 1" class="meta-tag source-tag">
+                  {{ kindLabel(row.kind) }}
+                </span>
+              </div>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column v-if="kindOptions.length > 1" label="来源" width="130">
+
+        <el-table-column label="状态" width="130">
           <template #default="{ row }">
-            <el-tag size="small" type="info">{{ kindLabel(row.kind) }}</el-tag>
+            <el-tag
+              v-if="row.status === 'available'"
+              type="success"
+              effect="plain"
+              class="status-badge"
+            >
+              <i class="dot dot-success" /> 可用 available
+            </el-tag>
+            <el-tag
+              v-else-if="row.status === 'in_use'"
+              type="warning"
+              effect="plain"
+              class="status-badge"
+            >
+              <i class="dot dot-warning" /> 占用 in_use
+            </el-tag>
+            <el-tag
+              v-else-if="row.status === 'done'"
+              type="primary"
+              effect="plain"
+              class="status-badge"
+            >
+              <i class="dot dot-primary" /> 完成 done
+            </el-tag>
+            <el-tag
+              v-else-if="row.status === 'failed'"
+              type="danger"
+              effect="plain"
+              class="status-badge"
+            >
+              <i class="dot dot-danger" /> 失败 failed
+            </el-tag>
+            <el-tag v-else type="info" effect="plain" class="status-badge">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="110">
+
+        <el-table-column prop="fail_reason" label="失败原因 / 备注" min-width="220" show-overflow-tooltip>
           <template #default="{ row }">
-            <StatusDot :type="STATUS_TYPE[row.status] || 'info'" :text="row.status" />
+            <span v-if="row.fail_reason" class="error-reason text-danger">
+              <Icon icon="lucide:alert-circle" /> {{ row.fail_reason }}
+            </span>
+            <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="fail_reason" label="失败原因" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="280" fixed="right">
+
+        <el-table-column label="操作" width="220" fixed="right" align="center">
           <template #default="{ row }">
-            <el-button size="small" text @click="useAccount(row.email)">使用</el-button>
-            <el-button size="small" text type="primary" @click="enterPassword(row)">录入密码</el-button>
+            <el-button size="small" text type="primary" @click="useAccount(row.email)">
+              测试单注册
+            </el-button>
+            <el-button size="small" text @click="enterPassword(row)">
+              录入密码
+            </el-button>
             <el-button
               v-if="row.status === 'done' || row.status === 'failed'"
-              size="small" text type="primary" @click="resetOne(row.email)"
-            >重置</el-button>
-            <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+              size="small"
+              text
+              type="primary"
+              @click="resetOne(row.email)"
+            >
+              重置
+            </el-button>
+            <el-button size="small" text type="danger" @click="deleteOne(row.email)">
+              删除
+            </el-button>
           </template>
         </el-table-column>
+
         <template #empty>
-          <el-empty description="暂无数据，去「导入邮箱」添加接码号" :image-size="70" />
+          <el-empty description="暂无数据，可前往「批量导入」添加邮箱" :image-size="70" />
         </template>
       </el-table>
 
-      <div style="display: flex; justify-content: center; margin-top: 14px">
+      <!-- Pagination -->
+      <div class="pagination-footer">
         <el-pagination
-          v-model:current-page="page" :page-size="PAGE_SIZE" :total="total"
-          layout="prev, pager, next, total" background
+          v-model:current-page="page"
+          :page-size="PAGE_SIZE"
+          :total="total"
+          layout="total, prev, pager, next, jumper"
+          background
         />
       </div>
     </el-card>
 
-    <el-dialog v-model="groupManagerVisible" title="编辑分组" width="min(620px, 92vw)" top="10vh">
-      <div style="display: flex; justify-content: flex-end; margin-bottom: 12px">
-        <el-button type="primary" @click="addGroup">新增分组</el-button>
+    <!-- Group Management Dialog -->
+    <el-dialog v-model="groupManagerVisible" title="分组管理" width="min(600px, 92vw)" append-to-body>
+      <div class="group-dialog-header">
+        <span class="text-muted" style="font-size: 13px">管理已创建的账号分组与容量</span>
+        <el-button type="primary" size="small" @click="addGroup">
+          <Icon icon="lucide:plus" style="margin-right: 4px" /> 新增分组
+        </el-button>
       </div>
-      <el-table :data="groups" size="small" border>
-        <el-table-column prop="name" label="分组名称" min-width="220" />
-        <el-table-column prop="total" label="账号数" width="100" />
-        <el-table-column prop="available" label="可用" width="100" />
-        <el-table-column label="操作" width="160">
+
+      <el-table :data="groups" size="small" border class="modern-table" style="margin-top: 12px">
+        <el-table-column prop="name" label="分组名称" min-width="180">
+          <template #default="{ row }">
+            <span class="group-name-text">{{ row.name }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="total" label="总账号数" width="90" align="center" />
+        <el-table-column prop="available" label="可用数" width="90" align="center">
+          <template #default="{ row }">
+            <span class="text-success">{{ row.available }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="140" align="center">
           <template #default="{ row }">
             <el-button size="small" text type="primary" @click="renameGroup(row)">改名</el-button>
             <el-button size="small" text type="danger" @click="removeGroup(row)">删除</el-button>
           </template>
         </el-table-column>
-        <template #empty><el-empty description="还没有自定义分组" :image-size="54" /></template>
+        <template #empty>
+          <el-empty description="还没有自定义分组" :image-size="50" />
+        </template>
       </el-table>
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.page-container {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Hero KPI Grid */
+.hero-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.kpi-card {
+  background: var(--el-bg-color-overlay, #ffffff);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: var(--app-radius-md);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--app-shadow-sm);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.kpi-card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--app-shadow-md);
+}
+
+.kpi-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.kpi-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.kpi-type-icon {
+  font-size: 18px;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.kpi-body {
+  margin-bottom: 8px;
+}
+
+.kpi-val {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--el-text-color-primary, #303133);
+  line-height: 1.2;
+}
+
+.kpi-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary, #909399);
+  margin-top: 4px;
+}
+
+.kpi-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--el-text-color-regular, #606266);
+  border-top: 1px dashed var(--el-border-color-lighter, #ebeef5);
+  padding-top: 8px;
+  margin-top: auto;
+}
+
+.kpi-sub-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-primary { background-color: var(--el-color-primary, #409eff); }
+.dot-success { background-color: var(--el-color-success, #67c23a); }
+.dot-warning { background-color: var(--el-color-warning, #e6a23c); }
+.dot-danger { background-color: var(--el-color-danger, #f56c6c); }
+
+.text-primary { color: var(--el-color-primary, #409eff); }
+.text-success { color: var(--el-color-success, #67c23a); }
+.text-warning { color: var(--el-color-warning, #e6a23c); }
+.text-danger { color: var(--el-color-danger, #f56c6c); }
+.text-muted { color: var(--el-text-color-secondary, #909399); }
+
+/* Segment Filter Bar */
+.filter-segment-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--el-bg-color-overlay, #ffffff);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: var(--app-radius-md);
+  padding: 6px 12px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.segment-tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.segment-tab-btn {
+  border: none;
+  background: transparent;
+  padding: 6px 12px;
+  border-radius: var(--app-radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-regular, #606266);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s;
+}
+
+.segment-tab-btn:hover {
+  background: var(--el-fill-color-light, #f5f7fa);
+  color: var(--el-color-primary, #409eff);
+}
+
+.segment-tab-btn.active {
+  background: var(--el-color-primary-light-9, #ecf5ff);
+  color: var(--el-color-primary, #409eff);
+  font-weight: 600;
+}
+
+.tab-icon {
+  font-size: 14px;
+}
+
+.filter-selectors {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.refresh-btn {
+  padding: 8px;
+}
+
+/* Workflow Action Bar */
+.main-card {
+  border-radius: var(--app-radius-md);
+}
+
+.workflow-action-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter, #ebeef5);
+}
+
+.action-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-icon {
+  font-size: 14px;
+}
+
+/* Table cells */
+.account-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.email-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.email-text {
+  font-family: var(--el-font-family-monospace, monospace);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--el-text-color-primary, #303133);
+}
+
+.mini-copy-btn {
+  padding: 0;
+  height: auto;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.mini-copy-btn:hover {
+  color: var(--el-color-primary, #409eff);
+}
+
+.meta-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.meta-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--app-radius-xs);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.group-tag {
+  background: var(--el-color-primary-light-9, #ecf5ff);
+  color: var(--el-color-primary, #409eff);
+  border: 1px solid var(--el-color-primary-light-7, #b3d8ff);
+}
+
+.ungrouped-tag {
+  background: var(--el-fill-color-light, #f5f7fa);
+  color: var(--el-text-color-secondary, #909399);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+}
+
+.source-tag {
+  background: var(--el-fill-color-light, #f5f7fa);
+  color: var(--el-text-color-regular, #606266);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+
+.error-reason {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.pagination-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.group-dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.group-name-text {
+  font-weight: 600;
+}
+</style>

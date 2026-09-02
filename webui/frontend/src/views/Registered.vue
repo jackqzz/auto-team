@@ -2,6 +2,7 @@
 import { computed, onActivated, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Icon } from '@iconify/vue'
 import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
@@ -667,29 +668,86 @@ watch(dataVersion, () => load())
 onActivated(() => load())
 </script>
 <template>
-  <div class="page">
-    <el-card shadow="never">
-      <template #header><span class="section-title" style="margin: 0">注册结果</span></template>
+  <div class="page-container">
+    <!-- Hero Summary Header -->
+    <div class="hero-kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">已注册账号</span>
+          <Icon icon="lucide:users" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val">{{ total }}</div>
+          <div class="kpi-hint">系统已托管注册结果总量</div>
+        </div>
+      </div>
 
-      <el-space wrap style="margin-bottom: 12px">
-        <el-button @click="load(false)"><el-icon><Refresh /></el-icon>刷新</el-button>
-        <el-button type="primary" plain @click="selectAllFiltered">全选当前筛选</el-button>
-        <input ref="sub2apiInput" type="file" accept=".json,application/json" hidden @change="onSub2ApiFile" />
-        <el-button :loading="importingSub2Api" @click="chooseSub2ApiFile">导入 Sub2API 账号</el-button>
-        <el-button @click="import2faVisible = true">导入 2FA 账号</el-button>
-        <el-select v-model="filter" style="width: 130px" @change="load(true)">
-          <el-option label="全部" value="all" />
-          <el-option label="已获取 AT" value="has_at" />
-          <el-option label="有 RT" value="has_rt" />
-          <el-option label="无 RT" value="no_rt" />
-          <el-option label="未检测" value="unchecked" />
-          <el-option label="Free" value="free" />
-          <el-option label="Plus试用生效" value="plus_active" />
-          <el-option label="可领取Plus" value="plus_eligible" />
-          <el-option label="已永久失效" value="permanently_invalid" />
-          <el-option label="凭证失效" value="token_invalid" />
-        </el-select>
-        <el-select v-model="groupFilter" style="width: 170px" @change="load(true)">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">分组统计</span>
+          <span class="kpi-dot dot-primary" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val-row">
+            <span class="kpi-val">{{ groups.length }}</span>
+            <span class="kpi-sub">个自定义分组</span>
+          </div>
+          <div class="kpi-hint">当前选择: {{ groupFilter === '__all__' ? '全部分组' : (groupFilter || '未分组') }}</div>
+        </div>
+        <div class="kpi-footer">
+          <el-button link type="primary" size="small" @click="groupManagerVisible = true">
+            <Icon icon="lucide:settings-2" style="margin-right: 4px" /> 分组管理
+          </el-button>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">选中与操作</span>
+          <span class="kpi-dot dot-warning" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val-row">
+            <span class="kpi-val">{{ selected.length }}</span>
+            <span class="kpi-sub">/ {{ total }} 选中</span>
+          </div>
+          <div class="kpi-hint">支持批量检测、移动、划分与重登录</div>
+        </div>
+        <div class="kpi-footer">
+          <el-button link type="primary" size="small" :disabled="!total" @click="selectAllFiltered">全选当前筛选</el-button>
+          <el-button link type="info" size="small" :disabled="!selected.length" @click="selected = []">清空选择</el-button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quick Segment Status Filter -->
+    <div class="filter-segment-bar">
+      <div class="segment-tabs">
+        <button
+          v-for="item in [
+            { label: '全部', value: 'all', icon: 'lucide:layers' },
+            { label: '已获取 AT', value: 'has_at', icon: 'lucide:key' },
+            { label: '有 RT', value: 'has_rt', icon: 'lucide:refresh-cw' },
+            { label: '无 RT', value: 'no_rt', icon: 'lucide:alert-circle' },
+            { label: '未检测', value: 'unchecked', icon: 'lucide:help-circle' },
+            { label: 'Free', value: 'free', icon: 'lucide:coffee' },
+            { label: 'Plus生效', value: 'plus_active', icon: 'lucide:sparkles' },
+            { label: '可领Plus', value: 'plus_eligible', icon: 'lucide:gift' },
+            { label: '永久失效', value: 'permanently_invalid', icon: 'lucide:ban' },
+            { label: '凭证失效', value: 'token_invalid', icon: 'lucide:shield-alert' }
+          ]"
+          :key="item.value"
+          class="segment-tab-btn"
+          :class="{ active: filter === item.value }"
+          @click="filter = item.value; load(true)"
+        >
+          <Icon :icon="item.icon" class="tab-icon" />
+          <span>{{ item.label }}</span>
+        </button>
+      </div>
+
+      <div class="segment-right">
+        <el-select v-model="groupFilter" placeholder="选择分组" style="width: 170px" size="default" @change="load(true)">
           <el-option label="全部分组" value="__all__" />
           <el-option label="未分组" value="" />
           <el-option
@@ -697,40 +755,61 @@ onActivated(() => load())
             :label="`${g.name} (${g.registered_total})`" :value="g.name"
           />
         </el-select>
+        <el-button :icon="Refresh" circle @click="load(false)" />
+      </div>
+    </div>
+
+    <!-- Workflow Action Toolbar -->
+    <div class="workflow-toolbar">
+      <div class="toolbar-left">
+        <input ref="sub2apiInput" type="file" accept=".json,application/json" hidden @change="onSub2ApiFile" />
+        <el-button :loading="importingSub2Api" @click="chooseSub2ApiFile">
+          <Icon icon="lucide:upload" style="margin-right: 5px" /> 导入 Sub2API
+        </el-button>
+        <el-button @click="import2faVisible = true">
+          <Icon icon="lucide:shield-check" style="margin-right: 5px" /> 导入 2FA
+        </el-button>
+
+        <el-divider direction="vertical" />
+
         <el-select
           v-model="form.proxy" filterable clearable allow-create default-first-option
           :reserve-keyword="false" placeholder="检测代理（留空直连）"
-          style="width: 260px"
+          style="width: 220px"
         >
           <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
-        <el-input-number v-model="plusCheckConcurrency" :min="1" :max="20" controls-position="right" />
-        <span class="hint">检测并发</span>
-        <el-button :loading="checking" @click="doCheck('unchecked')">检查未检测</el-button>
-        <el-button :loading="checking" @click="doCheck('all')">重新检查</el-button>
-        <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
-          检测选中 ({{ selected.length }})
-        </el-button>
-        <el-divider direction="vertical" />
-        <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
-          <el-button :loading="exporting">
-            <el-icon><Download /></el-icon>{{ exportBtnText }}
-            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+
+        <div class="concurrency-box">
+          <span class="concurrency-label">并发</span>
+          <el-input-number v-model="plusCheckConcurrency" :min="1" :max="20" controls-position="right" style="width: 80px" />
+        </div>
+
+        <el-dropdown trigger="click" @command="doCheck">
+          <el-button :loading="checking">
+            <Icon icon="lucide:search-check" style="margin-right: 4px" /> 检测 Plus
+            <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
           </el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item v-for="f in exportFormats" :key="f.id" :command="f" :divided="f.mode === 'download' && f.id === 'cpa'">
-                {{ f.label }}
-                <span v-if="f.note" class="hint" style="margin-left: 6px">{{ f.note }}</span>
+              <el-dropdown-item command="unchecked">检查当前页未检测</el-dropdown-item>
+              <el-dropdown-item command="all">重新检查当前页全部</el-dropdown-item>
+              <el-dropdown-item command="selected" :disabled="!selected.length">
+                检测选中项 ({{ selected.length }})
               </el-dropdown-item>
-              <el-dropdown-item v-if="!exportFormats.length" disabled>加载中...</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
-        <el-divider direction="vertical" />
+
+        <span v-if="checkResult" class="check-result-tag">{{ checkResult }}</span>
+      </div>
+
+      <div class="toolbar-right">
+        <!-- Batch Actions Menu -->
         <el-dropdown trigger="click" :disabled="!selected.length" @command="moveSelectedToGroup">
-          <el-button plain :disabled="!selected.length">
-            移动分组 ({{ selected.length }})<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          <el-button :disabled="!selected.length">
+            <Icon icon="lucide:folder-input" style="margin-right: 4px" /> 移动分组 ({{ selected.length }})
+            <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
           </el-button>
           <template #dropdown>
             <el-dropdown-menu>
@@ -742,315 +821,767 @@ onActivated(() => load())
             </el-dropdown-menu>
           </template>
         </el-dropdown>
-        <el-button plain @click="groupManagerVisible = true">编辑分组</el-button>
-        <el-button plain type="warning" :disabled="!selected.length" @click="openWorkspaceAssign">
-          划分到母号空间 ({{ selected.length }})
-        </el-button>
-        <el-button
-          type="success" plain :loading="pushingCpa" :disabled="!selected.length"
-          @click="pushSelectedToCpa"
-        >
-          推送 CPA ({{ selected.length }})
-        </el-button>
-        <el-button
-          type="primary" plain :loading="relogging" :disabled="!selected.length"
-          @click="reloginSelected"
-        >
-          重登录 ({{ selected.length }})
-        </el-button>
-        <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
-          删除选中 ({{ selected.length }})
-        </el-button>
-        <el-button type="danger" plain @click="deleteAll">清空全部</el-button>
-        <span class="hint">{{ checkResult }}</span>
-      </el-space>
 
-      <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
+        <el-button type="warning" plain :disabled="!selected.length" @click="openWorkspaceAssign">
+          <Icon icon="lucide:building" style="margin-right: 4px" /> 划分到母号 ({{ selected.length }})
+        </el-button>
+
+        <el-button type="success" plain :loading="pushingCpa" :disabled="!selected.length" @click="pushSelectedToCpa">
+          <Icon icon="lucide:send" style="margin-right: 4px" /> 推送 CPA ({{ selected.length }})
+        </el-button>
+
+        <el-button type="primary" plain :loading="relogging" :disabled="!selected.length" @click="reloginSelected">
+          <Icon icon="lucide:log-in" style="margin-right: 4px" /> 重登录 ({{ selected.length }})
+        </el-button>
+
+        <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
+          <el-button :loading="exporting">
+            <Icon icon="lucide:download" style="margin-right: 4px" /> {{ exportBtnText }}
+            <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-for="f in exportFormats" :key="f.id" :command="f" :divided="f.mode === 'download' && f.id === 'cpa'">
+                {{ f.label }}
+                <span v-if="f.note" class="hint" style="margin-left: 6px">{{ f.note }}</span>
+              </el-dropdown-item>
+              <el-dropdown-item v-if="!exportFormats.length" disabled>加载中...</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+
+        <el-dropdown trigger="click">
+          <el-button type="danger" plain>
+            <Icon icon="lucide:trash-2" style="margin-right: 4px" /> 清理
+            <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item :disabled="!selected.length" @click="deleteSelected">
+                <span style="color: var(--el-color-danger)">删除选中 ({{ selected.length }})</span>
+              </el-dropdown-item>
+              <el-dropdown-item divided @click="deleteAll">
+                <span style="color: var(--el-color-danger)">清空当前列表全部</span>
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </div>
+    </div>
+
+    <!-- Main Data Table -->
+    <div class="table-container">
+      <el-skeleton v-if="loading && !rows.length" :rows="8" animated style="padding: 16px" />
       <el-table
         v-else
-        v-loading="loading" :data="rows" size="small" stripe
+        v-loading="loading"
+        :data="rows"
+        size="default"
+        class="modern-table"
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="44" />
-        <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />
-        <el-table-column label="分组" width="130" show-overflow-tooltip>
+        <el-table-column type="selection" width="48" align="center" />
+
+        <!-- 账号信息复合列 -->
+        <el-table-column label="账号与分组" min-width="220">
           <template #default="{ row }">
-            <el-tag v-if="row.group_name" size="small">{{ row.group_name }}</el-tag>
-            <span v-else class="hint">未分组</span>
+            <div class="composite-cell">
+              <div class="primary-row">
+                <span class="mono-text account-email">{{ row.email }}</span>
+                <el-button
+                  size="small"
+                  text
+                  circle
+                  class="mini-copy-btn"
+                  title="复制邮箱"
+                  @click="copyText(row.email)"
+                >
+                  <Icon icon="lucide:copy" />
+                </el-button>
+              </div>
+              <div class="secondary-meta">
+                <el-tag v-if="row.group_name" size="small" type="info" effect="plain" class="group-tag">
+                  <Icon icon="lucide:folder" style="font-size: 11px; margin-right: 3px" />
+                  {{ row.group_name }}
+                </el-tag>
+                <span v-else class="sub-hint">未分组</span>
+                <span class="meta-dot">·</span>
+                <span class="time-hint">{{ fmtTime(row.created_at) }}</span>
+              </div>
+            </div>
           </template>
         </el-table-column>
+
+        <!-- 状态列 -->
         <el-table-column label="账号状态" width="130">
           <template #default="{ row }">
-            <el-tag v-if="row.account_status === 'permanently_invalid'" type="danger">已永久失效</el-tag>
-            <span v-else class="hint">正常</span>
+            <el-tag v-if="row.account_status === 'permanently_invalid'" type="danger" size="small" effect="dark">
+              已永久失效
+            </el-tag>
+            <el-tag v-else type="success" size="small" effect="plain">
+              正常
+            </el-tag>
           </template>
         </el-table-column>
-        <!-- 密码直接明文列出：随机 16 位，是登录账号的必需品，
-             藏进「查看凭证」弹窗每次都要多点两下。列表接口本来就在返回它。
-             图标放在文字**后面**：放前面会把值整体右推 27px（见 .cell-copy 注释）。 -->
-        <el-table-column label="密码" min-width="170">
+
+        <!-- 密码 -->
+        <el-table-column label="密码" min-width="160">
           <template #default="{ row }">
-            <el-button
-              v-if="row.password" size="small" text type="primary"
-              class="cell-copy mono" @click="copyText(row.password)"
-            >
-              {{ row.password }}<el-icon class="ico"><CopyDocument /></el-icon>
-            </el-button>
-            <span v-else class="hint">—</span>
+            <div v-if="row.password" class="cred-cell">
+              <span class="mono-text cred-val">{{ row.password }}</span>
+              <el-button
+                size="small"
+                text
+                circle
+                class="mini-copy-btn"
+                title="复制密码"
+                @click="copyText(row.password)"
+              >
+                <Icon icon="lucide:copy" />
+              </el-button>
+            </div>
+            <span v-else class="sub-hint">—</span>
           </template>
         </el-table-column>
-        <!-- 2FA secret 同样明文列出：它是唯一「服务端取不回」的凭证，
-             丢了这个号就永久锁死，必须一眼看见、一点就能复制。
-             min-width 必须装得下 32 位 base32：.cell 带 overflow:hidden，
-             宽度不够会**无声截断**，肉眼核对时看到的是残缺值。实测需 ~250px。 -->
-        <el-table-column label="2FA" min-width="260">
+
+        <!-- 2FA Secret -->
+        <el-table-column label="2FA Secret" min-width="200">
           <template #default="{ row }">
-            <el-button
-              v-if="row.totp_secret" size="small" text type="warning"
-              class="cell-copy mono" @click="copyText(row.totp_secret)"
-            >
-              {{ row.totp_secret }}<el-icon class="ico"><CopyDocument /></el-icon>
-            </el-button>
-            <span v-else class="hint">—</span>
+            <div v-if="row.totp_secret" class="cred-cell">
+              <span class="mono-text cred-val totp-val">{{ row.totp_secret }}</span>
+              <el-button
+                size="small"
+                text
+                circle
+                class="mini-copy-btn"
+                title="复制 2FA Secret"
+                @click="copyText(row.totp_secret)"
+              >
+                <Icon icon="lucide:copy" />
+              </el-button>
+            </div>
+            <span v-else class="sub-hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="Plus状态" width="120">
+
+        <!-- Plus 状态 -->
+        <el-table-column label="Plus 状态" width="130">
           <template #default="{ row }">
             <StatusDot v-if="plusOf(row)" :type="PLUS_TYPE[plusOf(row).status] || 'info'" :text="plusOf(row).label" />
-            <span v-else class="hint">—</span>
+            <span v-else class="sub-hint">未检测</span>
           </template>
         </el-table-column>
-        <el-table-column label="access" width="100" align="center">
+
+        <!-- Token 凭证 -->
+        <el-table-column label="凭证概况" width="210">
           <template #default="{ row }">
-            <el-button v-if="row.at_len > 0" size="small" text type="primary" @click="copyCell(row.email, 'access_token')">
-              <el-icon><CopyDocument /></el-icon>{{ row.at_len }}
-            </el-button>
-            <span v-else class="hint">—</span>
+            <div class="token-badges">
+              <span
+                class="token-badge"
+                :class="{ 'has-token': row.at_len > 0 }"
+                title="Access Token"
+                @click="row.at_len > 0 && copyCell(row.email, 'access_token')"
+              >
+                AT <span v-if="row.at_len > 0" class="token-len">{{ row.at_len }}</span>
+              </span>
+              <span
+                class="token-badge"
+                :class="{ 'has-token': row.st_len > 0 }"
+                title="Session Token"
+                @click="row.st_len > 0 && copyCell(row.email, 'session_token')"
+              >
+                ST <span v-if="row.st_len > 0" class="token-len">{{ row.st_len }}</span>
+              </span>
+              <span
+                class="token-badge"
+                :class="{ 'has-token': row.rt_len > 0 }"
+                title="Refresh Token"
+                @click="row.rt_len > 0 && copyCell(row.email, 'refresh_token')"
+              >
+                RT <span v-if="row.rt_len > 0" class="token-len">{{ row.rt_len }}</span>
+              </span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="session" width="100" align="center">
+
+        <!-- 操作 -->
+        <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
-            <el-button v-if="row.st_len > 0" size="small" text type="primary" @click="copyCell(row.email, 'session_token')">
-              <el-icon><CopyDocument /></el-icon>{{ row.st_len }}
-            </el-button>
-            <span v-else class="hint">—</span>
+            <div class="action-cell">
+              <el-button size="small" text type="primary" @click="viewCred(row.email)">凭证</el-button>
+              <el-button
+                v-if="!row.password"
+                size="small"
+                text
+                type="success"
+                @click="openPasswordEntry(row)"
+              >
+                录入
+              </el-button>
+              <el-button v-else size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
+              <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="refresh" width="100" align="center">
-          <template #default="{ row }">
-            <el-button v-if="row.rt_len > 0" size="small" text type="primary" @click="copyCell(row.email, 'refresh_token')">
-              <el-icon><CopyDocument /></el-icon>{{ row.rt_len }}
-            </el-button>
-            <span v-else class="hint">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="时间" width="160">
-          <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
-          <template #default="{ row }">
-            <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
-            <el-button
-              v-if="!row.password" size="small" text type="primary"
-              @click="openPasswordEntry(row)"
-            >录入密码</el-button>
-            <el-button v-else size="small" text type="warning" @click="openEdit(row)">编辑凭证</el-button>
-            <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
-          </template>
-        </el-table-column>
+
         <template #empty>
-          <el-empty description="暂无注册结果，去「单次注册」或「全自动批量」跑号" :image-size="70" />
+          <div class="empty-box">
+            <Icon icon="lucide:inbox" class="empty-icon" />
+            <div class="empty-title">暂无注册结果</div>
+            <div class="empty-sub">去「单次注册」或「全自动批量」跑号获取账号</div>
+          </div>
         </template>
       </el-table>
-      <div style="display: flex; justify-content: center; margin-top: 14px">
+
+      <!-- Pagination Footer -->
+      <div class="table-pagination-footer">
         <el-pagination
-          v-model:current-page="page" v-model:page-size="pageSize" :page-sizes="[20, 50, 100, 500, 1000]"
-          :total="total" layout="sizes, prev, pager, next, total" background
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          :page-sizes="[20, 50, 100, 500, 1000]"
+          :total="total"
+          layout="total, sizes, prev, pager, next, jumper"
+          background
         />
       </div>
+    </div>
 
-      <el-dialog v-model="workspaceDialog" title="划分到母号空间" width="520px">
-        <div class="hint" style="margin-bottom: 12px">这里只建立系统内候选关系，不会调用邀请或申请加入接口；同一账号可以划分到多个母号空间。</div>
-        <el-select v-model="workspaceTarget" filterable placeholder="选择母号空间" style="width: 100%">
-          <el-option v-for="item in workspaceOptions" :key="item.id" :value="item.id" :label="`${item.account} · ${item.workspace_id || '无 Workspace ID'}`" />
-        </el-select>
-        <template #footer><el-button @click="workspaceDialog = false">取消</el-button><el-button type="primary" @click="assignSelectedWorkspace">确认划分</el-button></template>
-      </el-dialog>
-
-      <el-dialog v-model="exportVisible" width="720px" top="8vh">
-        <template #header>
-          <div style="display: flex; align-items: center; gap: 12px">
-            <span style="font-weight: 600">导出 · {{ exportLabel }}</span>
-            <el-tag size="small" type="info">共 {{ exportCount }} 行</el-tag>
-          </div>
-        </template>
-        <el-input
-          :model-value="exportText" type="textarea" :rows="14" readonly
-          class="mono export-area"
+    <!-- 划分到母号空间弹窗 -->
+    <el-dialog v-model="workspaceDialog" title="划分到母号空间" width="520px" destroy-on-close>
+      <div class="modal-instruction">
+        这里只建立系统内候选关系，不会调用邀请或申请加入接口；同一账号可以划分到多个母号空间。
+      </div>
+      <el-select v-model="workspaceTarget" filterable placeholder="选择母号空间" style="width: 100%">
+        <el-option
+          v-for="item in workspaceOptions"
+          :key="item.id"
+          :value="item.id"
+          :label="`${item.account} · ${item.workspace_id || '无 Workspace ID'}`"
         />
-        <template #footer>
-          <el-button @click="copyText(exportText)">
-            <el-icon><CopyDocument /></el-icon>复制全部
-          </el-button>
-          <el-button type="primary" @click="downloadExport">
-            <el-icon><Download /></el-icon>下载 {{ exportFilename }}
-          </el-button>
-          <!-- 危险动作放最右、danger 色，和左边的纯下载拉开距离，避免手滑。
-               先下载文件、再弹二次确认，确认框里会报清楚要删哪两张表各多少条。 -->
-          <el-button
-            type="danger" plain
-            :loading="deletingExported"
-            :disabled="!exportedEmails.length"
-            @click="downloadAndDelete"
-          >
-            <el-icon><Delete /></el-icon>下载并删除这 {{ exportedEmails.length }} 个号
-          </el-button>
-        </template>
-      </el-dialog>
+      </el-select>
+      <template #footer>
+        <el-button @click="workspaceDialog = false">取消</el-button>
+        <el-button type="primary" @click="assignSelectedWorkspace">确认划分</el-button>
+      </template>
+    </el-dialog>
 
-      <el-dialog v-model="credVisible" :title="credEmail" width="760px" top="6vh">
-        <template #header>
-          <div style="display: flex; align-items: center; gap: 12px">
-            <span class="mono" style="font-weight: 600">{{ credEmail }}</span>
-            <el-button size="small" @click="copyAllJson">复制全部 JSON</el-button>
-          </div>
-        </template>
-        <div v-for="r in credRows" :key="r.key" style="margin-bottom: 12px">
-          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 4px">
-            <span class="mono" style="font-weight: 600; color: var(--dango-pink-dark)">{{ r.key }}</span>
-            <el-tag size="small" type="info">len={{ r.val.length }}</el-tag>
-            <el-button size="small" @click="copyText(r.val)">复制</el-button>
-          </div>
-          <el-input :model-value="r.val" type="textarea" :rows="2" readonly class="mono" />
+    <!-- 导出弹窗 -->
+    <el-dialog v-model="exportVisible" width="720px" top="8vh" destroy-on-close>
+      <template #header>
+        <div style="display: flex; align-items: center; gap: 12px">
+          <span style="font-weight: 600">导出 · {{ exportLabel }}</span>
+          <el-tag size="small" type="info">共 {{ exportCount }} 行</el-tag>
         </div>
-        <el-empty v-if="!credRows.length" description="无凭证字段" />
-      </el-dialog>
-
-      <!-- 手动编辑凭证：把外部已知的密码/2FA 补进来，或修正记录错误 -->
-      <el-dialog
-        v-model="editVisible" :title="editPasswordOnly ? '录入账号密码' : '编辑凭证'"
-        width="560px" top="10vh"
-      >
-        <el-alert
-          :type="editPasswordOnly ? 'info' : 'warning'" :closable="false" show-icon
-          style="margin-bottom: 16px"
-          :title="editPasswordOnly ? '补录已经在网页版创建好的密码' : '仅修改本地记录，不会同步到 OpenAI'"
-          :description="editPasswordOnly
-            ? '保存后，仅登录会优先使用这个密码和 2FA；不会修改 OpenAI 网页版密码。'
-            : '这里改密码不等于改了账号密码。填入的值会被登录流程直接使用。'"
-        />
-        <el-form label-position="top">
-          <el-form-item label="邮箱">
-            <el-input :model-value="editEmail" class="mono" disabled />
-          </el-form-item>
-          <el-form-item label="密码">
-            <el-input
-              v-model="editPassword" class="mono" type="password" show-password
-              :placeholder="editPasswordOnly ? '请输入网页版已经创建好的密码' : '留空表示该号无密码'"
-              @keyup.enter="saveEdit"
-            />
-          </el-form-item>
-          <el-form-item v-if="!editPasswordOnly" label="2FA Secret">
-            <el-input
-              v-model="editSecret" class="mono"
-              placeholder="base32，支持带空格/小写/otpauth:// 链接，会自动规范化"
-            />
-            <div class="hint" style="margin-top: 6px; line-height: 1.6">
-              服务端取不回此值，覆盖后原 secret 永久丢失。清空则该号按无 2FA 处理。
-            </div>
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <el-button @click="editVisible = false">取消</el-button>
-          <el-button type="primary" :loading="editSaving" @click="saveEdit">
-            {{ editPasswordOnly ? '保存密码' : '保存' }}
-          </el-button>
-        </template>
-      </el-dialog>
-
-      <el-dialog v-model="groupManagerVisible" title="编辑分组" width="min(660px, 92vw)" top="10vh">
-        <div style="display: flex; justify-content: flex-end; margin-bottom: 12px">
-          <el-button type="primary" @click="addGroup">新增分组</el-button>
-        </div>
-        <el-table :data="groups" size="small" border>
-          <el-table-column prop="name" label="分组名称" min-width="190" />
-          <el-table-column prop="total" label="邮箱列表" width="100" />
-          <el-table-column prop="registered_total" label="注册结果" width="100" />
-          <el-table-column label="操作" width="160">
-            <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="renameGroup(row)">改名</el-button>
-              <el-button size="small" text type="danger" @click="removeGroup(row)">删除</el-button>
-            </template>
-          </el-table-column>
-          <template #empty><el-empty description="还没有自定义分组" :image-size="54" /></template>
-        </el-table>
-      </el-dialog>
-
-      <!-- 导入 2FA 账号弹窗 -->
-      <el-dialog v-model="import2faVisible" title="导入 2FA 账号" width="680px" top="8vh">
-        <el-alert
-          type="info" :closable="false" show-icon
-          style="margin-bottom: 16px"
-          title="将已在外部注册好的账号直接导入注册结果表"
-          description="每行一个，用 ---- 分隔。支持 2 段（邮箱----密码）或 3 段（邮箱----密码----2FA）。空行和 # 开头的注释行自动跳过。导入后账号状态标记为 active。"
-        />
-        <p class="hint" style="margin-bottom: 8px">
-          格式：<code>邮箱----密码----2FA</code>（2FA 可选，支持 base32、otpauth:// 链接）
-        </p>
-        <el-input
-          v-model="import2faText"
-          type="textarea"
-          :rows="10"
-          class="mono"
-          placeholder="user@example.com----MyP@ssw0rd----JBSWY3DPEHPK3PXP&#10;user2@example.com----Pass1234"
-        />
-        <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px">
-          <el-button type="primary" :loading="importing2fa" @click="doImport2FA">导入</el-button>
-          <span class="hint" v-if="import2faLineCount">待导入 {{ import2faLineCount }} 行</span>
-          <span class="hint">{{ import2faResult }}</span>
-        </div>
-        <el-alert
-          v-if="import2faErrors.length"
-          type="error"
-          :closable="true"
-          show-icon
-          style="margin-top: 12px"
-          title="以下行不合法，整批已拒绝（注册结果表未被改动）"
-          @close="import2faErrors = []"
+      </template>
+      <el-input
+        :model-value="exportText"
+        type="textarea"
+        :rows="14"
+        readonly
+        class="mono-text export-area"
+      />
+      <template #footer>
+        <el-button @click="copyText(exportText)">
+          <Icon icon="lucide:copy" style="margin-right: 4px" /> 复制全部
+        </el-button>
+        <el-button type="primary" @click="downloadExport">
+          <Icon icon="lucide:download" style="margin-right: 4px" /> 下载 {{ exportFilename }}
+        </el-button>
+        <el-button
+          type="danger"
+          plain
+          :loading="deletingExported"
+          :disabled="!exportedEmails.length"
+          @click="downloadAndDelete"
         >
-          <ul class="err-list">
-            <li v-for="e in import2faErrors" :key="e.line">
-              <b>第 {{ e.line }} 行</b>：{{ e.error }}
-            </li>
-          </ul>
-        </el-alert>
-      </el-dialog>
-    </el-card>
+          <Icon icon="lucide:trash-2" style="margin-right: 4px" /> 下载并删除这 {{ exportedEmails.length }} 个号
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 查看凭证弹窗 -->
+    <el-dialog v-model="credVisible" :title="credEmail" width="760px" top="6vh" destroy-on-close>
+      <template #header>
+        <div style="display: flex; align-items: center; justify-content: space-between; padding-right: 20px">
+          <span class="mono-text" style="font-weight: 600; font-size: 15px">{{ credEmail }}</span>
+          <el-button size="small" type="primary" plain @click="copyAllJson">
+            <Icon icon="lucide:copy" style="margin-right: 4px" /> 复制全部 JSON
+          </el-button>
+        </div>
+      </template>
+      <div v-for="r in credRows" :key="r.key" class="cred-row-card">
+        <div class="cred-row-header">
+          <span class="mono-text cred-row-key">{{ r.key }}</span>
+          <el-tag size="small" type="info">len={{ r.val.length }}</el-tag>
+          <el-button size="small" text @click="copyText(r.val)">复制</el-button>
+        </div>
+        <el-input :model-value="r.val" type="textarea" :rows="2" readonly class="mono-text" />
+      </div>
+      <el-empty v-if="!credRows.length" description="无凭证字段" />
+    </el-dialog>
+
+    <!-- 手动编辑/录入凭证 -->
+    <el-dialog
+      v-model="editVisible"
+      :title="editPasswordOnly ? '录入账号密码' : '编辑凭证'"
+      width="560px"
+      top="10vh"
+      destroy-on-close
+    >
+      <el-alert
+        :type="editPasswordOnly ? 'info' : 'warning'"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        :title="editPasswordOnly ? '补录已经在网页版创建好的密码' : '仅修改本地记录，不会同步到 OpenAI'"
+        :description="editPasswordOnly
+          ? '保存后，仅登录会优先使用这个密码和 2FA；不会修改 OpenAI 网页版密码。'
+          : '这里改密码不等于改了账号密码。填入的值会被登录流程直接使用。'"
+      />
+      <el-form label-position="top">
+        <el-form-item label="邮箱">
+          <el-input :model-value="editEmail" class="mono-text" disabled />
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input
+            v-model="editPassword"
+            class="mono-text"
+            type="password"
+            show-password
+            :placeholder="editPasswordOnly ? '请输入网页版已经创建好的密码' : '留空表示该号无密码'"
+            @keyup.enter="saveEdit"
+          />
+        </el-form-item>
+        <el-form-item v-if="!editPasswordOnly" label="2FA Secret">
+          <el-input
+            v-model="editSecret"
+            class="mono-text"
+            placeholder="base32，支持带空格/小写/otpauth:// 链接，会自动规范化"
+          />
+          <div class="sub-hint" style="margin-top: 6px; line-height: 1.6">
+            服务端取不回此值，覆盖后原 secret 永久丢失。清空则该号按无 2FA 处理。
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="editVisible = false">取消</el-button>
+        <el-button type="primary" :loading="editSaving" @click="saveEdit">
+          {{ editPasswordOnly ? '保存密码' : '保存' }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 分组管理弹窗 -->
+    <el-dialog v-model="groupManagerVisible" title="分组管理" width="min(660px, 92vw)" top="10vh" destroy-on-close>
+      <div style="display: flex; justify-content: flex-end; margin-bottom: 12px">
+        <el-button type="primary" @click="addGroup">
+          <Icon icon="lucide:plus" style="margin-right: 4px" /> 新增分组
+        </el-button>
+      </div>
+      <el-table :data="groups" size="default" border class="modern-table">
+        <el-table-column prop="name" label="分组名称" min-width="190" />
+        <el-table-column prop="total" label="邮箱列表" width="110" align="center" />
+        <el-table-column prop="registered_total" label="注册结果" width="110" align="center" />
+        <el-table-column label="操作" width="150" align="center">
+          <template #default="{ row }">
+            <el-button size="small" text type="primary" @click="renameGroup(row)">改名</el-button>
+            <el-button size="small" text type="danger" @click="removeGroup(row)">删除</el-button>
+          </template>
+        </el-table-column>
+        <template #empty><el-empty description="还没有自定义分组" :image-size="54" /></template>
+      </el-table>
+    </el-dialog>
+
+    <!-- 导入 2FA 账号弹窗 -->
+    <el-dialog v-model="import2faVisible" title="导入 2FA 账号" width="680px" top="8vh" destroy-on-close>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        title="将已在外部注册好的账号直接导入注册结果表"
+        description="每行一个，用 ---- 分隔。支持 2 段（邮箱----密码）或 3 段（邮箱----密码----2FA）。空行和 # 开头的注释行自动跳过。导入后账号状态标记为 active。"
+      />
+      <p class="sub-hint" style="margin-bottom: 8px">
+        格式：<code>邮箱----密码----2FA</code>（2FA 可选，支持 base32、otpauth:// 链接）
+      </p>
+      <el-input
+        v-model="import2faText"
+        type="textarea"
+        :rows="10"
+        class="mono-text"
+        placeholder="user@example.com----MyP@ssw0rd----JBSWY3DPEHPK3PXP&#10;user2@example.com----Pass1234"
+      />
+      <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px">
+        <el-button type="primary" :loading="importing2fa" @click="doImport2FA">导入</el-button>
+        <span v-if="import2faLineCount" class="sub-hint">待导入 {{ import2faLineCount }} 行</span>
+        <span class="sub-hint">{{ import2faResult }}</span>
+      </div>
+      <el-alert
+        v-if="import2faErrors.length"
+        type="error"
+        :closable="true"
+        show-icon
+        style="margin-top: 12px"
+        title="以下行不合法，整批已拒绝（注册结果表未被改动）"
+        @close="import2faErrors = []"
+      >
+        <ul class="err-list">
+          <li v-for="e in import2faErrors" :key="e.line">
+            <b>第 {{ e.line }} 行</b>：{{ e.error }}
+          </li>
+        </ul>
+      </el-alert>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
-/* 表格里「点一下就复制」的明文单元格（密码 / 2FA secret）。
-   :deep 是必需的：.el-button 由 Element Plus 渲染，scoped 的属性选择器打不到它。
+.page-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+}
 
-   为什么要重置 padding —— Element Plus 有两个长得很像的类：
-     .el-button--text  （旧版 type="text"）  padding 左右为 0
-     .el-button.is-text（新版 text 属性）    继承 --small 的 5px 11px
-   我们用的是后者，于是 11px padding + 12px 图标 + 4px 间隙 = 值被整体右推 27px，
-   同列的表头和空值「—」都贴着 cell 左沿，一眼就看出错位。 */
-:deep(.el-button.cell-copy.el-button--small) {
-  padding: 0 6px 0 0;
-  height: 20px;
+/* Hero KPI Grid */
+.hero-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.kpi-card {
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-lg);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: var(--app-shadow-sm);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.kpi-card:hover {
+  box-shadow: var(--app-shadow-md);
+}
+
+.kpi-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.kpi-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.kpi-type-icon {
+  font-size: 18px;
+  color: var(--el-text-color-placeholder);
+}
+
+.kpi-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.dot-primary { background: var(--el-color-primary); }
+.dot-warning { background: var(--el-color-warning); }
+.dot-success { background: var(--el-color-success); }
+
+.kpi-body {
+  margin-bottom: 12px;
+}
+
+.kpi-val {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--el-text-color-primary);
+  line-height: 1.2;
+}
+
+.kpi-val-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.kpi-sub {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+
+.kpi-hint {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  margin-top: 4px;
+}
+
+.kpi-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+  padding-top: 10px;
+  margin-top: auto;
+}
+
+/* Filter Segment Bar */
+.filter-segment-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-md);
+  padding: 8px 12px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.segment-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.segment-tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--app-radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.segment-tab-btn:hover {
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-primary);
+}
+
+.segment-tab-btn.active {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  border-color: var(--el-color-primary-light-5);
+  font-weight: 600;
+}
+
+.tab-icon {
+  font-size: 14px;
+}
+
+.segment-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Workflow Toolbar */
+.workflow-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-md);
+  padding: 10px 14px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.toolbar-left, .toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.concurrency-box {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--el-fill-color-light);
+  border-radius: var(--app-radius-sm);
+  padding: 2px 6px;
+}
+
+.concurrency-label {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.check-result-tag {
+  font-size: 12px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  padding: 3px 8px;
+  border-radius: var(--app-radius-xs);
+}
+
+/* Table Container */
+.table-container {
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-lg);
+  overflow: hidden;
+  box-shadow: var(--app-shadow-sm);
+}
+
+.modern-table {
+  width: 100%;
+}
+
+.composite-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.primary-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mono-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.account-email {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+}
+
+.secondary-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
 }
-/* 图标默认透明但**保留占位**：用 opacity 而不是 display:none，
-   否则 hover 时图标撑开宽度会把文字挤得左右抖。 */
-:deep(.cell-copy .ico) {
-  margin-left: 5px;
-  opacity: 0;
-  transition: opacity 0.12s;
+
+.group-tag {
+  font-size: 11px;
 }
-:deep(.cell-copy:hover .ico) { opacity: 0.65; }
+
+.meta-dot {
+  color: var(--el-text-color-placeholder);
+}
+
+.time-hint, .sub-hint {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+}
+
+.mini-copy-btn {
+  padding: 2px;
+  height: 20px;
+  width: 20px;
+  color: var(--el-text-color-secondary);
+}
+
+.mini-copy-btn:hover {
+  color: var(--el-color-primary);
+}
+
+.cred-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cred-val {
+  font-size: 12px;
+  color: var(--el-text-color-regular);
+}
+
+.totp-val {
+  color: var(--el-color-warning-dark-2);
+}
+
+/* Token Badges */
+.token-badges {
+  display: flex;
+  gap: 6px;
+}
+
+.token-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: var(--app-radius-xs);
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-placeholder);
+  cursor: default;
+  transition: all 0.15s;
+}
+
+.token-badge.has-token {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  cursor: pointer;
+}
+
+.token-badge.has-token:hover {
+  background: var(--el-color-primary-light-8);
+}
+
+.token-len {
+  font-size: 10px;
+  font-weight: 400;
+  opacity: 0.8;
+}
+
+.action-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.table-pagination-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px 16px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.modal-instruction {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+
+.cred-row-card {
+  margin-bottom: 12px;
+}
+
+.cred-row-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.cred-row-key {
+  font-weight: 600;
+  color: var(--el-color-primary);
+  font-size: 13px;
+}
+
 .err-list {
   margin: 6px 0 0;
   padding-left: 18px;
@@ -1058,10 +1589,34 @@ onActivated(() => load())
   overflow-y: auto;
   line-height: 1.7;
 }
+
+.empty-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 0;
+}
+
+.empty-icon {
+  font-size: 48px;
+  color: var(--el-text-color-placeholder);
+  margin-bottom: 8px;
+}
+
+.empty-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--el-text-color-regular);
+}
+
+.empty-sub {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  margin-top: 4px;
+}
 </style>
 
-<!-- 非 scoped：ElMessageBox 是挂到 body 上的，不在本组件的 scope 属性范围内，
-     scoped 样式打不到它。只作用在自家 customClass 上，不会污染别处的确认框。 -->
 <style>
 .confirm-multiline .el-message-box__message { white-space: pre-line; }
 </style>

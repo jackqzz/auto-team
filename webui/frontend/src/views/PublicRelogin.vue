@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Icon } from '@iconify/vue'
 import {
   checkPublicRelogin,
   getPublicReloginQueueStatus,
@@ -1209,199 +1210,317 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="page">
-    <el-card shadow="never">
-      <template #header>
-        <span class="section-title" style="margin:0">公开 401 重登录</span>
-      </template>
-      <p class="hint">导入 sub2api / cpa JSON 后，在浏览器内完成解析、检查 401、密码 + 2FA 重登录和下载。</p>
+  <div class="page-container">
+    <!-- Hero KPI Metrics Grid -->
+    <div class="hero-kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">导入账号总数</span>
+          <Icon icon="lucide:users" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val">{{ statusCount.total }}</div>
+          <div class="kpi-hint">浏览器端暂存会话数据</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item"><i class="dot dot-success" /> 正常: {{ statusCount.active }}</span>
+          <span class="kpi-sub-item"><i class="dot dot-info" /> 复活: {{ statusCount.revived }}</span>
+        </div>
+      </div>
 
-      <div class="toolbar">
-        <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="handleFile" />
-        <el-button :loading="loading" @click="openFile">导入 JSON</el-button>
-        <el-button :loading="checking" type="primary" @click="doCheck">检查额度 / 401</el-button>
-        <el-button :loading="relogining" type="success" @click="doRelogin(true)">一键重新登录</el-button>
-        <el-button @click="poolPushDrawerVisible = true">
-          <el-icon><Upload /></el-icon>
-          自动号池推送
-        </el-button>
-        <el-button :type="aliveOnly ? 'primary' : 'default'" @click="aliveOnly = !aliveOnly">
-          仅查看存活账号
-        </el-button>
-        <el-checkbox v-model="sub2RefreshOauth" :disabled="loading || downloading">
-          导出 Sub2 前用 RT 刷新 OAuth
-        </el-checkbox>
-        <el-tooltip placement="top" content="关闭：直接使用现有 AT/ID，不请求 OAuth；开启：每个账号用 RT 换取新的 Codex AT/ID/RT，适合修复历史混合凭证">
-          <span class="hint" style="cursor: help">ⓘ</span>
-        </el-tooltip>
-        <el-checkbox v-model="plainCredentialMode" :disabled="loading || downloading">
-          导入/导出密码和 2FA 不加密
-        </el-checkbox>
-        <el-dropdown>
-          <el-button :loading="downloading">
-            下载
-            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">异常与停用</span>
+          <Icon icon="lucide:alert-triangle" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val text-warning">{{ statusCount.unauthorized + statusCount.deactivated }}</div>
+          <div class="kpi-hint">需要重登录或已失效账号</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item"><i class="dot dot-warning" /> 401未授权: {{ statusCount.unauthorized }}</span>
+          <span class="kpi-sub-item"><i class="dot dot-danger" /> 停用: {{ statusCount.deactivated }}</span>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">定时巡检状态</span>
+          <Icon icon="lucide:timer" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val" :class="inspectionRunning ? 'text-success' : 'text-muted'">
+            {{ inspectionRunning ? '运行中' : '未启动' }}
+          </div>
+          <div class="kpi-hint" v-if="inspectionRunning">
+            下一轮: {{ inspectionCountdown }} (已完成 {{ inspectionRound }} 批)
+          </div>
+          <div class="kpi-hint" v-else>周期巡检检测 401 并自动复活</div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item">批次: {{ inspectionBatchSize }} 个 / {{ inspectionIntervalMinutes }} 分钟</span>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">号池推送服务</span>
+          <Icon icon="lucide:cloud-upload" class="kpi-type-icon" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val" :class="poolPushConfig.autoEnabled ? 'text-primary' : 'text-muted'">
+            {{ poolPushConfig.autoEnabled ? '已开启' : '未开启' }}
+          </div>
+          <div class="kpi-hint">
+            目标: {{ enabledPoolTargetNames.join(' + ') || '未配置目标' }}
+          </div>
+        </div>
+        <div class="kpi-footer">
+          <span class="kpi-sub-item"><i class="dot dot-success" /> 成功: {{ poolPushStats.success }}</span>
+          <span class="kpi-sub-item"><i class="dot dot-danger" /> 失败: {{ poolPushStats.failed }}</span>
+          <span v-if="poolPushStats.queued || poolPushStats.running" class="kpi-sub-item"><i class="dot dot-primary" /> 队列: {{ poolPushStats.queued + poolPushStats.running }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Queue & Notice Strip -->
+    <div class="queue-status-card">
+      <div class="queue-left">
+        <div class="queue-title-badge">
+          <Icon icon="lucide:activity" />
+          <span>并发队列状态</span>
+        </div>
+        <div class="queue-items">
+          <div v-for="item in queueItems" :key="item.name" class="queue-chip" :class="{ 'chip-full': item.full, 'chip-warn': item.waiting > 0 }">
+            <span class="chip-name">{{ item.name }}</span>
+            <span class="chip-metric">运行 <b>{{ item.running }}</b>/{{ item.concurrency }}</span>
+            <span class="chip-metric">等待 <b>{{ item.waiting }}</b>/{{ item.capacity }}</span>
+            <span class="chip-metric">余量 {{ item.available }}</span>
+          </div>
+        </div>
+      </div>
+      <div class="queue-right">
+        <span class="proxy-tag">
+          <Icon icon="lucide:network" />
+          系统代理池: {{ proxyStore.count }} 条
+        </span>
+      </div>
+    </div>
+
+    <!-- Main Table & Actions Card -->
+    <el-card shadow="never" class="main-card">
+      <!-- Toolbar Section -->
+      <div class="workflow-action-bar">
+        <div class="action-left">
+          <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="handleFile" />
+
+          <el-button :loading="loading" @click="openFile" class="action-btn">
+            <Icon icon="lucide:folder-open" class="btn-icon" /> 导入 JSON
           </el-button>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item @click="download('cpa', 'all')">导出 CPA 格式（存活账号）</el-dropdown-item>
-              <el-dropdown-item @click="download('sub2api', 'all')">导出 Sub2API 格式（存活账号）</el-dropdown-item>
-              <el-dropdown-item @click="download('password2fa', 'all')">导出 账号----密码----2FA（存活账号）</el-dropdown-item>
-              <el-dropdown-item divided @click="download('cpa', 'revived')">导出 CPA 格式（仅复活项）</el-dropdown-item>
-              <el-dropdown-item @click="download('sub2api', 'revived')">导出 Sub2API 格式（仅复活项）</el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
+
+          <el-button :loading="checking" type="primary" @click="doCheck" class="action-btn">
+            <Icon icon="lucide:check-circle-2" class="btn-icon" /> 检查额度 / 401
+          </el-button>
+
+          <el-button :loading="relogining" type="success" @click="doRelogin(true)" class="action-btn">
+            <Icon icon="lucide:refresh-cw" class="btn-icon" /> 一键重新登录
+          </el-button>
+
+          <el-button @click="poolPushDrawerVisible = true" class="action-btn">
+            <Icon icon="lucide:send" class="btn-icon" /> 号池自动推送
+          </el-button>
+
+          <el-button :type="aliveOnly ? 'primary' : 'default'" @click="aliveOnly = !aliveOnly" class="action-btn">
+            <Icon :icon="aliveOnly ? 'lucide:eye' : 'lucide:eye-off'" class="btn-icon" />
+            {{ aliveOnly ? '显示全部账号' : '仅查看存活账号' }}
+          </el-button>
+
+          <el-dropdown>
+            <el-button :loading="downloading" class="action-btn">
+              <Icon icon="lucide:download" class="btn-icon" /> 导出数据
+              <Icon icon="lucide:chevron-down" style="margin-left: 4px" />
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item @click="download('cpa', 'all')">
+                  <Icon icon="lucide:file-json" style="margin-right: 6px" /> 导出 CPA 格式（存活账号）
+                </el-dropdown-item>
+                <el-dropdown-item @click="download('sub2api', 'all')">
+                  <Icon icon="lucide:file-code" style="margin-right: 6px" /> 导出 Sub2API 格式（存活账号）
+                </el-dropdown-item>
+                <el-dropdown-item @click="download('password2fa', 'all')">
+                  <Icon icon="lucide:key" style="margin-right: 6px" /> 导出 账号----密码----2FA（存活账号）
+                </el-dropdown-item>
+                <el-dropdown-item divided @click="download('cpa', 'revived')">
+                  <Icon icon="lucide:sparkles" style="margin-right: 6px" /> 导出 CPA 格式（仅复活项）
+                </el-dropdown-item>
+                <el-dropdown-item @click="download('sub2api', 'revived')">
+                  <Icon icon="lucide:sparkles" style="margin-right: 6px" /> 导出 Sub2API 格式（仅复活项）
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+
+        <div class="action-right">
+          <div class="config-switches">
+            <el-checkbox v-model="sub2RefreshOauth" :disabled="loading || downloading" size="small">
+              导出前 RT 刷新 OAuth
+            </el-checkbox>
+            <el-tooltip placement="top" content="关闭：直接使用现有 AT/ID，不请求 OAuth；开启：每个账号用 RT 换取新的 Codex AT/ID/RT，适合修复历史混合凭证">
+              <Icon icon="lucide:help-circle" class="help-icon" />
+            </el-tooltip>
+            <el-divider direction="vertical" />
+            <el-checkbox v-model="plainCredentialMode" :disabled="loading || downloading" size="small">
+              明文密码/2FA
+            </el-checkbox>
+          </div>
+        </div>
       </div>
 
-      <div class="pool-push-strip">
-        <el-tag :type="poolPushConfig.autoEnabled ? 'success' : 'info'" size="small">
-          自动推送{{ poolPushConfig.autoEnabled ? '已开启' : '未开启' }}
-        </el-tag>
-        <el-tag
-          v-if="poolPushConfig.autoEnabled && poolPushConfigIssue"
-          type="danger"
-          size="small"
-          effect="plain"
-        >{{ poolPushConfigIssue }}</el-tag>
-        <span>目标：{{ enabledPoolTargetNames.join(' + ') || '未配置' }}</span>
-        <span v-if="poolPushStats.queued || poolPushStats.running">
-          等待 {{ poolPushStats.queued }}，推送中 {{ poolPushStats.running }}
-        </span>
-        <span>成功 {{ poolPushStats.success }}，失败 {{ poolPushStats.failed }}</span>
-        <span>配置仅存当前浏览器，浏览器直接连接号池</span>
-        <span v-if="poolPushStats.lastMessage" class="pool-push-last" :title="poolPushStats.lastMessage">
-          {{ poolPushStats.lastMessage }}
-        </span>
-      </div>
-
-      <div class="inspection-bar">
-        <el-form-item label="巡检批次" style="margin: 0">
-          <el-input-number
-            v-model="inspectionBatchSize"
-            :min="1"
-            :max="200"
-            controls-position="right"
-          />
-        </el-form-item>
-        <el-form-item label="巡检周期（分钟）" style="margin: 0">
-          <el-input-number
-            v-model="inspectionIntervalMinutes"
-            :min="1"
-            :max="1440"
-            controls-position="right"
-          />
-        </el-form-item>
-        <el-button
-          v-if="!inspectionRunning"
-          type="primary"
-          plain
-          :disabled="!checkableAccounts.length"
-          @click="startInspection"
-        >启动定时巡检</el-button>
-        <el-button v-else type="danger" plain @click="stopInspection()">停止定时巡检</el-button>
-        <div class="inspection-status">
-          <el-tag :type="inspectionRunning ? 'success' : 'info'">
-            {{ inspectionRunning ? '运行中' : '未运行' }}
-          </el-tag>
-          <span v-if="inspectionRunning">
-            下一轮 {{ inspectionCountdown }}，已完成 {{ inspectionRound }} 批，上一批 {{ inspectionLastBatch }} 个；发现 401 立即复活
+      <!-- Inspection Controls Strip -->
+      <div class="inspection-bar-modern">
+        <div class="inspection-form-inline">
+          <span class="field-label">巡检控制:</span>
+          <el-form-item label="批次大小" style="margin: 0">
+            <el-input-number v-model="inspectionBatchSize" :min="1" :max="200" size="small" controls-position="right" style="width: 100px" />
+          </el-form-item>
+          <el-form-item label="间隔(分)" style="margin: 0">
+            <el-input-number v-model="inspectionIntervalMinutes" :min="1" :max="1440" size="small" controls-position="right" style="width: 100px" />
+          </el-form-item>
+          <el-button
+            v-if="!inspectionRunning"
+            type="primary"
+            size="small"
+            plain
+            :disabled="!checkableAccounts.length"
+            @click="startInspection"
+          >
+            <Icon icon="lucide:play" style="margin-right: 4px" /> 启动定时巡检
+          </el-button>
+          <el-button v-else type="danger" size="small" plain @click="stopInspection()">
+            <Icon icon="lucide:square" style="margin-right: 4px" /> 停止巡检
+          </el-button>
+        </div>
+        <div class="inspection-info-inline">
+          <span v-if="inspectionRunning" class="text-success">
+            <i class="dot dot-success" /> 下一轮: {{ inspectionCountdown }} (已巡检 {{ inspectionRound }} 批, 上批 {{ inspectionLastBatch }} 个)
           </span>
-          <span v-else>启动后立即检查最久未检查的一批</span>
+          <span v-else class="text-muted">
+            <i class="dot dot-info" /> 启动后将按设定的批次和周期循环校验账号状态
+          </span>
         </div>
       </div>
 
-      <div class="queue-strip">
-        <div v-for="item in queueItems" :key="item.name" class="queue-item">
-          <el-tag :type="item.full ? 'danger' : item.waiting ? 'warning' : 'success'" size="small">
-            {{ item.name }}{{ item.full ? ' · 已满' : '' }}
-          </el-tag>
-          <span>运行 {{ item.running }}/{{ item.concurrency }}</span>
-          <span>等待 {{ item.waiting }}/{{ item.capacity }}</span>
-          <span>可接收 {{ item.available }}</span>
+      <!-- Live Progress Meters -->
+      <div v-if="checking || relogining" class="progress-section">
+        <div v-if="checking" class="progress-item">
+          <div class="progress-label">
+            <span>正在校验账号额度及 401 状态...</span>
+            <span>{{ checkProgress.done }} / {{ checkProgress.total }}</span>
+          </div>
+          <el-progress
+            :percentage="checkProgress.total ? Math.round((checkProgress.done / checkProgress.total) * 100) : 0"
+            :show-text="false"
+            :stroke-width="6"
+          />
+        </div>
+        <div v-if="relogining" class="progress-item">
+          <div class="progress-label">
+            <span>正在重新登录账号 (密码 + 2FA)...</span>
+            <span>{{ reloginProgress.done }} / {{ reloginProgress.total }}</span>
+          </div>
+          <el-progress
+            status="success"
+            :percentage="reloginProgress.total ? Math.round((reloginProgress.done / reloginProgress.total) * 100) : 0"
+            :show-text="false"
+            :stroke-width="6"
+          />
         </div>
       </div>
 
-      <div class="hint" style="margin-top: 8px">
-        当前会随请求复用系统代理池：{{ proxyStore.count }} 条；单账号代理不为空时优先使用单账号代理。
-      </div>
+      <!-- Account Table -->
+      <el-table
+        :data="visibleAccounts"
+        style="width: 100%; margin-top: 12px"
+        height="600"
+        row-key="id"
+        class="modern-table"
+      >
+        <el-table-column prop="email" label="账号 / 邮箱" min-width="260">
+          <template #default="{ row }">
+            <div class="account-cell">
+              <div class="email-row">
+                <span class="email-text">{{ row.email }}</span>
+                <el-button link size="small" class="mini-copy-btn" @click="copyText(row.email)" title="复制邮箱">
+                  <Icon icon="lucide:copy" />
+                </el-button>
+              </div>
+              <div class="meta-row">
+                <span class="cred-pill" :class="row.password ? 'pill-green' : 'pill-gray'">
+                  PWD: {{ row.password ? '已配置' : '无' }}
+                </span>
+                <span class="cred-pill" :class="row.totp_secret ? 'pill-green' : 'pill-gray'">
+                  2FA: {{ row.totp_secret ? '已配置' : '无' }}
+                </span>
+                <span v-if="row.last_checked_at" class="checked-time">
+                  检查: {{ formatCheckedAt(row.last_checked_at) }}
+                </span>
+              </div>
+            </div>
+          </template>
+        </el-table-column>
 
-      <el-alert
-        style="margin-top: 12px"
-        type="warning"
-        show-icon
-        :closable="false"
-        title="公开页面不会把导入账号写入后端数据库；只在点击检查/重登时把当前账号对象发给后端处理。"
-      />
+        <el-table-column label="独立代理" min-width="200">
+          <template #default="{ row }">
+            <el-input
+              v-model="row.proxy"
+              size="small"
+              placeholder="http://user:pass@host:port (可空)"
+              class="table-inline-input"
+              @change="updateOne(row.id, { proxy: row.proxy })"
+            >
+              <template #prefix>
+                <Icon icon="lucide:network" class="input-icon" />
+              </template>
+            </el-input>
+          </template>
+        </el-table-column>
 
-      <el-descriptions :column="5" border style="margin-top: 16px">
-        <el-descriptions-item label="总计">{{ statusCount.total }}</el-descriptions-item>
-        <el-descriptions-item label="活跃">{{ statusCount.active }}</el-descriptions-item>
-        <el-descriptions-item label="401">{{ statusCount.unauthorized }}</el-descriptions-item>
-        <el-descriptions-item label="复活">{{ statusCount.revived }}</el-descriptions-item>
-        <el-descriptions-item label="停用">{{ statusCount.deactivated }}</el-descriptions-item>
-      </el-descriptions>
-      <el-progress
-        v-if="checking"
-        style="margin-top: 12px"
-        :percentage="checkProgress.total ? Math.round((checkProgress.done / checkProgress.total) * 100) : 0"
-        :format="() => `${checkProgress.done}/${checkProgress.total}`"
-      />
-      <el-progress
-        v-if="relogining"
-        style="margin-top: 12px"
-        status="success"
-        :percentage="reloginProgress.total ? Math.round((reloginProgress.done / reloginProgress.total) * 100) : 0"
-        :format="() => `重登录 ${reloginProgress.done}/${reloginProgress.total}`"
-      />
+        <el-table-column label="状态" width="130">
+          <template #default="{ row }">
+            <el-tag v-if="row.status === 'checking'" type="info" effect="plain" class="status-badge">
+              <el-icon class="is-loading"><Loading /></el-icon> 检查中
+            </el-tag>
+            <el-tag v-else-if="row.status === 'relogging'" type="info" effect="plain" class="status-badge">
+              <el-icon class="is-loading"><Loading /></el-icon> 重登中
+            </el-tag>
+            <el-tag v-else-if="row.status === 'revived'" type="success" class="status-badge">
+              <Icon icon="lucide:sparkles" style="margin-right: 2px" /> 复活成功
+            </el-tag>
+            <el-tag v-else-if="row.status === '401'" type="warning" class="status-badge">
+              <Icon icon="lucide:alert-circle" style="margin-right: 2px" /> 401 未授权
+            </el-tag>
+            <el-tag v-else-if="row.status === 'deactivated'" type="danger" class="status-badge">
+              <Icon icon="lucide:x-circle" style="margin-right: 2px" /> 已停用
+            </el-tag>
+            <el-tag v-else-if="row.status === 'active'" type="success" effect="plain" class="status-badge">
+              <Icon icon="lucide:check" style="margin-right: 2px" /> 正常存活
+            </el-tag>
+            <el-tag v-else-if="row.status === 'error'" type="danger" effect="plain" class="status-badge">
+              错误
+            </el-tag>
+            <el-tag v-else-if="row.status === 'failed'" type="danger" effect="plain" class="status-badge">
+              重登失败
+            </el-tag>
+            <el-tag v-else-if="row.status === 'queue_full'" type="danger" effect="plain" class="status-badge">
+              队列已满
+            </el-tag>
+            <el-tag v-else type="info" effect="plain" class="status-badge">待检查</el-tag>
+          </template>
+        </el-table-column>
 
-      <el-table :data="visibleAccounts" style="margin-top: 16px" height="640" row-key="id">
-        <el-table-column prop="email" label="邮箱" min-width="220" />
-        <el-table-column label="密码" width="90">
-          <template #default="{ row }">
-            <el-tag :type="row.password ? 'success' : 'info'" effect="plain">
-              {{ row.password ? '有' : '无' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="2FA" width="90">
-          <template #default="{ row }">
-            <el-tag :type="row.totp_secret ? 'success' : 'info'" effect="plain">
-              {{ row.totp_secret ? '有' : '无' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="代理" min-width="220">
-          <template #default="{ row }">
-            <el-input v-model="row.proxy" size="small" placeholder="代理，可空" @change="updateOne(row.id, { proxy: row.proxy })" />
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="140">
-          <template #default="{ row }">
-            <el-tag v-if="row.status === 'checking'" type="info">
-              <el-icon class="is-loading"><Loading /></el-icon>
-              检查中
-            </el-tag>
-            <el-tag v-else-if="row.status === 'relogging'" type="info">
-              <el-icon class="is-loading"><Loading /></el-icon>
-              重登录中
-            </el-tag>
-            <el-tag v-else-if="row.status === 'revived'" type="success">复活</el-tag>
-            <el-tag v-else-if="row.status === '401'" type="warning">401</el-tag>
-            <el-tag v-else-if="row.status === 'deactivated'" type="danger">停用</el-tag>
-            <el-tag v-else-if="row.status === 'active'" type="success" effect="plain">正常</el-tag>
-            <el-tag v-else-if="row.status === 'error'" type="danger" effect="plain">错误</el-tag>
-            <el-tag v-else-if="row.status === 'failed'" type="danger" effect="plain">重登录失败</el-tag>
-            <el-tag v-else-if="row.status === 'queue_full'" type="danger" effect="plain">队列已满</el-tag>
-            <el-tag v-else type="info" effect="plain">未知</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="最近检查" width="110">
-          <template #default="{ row }">
-            <span class="hint">{{ formatCheckedAt(row.last_checked_at) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="号池推送" min-width="180">
+        <el-table-column label="号池推送结果" min-width="200">
           <template #default="{ row }">
             <div v-if="poolPushStatusFor(row, 'cpa') || poolPushStatusFor(row, 'sub2api')" class="push-result-list">
               <el-tag
@@ -1411,203 +1530,626 @@ onBeforeUnmount(() => {
                 :type="poolPushStatusFor(row, target)?.status === 'success' ? 'success' : poolPushStatusFor(row, target)?.status === 'failed' ? 'danger' : 'info'"
                 size="small"
                 effect="plain"
+                class="push-result-tag"
                 :title="poolPushStatusFor(row, target)?.message"
               >
+                <Icon :icon="target === 'cpa' ? 'lucide:file-json' : 'lucide:server'" style="margin-right: 4px" />
                 {{ poolTargetLabel(target) }} · {{ poolPushStatusFor(row, target)?.status === 'success' ? '成功' : poolPushStatusFor(row, target)?.status === 'failed' ? '失败' : '推送中' }}
               </el-tag>
             </div>
-            <span v-else>-</span>
+            <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="额度" min-width="220">
+
+        <el-table-column label="额度 / 详情" min-width="220">
           <template #default="{ row }">
-            <span v-if="row.quota">{{ row.quota.credits_balance ?? row.quota.primary?.used_percent ?? '-' }}</span>
-            <span v-else>{{ row.error || '-' }}</span>
+            <div class="quota-cell">
+              <span v-if="row.quota" class="quota-val">
+                <Icon icon="lucide:gauge" class="quota-icon" />
+                {{ row.quota.credits_balance ?? row.quota.primary?.used_percent ?? '有响应' }}
+              </span>
+              <span v-else-if="row.error" class="error-text" :title="row.error">
+                <Icon icon="lucide:alert-circle" /> {{ row.error }}
+              </span>
+              <span v-else class="text-muted">-</span>
+            </div>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
 
+    <!-- Pool Push Drawer -->
     <el-drawer
       v-model="poolPushDrawerVisible"
       title="浏览器自动号池推送"
       size="min(620px, 94vw)"
       append-to-body
+      class="modern-drawer"
     >
-      <el-alert
-        type="success"
-        show-icon
-        :closable="false"
-        title="号池地址与密钥仅保存在当前浏览器；推送由浏览器直接连接 CPA / Sub2API。本项目服务器不会接收、保存或转发这些配置。"
-      />
-      <el-alert
-        class="pool-push-alert"
-        type="warning"
-        show-icon
-        :closable="false"
-        title="目标号池必须允许跨域请求（CORS）及对应鉴权请求头；本页面为 HTTPS 时只能连接 HTTPS 号池。"
-      />
+      <div class="drawer-content">
+        <el-alert
+          type="success"
+          show-icon
+          :closable="false"
+          title="号池地址与密钥仅保存在当前浏览器；推送由浏览器直接连接 CPA / Sub2API。本项目服务器不会接收、保存或转发这些配置。"
+        />
+        <el-alert
+          class="pool-push-alert"
+          type="warning"
+          show-icon
+          :closable="false"
+          title="目标号池必须允许跨域请求（CORS）及对应鉴权请求头；本页面为 HTTPS 时只能连接 HTTPS 号池。"
+        />
 
-      <div class="pool-auto-row">
-        <div>
-          <div class="pool-setting-title">复活后自动推送</div>
-          <div class="hint">手动重登录和定时巡检复活成功后立即进入浏览器推送队列。</div>
-        </div>
-        <el-switch v-model="poolPushConfig.autoEnabled" />
-      </div>
-      <el-alert
-        v-if="poolPushConfig.autoEnabled && poolPushConfigIssue"
-        class="pool-push-alert"
-        type="error"
-        show-icon
-        :closable="false"
-        :title="poolPushConfigIssue"
-      />
-
-      <section class="pool-target-section">
-        <div class="pool-target-header">
-          <el-checkbox v-model="poolPushConfig.cpa.enabled">启用 CPA</el-checkbox>
-          <span class="hint">POST /v0/management/auth-files</span>
-        </div>
-        <el-form label-position="top">
-          <el-form-item label="CPA URL">
-            <el-input v-model="poolPushConfig.cpa.url" placeholder="https://cpa.example.com" clearable />
-          </el-form-item>
-          <el-form-item label="管理密钥（Authorization Bearer + X-Management-Key）">
-            <el-input v-model="poolPushConfig.cpa.key" type="password" show-password clearable placeholder="CPA 管理密钥" />
-          </el-form-item>
-          <div class="pool-target-actions">
-            <el-form-item label="请求超时（秒）" style="margin-bottom: 0">
-              <el-input-number v-model="poolPushConfig.cpa.timeout" :min="5" :max="300" controls-position="right" />
-            </el-form-item>
-            <el-button :loading="testingPoolTarget === 'cpa'" @click="testPoolTarget('cpa')">测试浏览器直连</el-button>
+        <div class="pool-auto-row">
+          <div>
+            <div class="pool-setting-title">复活后自动推送</div>
+            <div class="drawer-hint">手动重登录和定时巡检复活成功后立即进入浏览器推送队列。</div>
           </div>
-        </el-form>
-      </section>
-
-      <section class="pool-target-section">
-        <div class="pool-target-header">
-          <el-checkbox v-model="poolPushConfig.sub2api.enabled">启用 Sub2API</el-checkbox>
-          <span class="hint">POST /api/v1/admin/accounts</span>
+          <el-switch v-model="poolPushConfig.autoEnabled" />
         </div>
-        <el-form label-position="top">
-          <el-form-item label="Sub2API URL">
-            <el-input v-model="poolPushConfig.sub2api.url" placeholder="https://sub2api.example.com" clearable />
-          </el-form-item>
-          <el-form-item label="API Key（x-api-key）">
-            <el-input v-model="poolPushConfig.sub2api.key" type="password" show-password clearable placeholder="Sub2API API Key" />
-          </el-form-item>
-          <el-form-item label="分组 IDs（逗号分隔）">
-            <el-input v-model="poolPushConfig.sub2api.groupIds" placeholder="2" clearable />
-          </el-form-item>
-          <div class="pool-target-actions">
-            <el-form-item label="请求超时（秒）" style="margin-bottom: 0">
-              <el-input-number v-model="poolPushConfig.sub2api.timeout" :min="5" :max="300" controls-position="right" />
-            </el-form-item>
-            <el-button :loading="testingPoolTarget === 'sub2api'" @click="testPoolTarget('sub2api')">测试浏览器直连</el-button>
-          </div>
-        </el-form>
-      </section>
 
-      <div class="pool-drawer-actions">
-        <el-button type="danger" plain @click="clearPoolPushConfig">清除本地配置</el-button>
-        <el-button
-          type="primary"
-          :loading="manualPoolPushing"
-          :disabled="Boolean(manualPoolPushConfigIssue) || Boolean(poolPushStats.queued || poolPushStats.running)"
-          @click="pushCurrentAlive"
-        >手动推送存活账号</el-button>
+        <el-alert
+          v-if="poolPushConfig.autoEnabled && poolPushConfigIssue"
+          class="pool-push-alert"
+          type="error"
+          show-icon
+          :closable="false"
+          :title="poolPushConfigIssue"
+        />
+
+        <section class="pool-target-section">
+          <div class="pool-target-header">
+            <div class="target-title">
+              <Icon icon="lucide:file-json" class="target-icon" />
+              <el-checkbox v-model="poolPushConfig.cpa.enabled">启用 CPA 推送</el-checkbox>
+            </div>
+            <span class="target-api-hint">POST /v0/management/auth-files</span>
+          </div>
+          <el-form label-position="top" class="drawer-form">
+            <el-form-item label="CPA URL">
+              <el-input v-model="poolPushConfig.cpa.url" placeholder="https://cpa.example.com" clearable />
+            </el-form-item>
+            <el-form-item label="管理密钥（Authorization Bearer + X-Management-Key）">
+              <el-input v-model="poolPushConfig.cpa.key" type="password" show-password clearable placeholder="CPA 管理密钥" />
+            </el-form-item>
+            <div class="pool-target-actions">
+              <el-form-item label="请求超时（秒）" style="margin-bottom: 0">
+                <el-input-number v-model="poolPushConfig.cpa.timeout" :min="5" :max="300" controls-position="right" />
+              </el-form-item>
+              <el-button :loading="testingPoolTarget === 'cpa'" @click="testPoolTarget('cpa')">测试浏览器直连</el-button>
+            </div>
+          </el-form>
+        </section>
+
+        <section class="pool-target-section">
+          <div class="pool-target-header">
+            <div class="target-title">
+              <Icon icon="lucide:server" class="target-icon" />
+              <el-checkbox v-model="poolPushConfig.sub2api.enabled">启用 Sub2API 推送</el-checkbox>
+            </div>
+            <span class="target-api-hint">POST /api/v1/admin/accounts</span>
+          </div>
+          <el-form label-position="top" class="drawer-form">
+            <el-form-item label="Sub2API URL">
+              <el-input v-model="poolPushConfig.sub2api.url" placeholder="https://sub2api.example.com" clearable />
+            </el-form-item>
+            <el-form-item label="API Key（x-api-key）">
+              <el-input v-model="poolPushConfig.sub2api.key" type="password" show-password clearable placeholder="Sub2API API Key" />
+            </el-form-item>
+            <el-form-item label="分组 IDs（逗号分隔）">
+              <el-input v-model="poolPushConfig.sub2api.groupIds" placeholder="2" clearable />
+            </el-form-item>
+            <div class="pool-target-actions">
+              <el-form-item label="请求超时（秒）" style="margin-bottom: 0">
+                <el-input-number v-model="poolPushConfig.sub2api.timeout" :min="5" :max="300" controls-position="right" />
+              </el-form-item>
+              <el-button :loading="testingPoolTarget === 'sub2api'" @click="testPoolTarget('sub2api')">测试浏览器直连</el-button>
+            </div>
+          </el-form>
+        </section>
+
+        <div class="pool-drawer-actions">
+          <el-button type="danger" plain @click="clearPoolPushConfig">清除本地配置</el-button>
+          <el-button
+            type="primary"
+            :loading="manualPoolPushing"
+            :disabled="Boolean(manualPoolPushConfigIssue) || Boolean(poolPushStats.queued || poolPushStats.running)"
+            @click="pushCurrentAlive"
+          >
+            手动推送存活账号
+          </el-button>
+        </div>
       </div>
     </el-drawer>
-
   </div>
 </template>
 
 <style scoped>
-.page { padding: 16px; }
-.toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
-.pool-push-strip {
+.page-container {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Hero KPI Grid */
+.hero-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.kpi-card {
+  background: var(--el-bg-color-overlay, #ffffff);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: var(--app-radius-md);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--app-shadow-sm);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.kpi-card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--app-shadow-md);
+}
+
+.kpi-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.kpi-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.kpi-type-icon {
+  font-size: 16px;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.kpi-body {
+  margin-bottom: 8px;
+}
+
+.kpi-val {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--el-text-color-primary, #303133);
+  line-height: 1.2;
+}
+
+.kpi-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary, #909399);
+  margin-top: 4px;
+}
+
+.kpi-footer {
   display: flex;
   align-items: center;
   gap: 10px;
+  font-size: 12px;
+  color: var(--el-text-color-regular, #606266);
+  border-top: 1px dashed var(--el-border-color-lighter, #ebeef5);
+  padding-top: 8px;
+  margin-top: auto;
   flex-wrap: wrap;
-  min-height: 34px;
-  padding-top: 10px;
-  color: var(--el-text-color-secondary);
+}
+
+.kpi-sub-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-primary { background-color: var(--el-color-primary, #409eff); }
+.dot-success { background-color: var(--el-color-success, #67c23a); }
+.dot-warning { background-color: var(--el-color-warning, #e6a23c); }
+.dot-danger { background-color: var(--el-color-danger, #f56c6c); }
+.dot-info { background-color: var(--el-text-color-placeholder, #c0c4cc); }
+
+.text-primary { color: var(--el-color-primary, #409eff); }
+.text-success { color: var(--el-color-success, #67c23a); }
+.text-warning { color: var(--el-color-warning, #e6a23c); }
+.text-danger { color: var(--el-color-danger, #f56c6c); }
+.text-muted { color: var(--el-text-color-secondary, #909399); }
+
+/* Live Queue Status Banner */
+.queue-status-card {
+  background: var(--el-bg-color-overlay, #ffffff);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: var(--app-radius-md);
+  padding: 10px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.queue-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.queue-title-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary, #303133);
+}
+
+.queue-items {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.queue-chip {
+  background: var(--el-fill-color-light, #f5f7fa);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: var(--app-radius-sm);
+  padding: 4px 10px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.queue-chip.chip-warn {
+  border-color: var(--el-color-warning-light-5, #f8d49a);
+  background: var(--el-color-warning-light-9, #fdf6ec);
+}
+
+.queue-chip.chip-full {
+  border-color: var(--el-color-danger-light-5, #fbc4c4);
+  background: var(--el-color-danger-light-9, #fef0f0);
+}
+
+.chip-name {
+  font-weight: 600;
+  color: var(--el-text-color-primary, #303133);
+}
+
+.chip-metric {
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.chip-metric b {
+  color: var(--el-text-color-primary, #303133);
+}
+
+.proxy-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+/* Workflow Actions */
+.main-card {
+  border-radius: var(--app-radius-md);
+}
+
+.workflow-action-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter, #ebeef5);
+}
+
+.action-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-icon {
+  font-size: 14px;
+}
+
+.action-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.config-switches {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.help-icon {
+  font-size: 14px;
+  color: var(--el-text-color-secondary, #909399);
+  cursor: help;
+}
+
+/* Inspection Bar Modern */
+.inspection-bar-modern {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--el-fill-color-lighter, #fafafa);
+  border-radius: var(--app-radius-sm);
+  margin-top: 12px;
+}
+
+.inspection-form-inline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.field-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-regular, #606266);
+}
+
+.inspection-info-inline {
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Progress Section */
+.progress-section {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--el-fill-color-light, #f5f7fa);
+  padding: 12px;
+  border-radius: var(--app-radius-sm);
+}
+
+.progress-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.progress-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--el-text-color-regular, #606266);
+}
+
+/* Table Cells */
+.account-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.email-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.email-text {
+  font-family: var(--el-font-family-monospace, monospace);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--el-text-color-primary, #303133);
+}
+
+.mini-copy-btn {
+  padding: 0;
+  height: auto;
+  color: var(--el-text-color-secondary, #909399);
+}
+
+.mini-copy-btn:hover {
+  color: var(--el-color-primary, #409eff);
+}
+
+.meta-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cred-pill {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--app-radius-xs);
+  font-family: var(--el-font-family-monospace, monospace);
+}
+
+.pill-green {
+  background: var(--el-color-success-light-9, #f0f9eb);
+  color: var(--el-color-success, #67c23a);
+  border: 1px solid var(--el-color-success-light-7, #c2e7b0);
+}
+
+.pill-gray {
+  background: var(--el-fill-color-light, #f5f7fa);
+  color: var(--el-text-color-secondary, #909399);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+}
+
+.checked-time {
+  font-size: 11px;
+  color: var(--el-text-color-placeholder, #c0c4cc);
+}
+
+.table-inline-input {
+  width: 100%;
+}
+
+.input-icon {
+  font-size: 13px;
+  color: var(--el-text-color-placeholder, #c0c4cc);
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 500;
+}
+
+.push-result-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.push-result-tag {
+  display: inline-flex;
+  align-items: center;
+}
+
+.quota-cell {
+  display: flex;
+  align-items: center;
   font-size: 12px;
 }
-.pool-push-last {
-  max-width: min(520px, 100%);
+
+.quota-val {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--el-font-family-monospace, monospace);
+  color: var(--el-text-color-primary, #303133);
+}
+
+.quota-icon {
+  color: var(--el-color-primary, #409eff);
+}
+
+.error-text {
+  color: var(--el-color-danger, #f56c6c);
+  display: flex;
+  align-items: center;
+  gap: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.inspection-bar {
+
+/* Drawer Styling */
+.drawer-content {
   display: flex;
-  align-items: flex-end;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-top: 14px;
-  padding: 12px 0;
-  border-top: 1px solid var(--el-border-color-light);
-  border-bottom: 1px solid var(--el-border-color-light);
+  flex-direction: column;
+  gap: 16px;
 }
-.inspection-status {
-  min-height: 32px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
+
+.pool-push-alert {
+  margin-top: 4px;
 }
-.queue-strip {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  flex-wrap: wrap;
-  min-height: 34px;
-  padding-top: 10px;
-}
-.queue-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-}
-.push-result-list { display: flex; gap: 6px; flex-wrap: wrap; }
-.pool-push-alert { margin-top: 12px; }
+
 .pool-auto-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 0 14px;
-  border-bottom: 1px solid var(--el-border-color-light);
+  padding: 12px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter, #ebeef5);
 }
-.pool-setting-title { font-weight: 600; }
+
+.pool-setting-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--el-text-color-primary, #303133);
+}
+
+.drawer-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary, #909399);
+  margin-top: 2px;
+}
+
 .pool-target-section {
-  padding: 18px 0;
-  border-bottom: 1px solid var(--el-border-color-light);
+  background: var(--el-fill-color-lighter, #fafafa);
+  border: 1px solid var(--el-border-color-lighter, #ebeef5);
+  border-radius: var(--app-radius-md);
+  padding: 14px;
 }
+
 .pool-target-header {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  align-items: center;
   margin-bottom: 12px;
 }
+
+.target-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.target-icon {
+  font-size: 16px;
+  color: var(--el-color-primary, #409eff);
+}
+
+.target-api-hint {
+  font-family: var(--el-font-family-monospace, monospace);
+  font-size: 11px;
+  color: var(--el-text-color-placeholder, #c0c4cc);
+}
+
+.drawer-form {
+  margin-top: 8px;
+}
+
 .pool-target-actions {
   display: flex;
-  align-items: flex-end;
   justify-content: space-between;
+  align-items: flex-end;
   gap: 12px;
-  flex-wrap: wrap;
+  margin-top: 8px;
 }
+
 .pool-drawer-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  padding-top: 18px;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--el-border-color-lighter, #ebeef5);
 }
 </style>
