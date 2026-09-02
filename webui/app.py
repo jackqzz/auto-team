@@ -263,22 +263,29 @@ class WorkspaceCandidateInviteStatusReq(BaseModel):
 
 class WorkspaceQuotaScheduleReq(BaseModel):
     workspace_id: int
-    interval_minutes: int = Field(30, ge=5, le=1440)
+    interval_minutes: int = Field(30, ge=1, le=1440)
     relogin_on_401: bool = False
     proxy_pool: str = ""
+    quota_proxy_pool: str = Field("", description="候选人专属代理池；为空时回退到全局池")
     auto_push: bool = False
     concurrency: int = Field(1, ge=1, le=20)
     otp_timeout: int = Field(180, ge=10, le=600)
     account_retry_count: int = Field(1, ge=1, le=5)
     cool_down_seconds: int = Field(0, ge=0, le=3600)
+    quota_network_retries: int = Field(2, ge=0, le=5, description="额度查询网络/5xx 失败的重试次数")
     trash_enabled: bool = True
     trash_invalid_enabled: bool = True
     trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
     seat_protect_enabled: bool = False
     seat_protect_threshold: int = Field(8, ge=1, le=1000)
     seat_protect_refresh_time: str = Field("00:00", description="席位保护阈值刷新时间（HH:MM，CST）")
+    prolite_seat_protect_enabled: bool = False
+    prolite_seat_protect_threshold: int = Field(8, ge=1, le=1000)
+    prolite_seat_protect_refresh_time: str = Field("00:00", description="高级席位保护阈值刷新时间（HH:MM，CST）")
     auto_standard_seat_enabled: bool = False
     auto_prolite_seat_enabled: bool = False
+    auto_seat_interval_minutes: int = Field(5, ge=1, le=1440, description="自动补齐席位轮询周期（分钟）")
+    auto_prolite_candidate_seat_type: str = Field("default", description="自动补齐高级席位的候选人席位类型")
 
 
 class WorkspaceAutoSeatReq(BaseModel):
@@ -880,6 +887,23 @@ def _proxy_pool_values(value: object) -> list[str]:
     ))
 
 
+def _candidate_proxy_pool_text(settings: dict | None, req_pool: object = "") -> str:
+    """候选人任务实际生效的代理池文本。
+
+    优先级：空间专属的 ``quota_proxy_pool`` > 请求带上来的池 > 空间的
+    ``proxy_pool``。前端各处仍会把全局池塞进请求，所以专属池必须排在请求
+    之前，否则配了也不会生效；专属池为空时行为与改造前完全一致。
+    """
+    cfg = settings or {}
+    dedicated = str(cfg.get("quota_proxy_pool") or "").strip()
+    if dedicated:
+        return dedicated
+    requested = str(req_pool or "").strip()
+    if requested:
+        return requested
+    return str(cfg.get("proxy_pool") or "").strip()
+
+
 def _candidate_quota_proxy_pool(
     proxy_pool: object,
     *,
@@ -887,11 +911,11 @@ def _candidate_quota_proxy_pool(
 ) -> public_relogin.ProxyLeasePool:
     values = _proxy_pool_values(proxy_pool)
     if not values:
-        raise ValueError("全局代理池为空，候选额度查询无法租取代理")
+        raise ValueError("候选人代理池为空，额度查询无法租取代理")
     preferred = str(preferred_proxy or "").strip()
     if preferred:
         if preferred not in values:
-            raise ValueError("额度任务预选代理不属于当前全局代理池")
+            raise ValueError("额度任务预选代理不属于当前候选人代理池")
         values = [preferred, *(proxy for proxy in values if proxy != preferred)]
     return public_relogin.ProxyLeasePool(values)
 
@@ -908,11 +932,12 @@ def _lease_candidate_quota_proxy(
         exclude_proxy,
         task_type="quota",
         task_detail=detail,
+        skip_cooldown=True,
     )
     if not proxy:
-        raise ValueError("全局代理池为空，候选额度查询无法租取代理")
+        raise ValueError("候选人代理池为空，额度查询无法租取代理")
     logging.getLogger("workspace_membership").info(
-        "候选额度查询领取全局代理 workspace=%s email=%s pool_index=%s leased_count=%s detail=%s",
+        "候选额度查询领取代理 workspace=%s email=%s pool_index=%s leased_count=%s detail=%s",
         workspace_id,
         email,
         index + 1,
@@ -944,9 +969,9 @@ def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, a
     master = db.get_workspace_master(workspace_id)
     if not master or not master.get("workspace_id"):
         raise HTTPException(400, "母号缺少 Workspace ID")
-    proxy_pool = str(settings.get("proxy_pool") or "").strip()
+    proxy_pool = _candidate_proxy_pool_text(settings)
     if not proxy_pool:
-        raise HTTPException(400, "全局代理池为空")
+        raise HTTPException(400, "候选人代理池为空")
     return {
         "login_only": True,
         # 空间凭证任务只刷新目标 Workspace 的 token，不应因为账号本地缺少
@@ -1008,6 +1033,7 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
             return
         settings = _workspace_settings_snapshot(workspace_id)
         trash_delay = _candidate_trash_delay_seconds(workspace_id, settings)
+        network_retries = _candidate_quota_network_retries(workspace_id, settings)
         candidates = [
             row for row in db.list_workspace_candidate_options(workspace_id)
             if not _candidate_quota_ineligible_reason(row)
@@ -1016,7 +1042,7 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
         if candidates:
             try:
                 quota_leases = _candidate_quota_proxy_pool(
-                    settings.get("proxy_pool"),
+                    _candidate_proxy_pool_text(settings),
                 )
             except ValueError as exc:
                 logging.getLogger("workspace_membership").error(
@@ -1059,6 +1085,7 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
                     workspace_id,
                     email,
                     proxy=quota_proxy,
+                    network_retries=network_retries,
                 )
             except workspace_membership.QuotaUnauthorized:
                 quota_logger.warning(
@@ -1086,6 +1113,7 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
                                 workspace_id,
                                 email,
                                 proxy=retry_proxy,
+                                network_retries=network_retries,
                             )
                         else:
                             return
@@ -1099,11 +1127,29 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
                         return
                 else:
                     return
-            except Exception:
-                quota_logger.warning(
-                    "定时额度查询失败 workspace=%s email=%s",
+            except workspace_membership.QuotaAccountDeactivated as exc:
+                _handle_candidate_quota_deactivated(
+                    workspace_id, email, settings, exc, source="quota_scheduled"
+                )
+                return
+            except workspace_membership.QuotaPaymentRequired as exc:
+                # 402 是母号空间级计费问题，会同时打到该空间下所有候选人，
+                # 不能归因到单个账号，因此只告警不改任何账号状态。
+                quota_logger.error(
+                    "定时额度查询遇到空间计费异常 workspace=%s email=%s error=%s",
                     workspace_id,
                     email,
+                    str(exc)[:300],
+                )
+                return
+            except Exception as exc:
+                quota_logger.warning(
+                    "定时额度查询失败 workspace=%s email=%s error_type=%s status=%s error=%s",
+                    workspace_id,
+                    email,
+                    type(exc).__name__,
+                    getattr(exc, "status_code", ""),
+                    str(exc)[:300],
                     exc_info=True,
                 )
                 return
@@ -1296,7 +1342,8 @@ def _refresh_workspace_unknown_candidate_seats(workspace_id: int, limit: int = 2
 
     这里的“未知”指本地没有有效 seat_type / seat_label / member_id 记录，
     但候选人已经处于 joined 且未入箱状态。刷新后会回写到候选表，供后续
-    自动补标准席位、额度查询和导出直接复用。
+    候选操作、额度查询和导出直接复用。该操作只在用户手动点击“同步成员
+    席位”时执行，自动补齐席位任务不会为此额外分页请求成员列表。
     """
     with _workspace_member_sync_lock:
         if workspace_id in _workspace_member_sync_running:
@@ -1396,14 +1443,33 @@ def _workspace_auto_standard_candidates(workspace_id: int, seen: set[str] | None
     return out
 
 
-def _workspace_auto_prolite_candidates(workspace_id: int, seen: set[str] | None = None) -> list[dict]:
-    """Return joined standard-seat candidates eligible for ProLite upgrade."""
+def _normalize_auto_prolite_candidate_seat_type(value: object) -> str:
+    normalized = str(value or "default").strip().lower().replace("-", "_")
+    if normalized in {"all", "any", "all_non_prolite", "全部", "全部席位"}:
+        return "all"
+    canonical = workspace_membership._canonical_candidate_seat_type(normalized)
+    if canonical in {"default", "usage_based"}:
+        return canonical
+    return "default"
+
+
+def _workspace_auto_prolite_candidates(
+    workspace_id: int,
+    seen: set[str] | None = None,
+    candidate_seat_type: str = "default",
+) -> list[dict]:
+    """Return joined candidates eligible for ProLite upgrade.
+
+    ``candidate_seat_type`` can target one source tier or ``all`` non-ProLite
+    tiers.  The default remains the historical standard-seat behavior.
+    """
     seen = seen or set()
+    candidate_seat_type = _normalize_auto_prolite_candidate_seat_type(candidate_seat_type)
     rows = db.list_workspace_candidate_options(
         workspace_id,
         account_status="active",
         join_status="joined",
-        seat_type="default",
+        seat_type="" if candidate_seat_type == "all" else candidate_seat_type,
         trash_status="active",
     )
     out = []
@@ -1420,7 +1486,10 @@ def _workspace_auto_prolite_candidates(workspace_id: int, seen: set[str] | None 
         seat = workspace_membership._canonical_candidate_seat_type(
             row.get("seat_label") or row.get("seat_type")
         )
-        if seat != "default":
+        if candidate_seat_type == "all":
+            if seat not in {"default", "usage_based"}:
+                continue
+        elif seat != candidate_seat_type:
             continue
         out.append(row)
     return out
@@ -1434,6 +1503,14 @@ def _workspace_seat_protect_exhausted(settings: dict) -> bool:
         return False
     threshold = max(1, int(settings.get("seat_protect_threshold") or 8))
     used = max(0, int(settings.get("seat_protect_used_count") or 0))
+    return used >= threshold
+
+
+def _workspace_prolite_seat_protect_exhausted(settings: dict) -> bool:
+    if not settings.get("prolite_seat_protect_enabled"):
+        return False
+    threshold = max(1, int(settings.get("prolite_seat_protect_threshold") or 8))
+    used = max(0, int(settings.get("prolite_seat_protect_used_count") or 0))
     return used >= threshold
 
 
@@ -1523,6 +1600,10 @@ def _switch_candidate_to_default_and_verify(workspace_id: int, candidate: dict, 
                 refreshed.get("member_id", member_id),
                 "default",
             )
+            try:
+                db.increment_workspace_fulfillment_counter(workspace_id, "default", 1)
+            except Exception:
+                logger.exception("自动标准席位历史计数递增失败 workspace_db_id=%s email=%s", workspace_id, email)
             return {"ok": True, "email": email, "member_id": member_id, "seat": refreshed, "reserved": reserved}
         if attempt < 2:
             time.sleep(5)
@@ -1535,13 +1616,18 @@ def _switch_candidate_to_default_and_verify(workspace_id: int, candidate: dict, 
     return {"ok": False, "email": email, "member_id": member_id, "error": f"席位切换失败: {last_error or '复查未通过'}"}
 
 
-def _switch_candidate_to_prolite_and_verify(workspace_id: int, candidate: dict) -> dict:
+def _switch_candidate_to_prolite_and_verify(
+    workspace_id: int,
+    candidate: dict,
+    settings: dict | None = None,
+) -> dict:
     """Switch one joined candidate to ProLite and verify the remote snapshot."""
     email = str(candidate.get("email") or "").strip().lower()
     if not email:
         return {"ok": False, "error": "email 不能为空"}
     if not _workspace_exists(workspace_id):
         return {"ok": False, "error": "母号已删除"}
+    settings = settings or _workspace_settings_snapshot(workspace_id)
     row = db.get_workspace_candidate(workspace_id, email) or dict(candidate)
     if str(row.get("workspace_join_status") or "") != "joined":
         return {"ok": False, "error": "候选人尚未加入当前空间"}
@@ -1560,9 +1646,26 @@ def _switch_candidate_to_prolite_and_verify(workspace_id: int, candidate: dict) 
     if not member_id:
         return {"ok": False, "error": "未获取到成员 member_id，请先校验候选状态"}
 
+    reserved = False
+    if settings.get("prolite_seat_protect_enabled"):
+        reservation = db.reserve_workspace_prolite_seat_protect_quota(workspace_id, 1)
+        if not reservation.get("allowed", False):
+            return {
+                "ok": False,
+                "error": (
+                    "高级席位保护已生效：本周期高级席位切换已达 "
+                    f"{int(reservation.get('threshold') or settings.get('prolite_seat_protect_threshold') or 8)} 个，"
+                    f"下次刷新时间 {reservation.get('refresh_time') or settings.get('prolite_seat_protect_refresh_time') or '00:00'}"
+                ),
+                "blocked_by_prolite_protect": True,
+            }
+        reserved = bool(reservation.get("enabled"))
+
     last_error: Exception | None = None
     for attempt in range(3):
         if not _workspace_exists(workspace_id):
+            if reserved:
+                db.release_workspace_prolite_seat_protect_quota(workspace_id, 1)
             return {"ok": False, "email": email, "member_id": member_id, "error": "母号已删除"}
         try:
             workspace_membership.update_member_seat_type(workspace_id, member_id, "prolite")
@@ -1603,9 +1706,18 @@ def _switch_candidate_to_prolite_and_verify(workspace_id: int, candidate: dict) 
                 refreshed.get("member_id", member_id),
                 "prolite",
             )
-            return {"ok": True, "email": email, "member_id": member_id, "seat": refreshed}
+            try:
+                db.increment_workspace_fulfillment_counter(workspace_id, "prolite", 1)
+            except Exception:
+                logger.exception("自动高级席位历史计数递增失败 workspace_db_id=%s email=%s", workspace_id, email)
+            return {"ok": True, "email": email, "member_id": member_id, "seat": refreshed, "reserved": reserved}
         if attempt < 2:
             time.sleep(5)
+    if reserved:
+        try:
+            db.release_workspace_prolite_seat_protect_quota(workspace_id, 1)
+        except Exception:
+            logger.exception("自动高级席位保护配额回滚失败 workspace_db_id=%s email=%s", workspace_id, email)
     return {"ok": False, "email": email, "member_id": member_id, "error": f"席位切换失败: {last_error or '复查未通过'}"}
 
 
@@ -1619,9 +1731,9 @@ def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], setting
     master = db.get_workspace_master(workspace_id)
     if not master or not master.get("workspace_id"):
         raise RuntimeError("母号缺少 Workspace ID")
-    proxy_pool = str(settings.get("proxy_pool") or "").strip()
+    proxy_pool = _candidate_proxy_pool_text(settings)
     if not proxy_pool:
-        raise RuntimeError("全局代理池为空")
+        raise RuntimeError("候选人代理池为空")
     result = login_controller_for(
         workspace_db_id=workspace_id,
         workspace_id=master["workspace_id"],
@@ -1654,6 +1766,15 @@ def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], setting
     return result
 
 
+def _auto_seat_interval_seconds(settings: dict | None) -> int:
+    """Return the configured automatic seat replenishment polling period."""
+    try:
+        minutes = int((settings or {}).get("auto_seat_interval_minutes") or 5)
+    except (TypeError, ValueError):
+        minutes = 5
+    return max(1, min(1440, minutes)) * 60
+
+
 def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
     logger.info("自动标准席位任务启动 workspace_db_id=%s", workspace_id)
     try:
@@ -1672,20 +1793,16 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                     int(settings.get("seat_protect_used_count") or 0),
                     int(settings.get("seat_protect_threshold") or 8),
                 )
-                stop.wait(5 * 60)
+                stop.wait(_auto_seat_interval_seconds(settings))
                 continue
             seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
             if not seat_info:
-                stop.wait(5 * 60)
+                stop.wait(_auto_seat_interval_seconds(settings))
                 continue
             try:
                 db.update_workspace_seat_info(workspace_id, **seat_info)
             except Exception:
                 logger.exception("自动标准席位刷新写回母号失败 workspace_db_id=%s", workspace_id)
-            try:
-                _refresh_workspace_unknown_candidate_seats(workspace_id)
-            except Exception:
-                logger.exception("自动标准席位成员快照刷新失败 workspace_db_id=%s", workspace_id)
             entitled = int(
                 seat_info.get("seats_default_entitled")
                 if seat_info.get("seats_default_entitled") is not None
@@ -1693,7 +1810,7 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
             )
             current_default = int(seat_info.get("seats_default") or 0)
             if entitled <= 0 or current_default >= entitled:
-                stop.wait(5 * 60)
+                stop.wait(_auto_seat_interval_seconds(settings))
                 continue
 
             switched: list[str] = []
@@ -1778,7 +1895,7 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                         _enqueue_workspace_credentials(workspace_id, switched, _workspace_settings_snapshot(workspace_id))
                     except Exception:
                         logger.exception("自动标准席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, switched)
-            stop.wait(5 * 60)
+            stop.wait(_auto_seat_interval_seconds(_workspace_settings_snapshot(workspace_id)))
     finally:
         with _seat_auto_schedulers_lock:
             current = _seat_auto_schedulers.get(workspace_id)
@@ -1799,29 +1916,33 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
             if not settings.get("auto_prolite_seat_enabled"):
                 logger.info("自动高级席位任务已关闭 workspace_db_id=%s", workspace_id)
                 return
+            if _workspace_prolite_seat_protect_exhausted(settings):
+                logger.info(
+                    "自动高级席位任务因高级席位保护跳过本轮 workspace_db_id=%s used=%s threshold=%s",
+                    workspace_id,
+                    int(settings.get("prolite_seat_protect_used_count") or 0),
+                    int(settings.get("prolite_seat_protect_threshold") or 8),
+                )
+                stop.wait(_auto_seat_interval_seconds(settings))
+                continue
             seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
             if not seat_info:
-                stop.wait(5 * 60)
+                stop.wait(_auto_seat_interval_seconds(settings))
                 continue
             try:
                 db.update_workspace_seat_info(workspace_id, **seat_info)
             except Exception:
                 logger.exception("自动高级席位刷新写回母号失败 workspace_db_id=%s", workspace_id)
-            try:
-                _refresh_workspace_unknown_candidate_seats(workspace_id)
-            except Exception:
-                logger.exception("自动高级席位成员快照刷新失败 workspace_db_id=%s", workspace_id)
-
             entitled = seat_info.get("seats_prolite_entitled")
             current_prolite = seat_info.get("seats_prolite")
             # ProLite 容量必须使用专属 entitlement；缺失时不能误把总席位当作高级席位容量。
             if entitled is None or current_prolite is None:
-                stop.wait(5 * 60)
+                stop.wait(_auto_seat_interval_seconds(settings))
                 continue
             entitled = int(entitled or 0)
             current_prolite = int(current_prolite or 0)
             if entitled <= 0 or current_prolite >= entitled:
-                stop.wait(5 * 60)
+                stop.wait(_auto_seat_interval_seconds(settings))
                 continue
 
             switched: list[str] = []
@@ -1829,6 +1950,15 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
             while not stop.is_set():
                 if not _workspace_exists(workspace_id):
                     logger.info("母号已删除，停止自动高级席位任务 workspace_db_id=%s", workspace_id)
+                    break
+                settings = _workspace_settings_snapshot(workspace_id)
+                if _workspace_prolite_seat_protect_exhausted(settings):
+                    logger.info(
+                        "自动高级席位任务达到高级席位保护阈值，停止本轮 workspace_db_id=%s used=%s threshold=%s",
+                        workspace_id,
+                        int(settings.get("prolite_seat_protect_used_count") or 0),
+                        int(settings.get("prolite_seat_protect_threshold") or 8),
+                    )
                     break
                 seat_info = _refresh_workspace_seat_info(workspace_id, retries=3, delay_seconds=5)
                 if not seat_info:
@@ -1844,7 +1974,11 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 deficit = max(0, int(entitled or 0) - int(current_prolite or 0))
                 if deficit <= 0:
                     break
-                candidates = _workspace_auto_prolite_candidates(workspace_id, attempted)
+                candidates = _workspace_auto_prolite_candidates(
+                    workspace_id,
+                    attempted,
+                    settings.get("auto_prolite_candidate_seat_type", "default"),
+                )
                 if not candidates:
                     logger.info(
                         "自动高级席位任务候选不足 workspace_db_id=%s deficit=%s",
@@ -1855,12 +1989,19 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 candidate = candidates[0]
                 email = str(candidate.get("email") or "").strip().lower()
                 attempted.add(email)
-                result = _switch_candidate_to_prolite_and_verify(workspace_id, candidate)
+                result = _switch_candidate_to_prolite_and_verify(workspace_id, candidate, settings)
                 if result.get("ok") and not result.get("skipped"):
                     switched.append(email)
                     logger.info("自动高级席位切换成功 workspace_db_id=%s email=%s", workspace_id, email)
                 elif result.get("skipped"):
                     logger.info("自动高级席位候选已是目标席位 workspace_db_id=%s email=%s", workspace_id, email)
+                elif result.get("blocked_by_prolite_protect"):
+                    logger.info(
+                        "自动高级席位任务受到高级席位保护，停止本轮 workspace_db_id=%s email=%s",
+                        workspace_id,
+                        email,
+                    )
+                    break
                 else:
                     logger.warning(
                         "自动高级席位切换失败 workspace_db_id=%s email=%s error=%s",
@@ -1880,7 +2021,7 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                         _enqueue_workspace_credentials(workspace_id, switched, _workspace_settings_snapshot(workspace_id))
                     except Exception:
                         logger.exception("自动高级席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, switched)
-            stop.wait(5 * 60)
+            stop.wait(_auto_seat_interval_seconds(_workspace_settings_snapshot(workspace_id)))
     finally:
         with _prolite_auto_schedulers_lock:
             current = _prolite_auto_schedulers.get(workspace_id)
@@ -1901,9 +2042,9 @@ _trash_sweeper_thread: threading.Thread | None = None
 def _reconcile_invalid_candidate_trash(limit: int = 500) -> dict:
     rows = db.list_invalid_workspace_candidates_pending_trash(limit=limit)
     settings_by_workspace: dict[int, dict] = {}
-    pending_seat_rows: list[dict] = []
     marked = 0
     skipped = 0
+    seat_pending = 0
     for row in rows:
         workspace_id = int(row.get("workspace_master_id") or 0)
         email = str(row.get("email") or "").strip().lower()
@@ -1924,67 +2065,25 @@ def _reconcile_invalid_candidate_trash(limit: int = 500) -> dict:
         if not row.get("member_id") and str(row.get("workspace_join_status") or "") != "joined":
             skipped += 1
             continue
-        if db.update_workspace_candidate_trash(
-            workspace_id,
-            email,
-            status="trashed",
-            due_at=0,
-            reason="account_invalid",
-        ):
-            marked += 1
-            pending_seat_rows.append(row)
-
-    seat_pending = 0
-    for row in pending_seat_rows:
-        workspace_id = int(row["workspace_master_id"])
-        email = str(row["email"]).strip().lower()
-        if not _workspace_exists(workspace_id):
-            skipped += 1
-            continue
-        if _is_codex_seat(row.get("seat_type")):
-            continue
-        if not row.get("member_id") and str(row.get("workspace_join_status") or "") != "joined":
-            continue
         try:
+            # trash_workspace_candidate 内部先切换并远端复查 usage_based，只有
+            # 复查成功后才会把 trash_status 写成 trashed；这里绝不提前标记。
             result = workspace_membership.trash_workspace_candidate(
                 workspace_id,
                 email,
                 reason="account_invalid",
                 retries=1,
             )
-            if not result.get("ok"):
-                # 失效账号补偿流程历史上会先写入 trashed，再切换席位。
-                # 席位未确认 usage_based 时必须回滚，避免出现“已入箱但仍是
-                # 标准/ProLite 席位”的不一致状态。
-                db.update_workspace_candidate_trash(
-                    workspace_id,
-                    email,
-                    status="active",
-                    due_at=0,
-                    reason="",
-                )
+            if result.get("ok"):
+                marked += 1
+            elif result.get("pending_seat"):
                 seat_pending += 1
+            else:
+                skipped += 1
         except Exception:
             seat_pending += 1
-            # trash_workspace_candidate 可能在席位复查过程中抛错；此前的
-            # 兼容路径会先写 trashed，此处同样回滚，确保“未确认
-            # usage_based 就不能入箱”。
-            try:
-                db.update_workspace_candidate_trash(
-                    workspace_id,
-                    email,
-                    status="active",
-                    due_at=0,
-                    reason="",
-                )
-            except Exception:
-                logger.exception(
-                    "失效候选人垃圾箱状态回滚失败 workspace_db_id=%s email=%s",
-                    workspace_id,
-                    email,
-                )
             logger.exception(
-                "失效候选人入箱后席位处理失败 workspace_db_id=%s email=%s",
+                "失效候选人切换 Codex 后入箱失败 workspace_db_id=%s email=%s",
                 workspace_id,
                 email,
             )
@@ -2019,7 +2118,7 @@ def _trash_sweeper_worker():
                     quota_leases = quota_lease_pools.get(workspace_id)
                     if quota_leases is None:
                         try:
-                            quota_leases = _candidate_quota_proxy_pool(settings.get("proxy_pool"))
+                            quota_leases = _candidate_quota_proxy_pool(_candidate_proxy_pool_text(settings))
                         except ValueError:
                             # 交给单条处理函数统一记录失败并把复查时间后移，避免
                             # 到期行每 30 秒被 sweeper 反复捞起。
@@ -2065,7 +2164,7 @@ def _start_background_sweeper():
                             daemon=True,
                             name=f"seat-auto-{workspace_id}",
                         )
-                        next_at = time.time() + 5 * 60
+                        next_at = time.time() + _auto_seat_interval_seconds(settings)
                         _seat_auto_schedulers[workspace_id] = (stop, thread, next_at)
                         thread.start()
             if settings.get("auto_prolite_seat_enabled"):
@@ -2078,7 +2177,7 @@ def _start_background_sweeper():
                             daemon=True,
                             name=f"seat-auto-prolite-{workspace_id}",
                         )
-                        next_at = time.time() + 5 * 60
+                        next_at = time.time() + _auto_seat_interval_seconds(settings)
                         _prolite_auto_schedulers[workspace_id] = (stop, thread, next_at)
                         thread.start()
     except Exception:
@@ -2269,6 +2368,52 @@ def _candidate_trash_delay_seconds(workspace_id: int, settings: dict | None = No
     return int(cfg.get("trash_zero_delay_minutes", 60) or 60) * 60
 
 
+def _candidate_quota_network_retries(workspace_id: int, settings: dict | None = None) -> int:
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    try:
+        value = int(cfg.get("quota_network_retries", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(0, min(5, value))
+
+
+def _handle_candidate_quota_deactivated(
+    workspace_id: int,
+    email: str,
+    settings: dict | None,
+    exc: Exception,
+    *,
+    source: str,
+) -> None:
+    """连续 403 判定停用后的统一收尾：标记账号失效并按设置入箱。
+
+    与 ``_wait_and_relogin_for_candidate`` 里的失效处理走同一套动作，保证
+    无论从哪条路径识别出停用，账号与候选关系的落库结果一致。
+    """
+    logger.warning(
+        "额度查询判定账号停用 source=%s workspace_db_id=%s email=%s streak=%s error=%s",
+        source,
+        workspace_id,
+        email,
+        getattr(exc, "streak", 0),
+        str(exc)[:200],
+    )
+    try:
+        db.mark_registered_permanently_invalid(email, reason="quota_403")
+    except Exception:
+        logger.exception("账号停用标记失败 workspace_db_id=%s email=%s", workspace_id, email)
+    if not _candidate_trash_invalid_enabled(workspace_id, settings):
+        return
+    try:
+        workspace_membership.trash_workspace_candidates_by_email(
+            email,
+            reason="quota_403",
+            respect_invalid_settings=True,
+        )
+    except Exception:
+        logger.exception("账号停用后垃圾箱处理失败 workspace_db_id=%s email=%s", workspace_id, email)
+
+
 def _schedule_candidate_trash(workspace_id: int, email: str, *, reason: str = "quota_zero", delay_seconds: int | None = None) -> bool:
     row = db.get_workspace_candidate(workspace_id, email)
     if not row:
@@ -2369,7 +2514,7 @@ def _process_scheduled_trash_due(
         if not _workspace_exists(workspace_id):
             return
         if quota_leases is None:
-            quota_leases = _candidate_quota_proxy_pool(settings.get("proxy_pool"))
+            quota_leases = _candidate_quota_proxy_pool(_candidate_proxy_pool_text(settings))
         quota_proxy = _lease_candidate_quota_proxy(
             quota_leases,
             workspace_id=workspace_id,
@@ -2380,6 +2525,7 @@ def _process_scheduled_trash_due(
             workspace_id,
             email,
             proxy=quota_proxy,
+            network_retries=_candidate_quota_network_retries(workspace_id, settings),
         )
     except workspace_membership.QuotaUnauthorized:
         try:
@@ -2395,6 +2541,7 @@ def _process_scheduled_trash_due(
                     workspace_id,
                     email,
                     proxy=retry_proxy,
+                    network_retries=_candidate_quota_network_retries(workspace_id, settings),
                 )
             else:
                 if not _candidate_trash_invalid_enabled(workspace_id, settings):
@@ -2410,6 +2557,27 @@ def _process_scheduled_trash_due(
                 reason="quota_401_retry",
             )
             return
+    except workspace_membership.QuotaAccountDeactivated as exc:
+        # 停用判定本身就是终态结论，直接走失效入箱，不再顺延复查。
+        _handle_candidate_quota_deactivated(
+            workspace_id, email, settings, exc, source="trash_recheck"
+        )
+        return
+    except workspace_membership.QuotaPaymentRequired as exc:
+        logger.error(
+            "垃圾箱到期复查遇到空间计费异常 workspace_db_id=%s email=%s error=%s",
+            workspace_id,
+            email,
+            str(exc)[:300],
+        )
+        db.update_workspace_candidate_trash(
+            workspace_id,
+            email,
+            status="scheduled",
+            due_at=time.time() + 10 * 60,
+            reason="quota_402_retry",
+        )
+        return
     except Exception:
         logger.exception("垃圾箱到期额度复查失败 workspace_db_id=%s email=%s", workspace_id, email)
         db.update_workspace_candidate_trash(
@@ -2524,7 +2692,13 @@ def api_workspace_candidate_options(
         trash_status=trash_status, tag_status=tag_status,
         group_name=group_name,
     )
-    return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset}
+    stats = db.get_workspace_candidate_stats(workspace_id)
+    return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset, "stats": stats}
+
+
+@app.get("/api/workspace-candidates/stats")
+def api_workspace_candidate_stats(workspace_id: int):
+    return {"ok": True, "stats": db.get_workspace_candidate_stats(workspace_id)}
 
 
 @app.get("/api/workspace-candidates/groups")
@@ -2654,7 +2828,11 @@ def api_request_workspace_join(req: WorkspaceCandidatesReq):
         raise HTTPException(400, "席位类型只能是标准席位、Usage-based 或 ProLite")
     rows = db.list_workspace_candidates(req.workspace_id)
     indexed = {r["email"]: r for r in rows}; results = []
-    pool_values = [line.strip() for line in req.proxy_pool.splitlines() if line.strip()]
+    pool_values = _proxy_pool_values(
+        _candidate_proxy_pool_text(
+            db.get_workspace_settings(req.workspace_id), req.proxy_pool
+        )
+    )
     proxy_leases = public_relogin.ProxyLeasePool(pool_values)
     def run_one(item):
         _index, email = item
@@ -2754,6 +2932,7 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
     for email in req.emails:
         key = email.lower(); row = indexed.get(key)
         reserved = False
+        prolite_reserved = False
         try:
             if not row: raise RuntimeError("候选人不属于当前空间")
             if row.get("workspace_join_status") != "joined":
@@ -2795,8 +2974,22 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
                         f"下次刷新时间 {reservation.get('refresh_time') or settings.get('seat_protect_refresh_time') or '00:00'}"
                     )
                 reserved = bool(reservation.get("enabled"))
+            elif req.seat_type == "prolite" and current_seat != "prolite":
+                reservation = db.reserve_workspace_prolite_seat_protect_quota(req.workspace_id, 1)
+                if not reservation.get("allowed", False):
+                    raise RuntimeError(
+                        "高级席位保护已生效：本周期高级席位切换已达 "
+                        f"{int(reservation.get('threshold') or settings.get('prolite_seat_protect_threshold') or 8)} 个，"
+                        f"下次刷新时间 {reservation.get('refresh_time') or settings.get('prolite_seat_protect_refresh_time') or '00:00'}"
+                    )
+                prolite_reserved = bool(reservation.get("enabled"))
             result = workspace_membership.update_member_seat_type(req.workspace_id, row["member_id"], req.seat_type)
             db.update_workspace_candidate_member(req.workspace_id, email, row["member_id"], req.seat_type)
+            if req.seat_type in {"default", "prolite"}:
+                try:
+                    db.increment_workspace_fulfillment_counter(req.workspace_id, req.seat_type, 1)
+                except Exception:
+                    logger.exception("席位切换历史计数递增失败 workspace_db_id=%s email=%s seat_type=%s", req.workspace_id, key, req.seat_type)
             results.append({"email": key, "ok": True, "skipped": False, "result": result})
         except Exception as e:
             logger.error(
@@ -2812,6 +3005,11 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
                     db.release_workspace_seat_protect_quota(req.workspace_id, 1)
                 except Exception:
                     logger.exception("席位保护配额回滚失败 workspace_db_id=%s email=%s", req.workspace_id, key)
+            if prolite_reserved:
+                try:
+                    db.release_workspace_prolite_seat_protect_quota(req.workspace_id, 1)
+                except Exception:
+                    logger.exception("高级席位保护配额回滚失败 workspace_db_id=%s email=%s", req.workspace_id, key)
             results.append({"email": key, "ok": False, "error": str(e)})
     skipped = sum(1 for x in results if x.get("skipped"))
     failed = sum(1 for x in results if not x.get("ok"))
@@ -2833,7 +3031,7 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
     settings = _workspace_settings_snapshot(req.workspace_id, setting_overrides)
     try:
         quota_leases = _candidate_quota_proxy_pool(
-            req.proxy_pool or settings.get("proxy_pool"),
+            _candidate_proxy_pool_text(settings, req.proxy_pool),
             preferred_proxy=req.quota_proxy,
         )
     except ValueError as exc:
@@ -2844,7 +3042,7 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
         if str(row.get("email") or "").strip()
     }
     results = {}
-    logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(req.proxy_pool.strip() or str(settings.get("proxy_pool") or "").strip()))
+    logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(_candidate_proxy_pool_text(settings, req.proxy_pool)))
     trash_delay = _candidate_trash_delay_seconds(req.workspace_id, settings)
     for email in req.emails:
         key = email.strip().lower()
@@ -2865,14 +3063,26 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
                 req.workspace_id,
                 email,
                 proxy=quota_proxy,
+                network_retries=_candidate_quota_network_retries(req.workspace_id, settings),
             )
             results[key] = {"ok": True, "quota": quota}
+        except workspace_membership.QuotaAccountDeactivated as e:
+            _handle_candidate_quota_deactivated(
+                req.workspace_id, key, settings, e, source="quota_manual"
+            )
+            results[key] = {"ok": False, "error": str(e), "status": "deactivated"}
+            if _candidate_trash_invalid_enabled(req.workspace_id, settings):
+                results[key]["trashed"] = True
+            continue
+        except workspace_membership.QuotaPaymentRequired as e:
+            results[key] = {"ok": False, "error": str(e), "status": "payment_required"}
+            continue
         except Exception as e:
             results[key] = {"ok": False, "error": str(e)}
-            is_401 = isinstance(e, workspace_membership.QuotaUnauthorized) or "HTTP 401" in str(e) or "401" in str(e)
+            is_401 = isinstance(e, workspace_membership.QuotaUnauthorized)
             if req.relogin_on_401 and is_401:
-                if not str(settings.get("proxy_pool") or "").strip():
-                    results[key]["relogin_error"] = "全局代理池为空，无法重新登录"
+                if not _candidate_proxy_pool_text(settings):
+                    results[key]["relogin_error"] = "候选人代理池为空，无法重新登录"
                     continue
                 try:
                     relogin_ok = _wait_and_relogin_for_candidate(
@@ -2897,6 +3107,7 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
                         req.workspace_id,
                         key,
                         proxy=retry_proxy,
+                        network_retries=_candidate_quota_network_retries(req.workspace_id, settings),
                     )
                     results[key] = {"ok": True, "quota": quota, "relogin_started": True}
                 except Exception as relogin_exc:
@@ -2931,7 +3142,10 @@ def api_start_quota_schedule(req: WorkspaceQuotaScheduleReq):
     settings = db.get_workspace_settings(req.workspace_id)
     for key in req.model_fields_set:
         if key != "workspace_id":
-            settings[key] = getattr(req, key)
+            value = getattr(req, key)
+            if key == "auto_prolite_candidate_seat_type":
+                value = _normalize_auto_prolite_candidate_seat_type(value)
+            settings[key] = value
     settings["quota_enabled"] = True
     db.update_workspace_settings(req.workspace_id, settings)
     item, _ = _start_quota_scheduler(
@@ -2975,11 +3189,17 @@ def api_start_auto_standard_seat(req: WorkspaceAutoSeatReq):
     db.update_workspace_settings(req.workspace_id, {"auto_standard_seat_enabled": True})
     stop = threading.Event()
     thread = threading.Thread(target=_auto_standard_seat_worker, args=(req.workspace_id, stop), daemon=True)
-    next_at = time.time() + 5 * 60
+    next_at = time.time() + _auto_seat_interval_seconds(settings)
     with _seat_auto_schedulers_lock:
         _seat_auto_schedulers[req.workspace_id] = (stop, thread, next_at)
     thread.start()
-    return {"ok": True, "running": True, "settings": {**settings, "auto_standard_seat_enabled": True}, "next_at": next_at}
+    return {
+        "ok": True,
+        "running": True,
+        "interval_minutes": _auto_seat_interval_seconds(settings) // 60,
+        "settings": {**settings, "auto_standard_seat_enabled": True},
+        "next_at": next_at,
+    }
 
 
 @app.post("/api/workspace-candidates/auto-standard-seat/stop")
@@ -3000,13 +3220,14 @@ def api_auto_standard_seat_status(workspace_id: int):
         if not item and cfg.get("auto_standard_seat_enabled"):
             stop = threading.Event()
             thread = threading.Thread(target=_auto_standard_seat_worker, args=(workspace_id, stop), daemon=True)
-            next_at = time.time() + 5 * 60
+            next_at = time.time() + _auto_seat_interval_seconds(cfg)
             item = (stop, thread, next_at)
             _seat_auto_schedulers[workspace_id] = item
             thread.start()
     return {
         "ok": True,
         "running": bool(item and item[1].is_alive()),
+        "interval_minutes": _auto_seat_interval_seconds(cfg) // 60,
         "next_at": item[2] if item else 0,
         "settings": cfg,
     }
@@ -3027,13 +3248,14 @@ def api_start_auto_prolite_seat(req: WorkspaceAutoSeatReq):
         daemon=True,
         name=f"seat-auto-prolite-{req.workspace_id}",
     )
-    next_at = time.time() + 5 * 60
+    next_at = time.time() + _auto_seat_interval_seconds(settings)
     with _prolite_auto_schedulers_lock:
         _prolite_auto_schedulers[req.workspace_id] = (stop, thread, next_at)
     thread.start()
     return {
         "ok": True,
         "running": True,
+        "interval_minutes": _auto_seat_interval_seconds(settings) // 60,
         "settings": {**settings, "auto_prolite_seat_enabled": True},
         "next_at": next_at,
     }
@@ -3065,13 +3287,14 @@ def api_auto_prolite_seat_status(workspace_id: int):
                 daemon=True,
                 name=f"seat-auto-prolite-{workspace_id}",
             )
-            next_at = time.time() + 5 * 60
+            next_at = time.time() + _auto_seat_interval_seconds(cfg)
             item = (stop, thread, next_at)
             _prolite_auto_schedulers[workspace_id] = item
             thread.start()
     return {
         "ok": True,
         "running": bool(item and item[1].is_alive()),
+        "interval_minutes": _auto_seat_interval_seconds(cfg) // 60,
         "next_at": item[2] if item else 0,
         "settings": cfg,
     }
@@ -3118,7 +3341,10 @@ def api_save_workspace_candidate_settings(req: WorkspaceQuotaScheduleReq):
     settings = db.get_workspace_settings(req.workspace_id)
     for key in req.model_fields_set:
         if key != "workspace_id":
-            settings[key] = getattr(req, key)
+            value = getattr(req, key)
+            if key == "auto_prolite_candidate_seat_type":
+                value = _normalize_auto_prolite_candidate_seat_type(value)
+            settings[key] = value
     db.update_workspace_settings(req.workspace_id, settings)
     return {"ok": True}
 
@@ -3176,9 +3402,11 @@ def api_workspace_credentials(req: WorkspaceCandidatesReq):
                 # not_invited / pending_request / 其他状态都不能获取空间凭证。
                 skipped.append(email)
     eligible = trusted_eligible + eligible
-    proxy_pool = req.proxy_pool
+    proxy_pool = _candidate_proxy_pool_text(
+        db.get_workspace_settings(req.workspace_id), req.proxy_pool
+    )
     if not proxy_pool:
-        raise HTTPException(400, "全局代理池为空")
+        raise HTTPException(400, "候选人代理池为空")
     if not eligible:
         return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(skipped), "skipped_emails": skipped}
     result = login_controller_for(
@@ -3251,9 +3479,11 @@ def api_workspace_login_only(req: WorkspaceCandidatesReq):
             else:
                 skipped.append(email)
     eligible = trusted_eligible + eligible
-    proxy_pool = req.proxy_pool
+    proxy_pool = _candidate_proxy_pool_text(
+        db.get_workspace_settings(req.workspace_id), req.proxy_pool
+    )
     if not proxy_pool:
-        raise HTTPException(400, "全局代理池为空")
+        raise HTTPException(400, "候选人代理池为空")
     if not eligible:
         return {"ok": True, "run": None, "workspace_id": master["workspace_id"], "eligible": 0, "skipped": len(skipped), "skipped_emails": skipped}
     result = login_controller_for(

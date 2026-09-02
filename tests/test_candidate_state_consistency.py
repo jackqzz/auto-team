@@ -75,6 +75,30 @@ class CandidateStateConsistencyTests(unittest.TestCase):
         update.assert_not_called()
         switch_seat.assert_not_called()
 
+    def test_invalid_reconciliation_never_marks_before_codex_confirmation(self):
+        rows = [{
+            "workspace_master_id": 1,
+            "email": "enabled@example.com",
+            "member_id": "member-1",
+            "workspace_join_status": "joined",
+            "seat_type": "default",
+        }]
+        with (
+            patch.object(app.db, "list_invalid_workspace_candidates_pending_trash", return_value=rows),
+            patch.object(app.db, "get_workspace_settings", return_value={"trash_invalid_enabled": True}),
+            patch.object(app.db, "update_workspace_candidate_trash") as update,
+            patch.object(
+                app.workspace_membership,
+                "trash_workspace_candidate",
+                return_value={"ok": False, "pending_seat": True},
+            ) as trash,
+        ):
+            result = app._reconcile_invalid_candidate_trash()
+
+        self.assertEqual(result, {"scanned": 1, "marked": 0, "skipped": 0, "seat_pending": 1})
+        trash.assert_called_once_with(1, "enabled@example.com", reason="account_invalid", retries=1)
+        update.assert_not_called()
+
     def test_immediate_invalid_trash_respects_each_workspace_setting(self):
         rows = [
             {"workspace_master_id": 1},
@@ -106,6 +130,7 @@ class CandidateStateConsistencyTests(unittest.TestCase):
 
     def test_trash_requires_confirmed_usage_based_seat_before_marking(self):
         with (
+            patch.object(workspace_membership.db, "get_workspace_master", return_value={"id": 1}),
             patch.object(workspace_membership.db, "get_workspace_candidate", return_value={}),
             patch.object(
                 workspace_membership,
@@ -120,8 +145,21 @@ class CandidateStateConsistencyTests(unittest.TestCase):
         self.assertTrue(result["pending_seat"])
         update.assert_not_called()
 
+    def test_trash_does_not_call_upstream_when_mother_is_missing(self):
+        with (
+            patch.object(workspace_membership.db, "get_workspace_master", return_value=None),
+            patch.object(workspace_membership, "_ensure_candidate_usage_based") as ensure,
+        ):
+            result = workspace_membership.trash_workspace_candidate(19, "member@example.com")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["pending_seat"])
+        self.assertIn("母号不存在", result["error"])
+        ensure.assert_not_called()
+
     def test_trash_marks_only_after_usage_based_confirmation(self):
         with (
+            patch.object(workspace_membership.db, "get_workspace_master", return_value={"id": 1}),
             patch.object(workspace_membership.db, "get_workspace_candidate", return_value={}),
             patch.object(
                 workspace_membership,
@@ -183,6 +221,28 @@ class CandidateStateConsistencyTests(unittest.TestCase):
             {"ok": False, "error": "Codex席位不参与额度查询", "skipped": True},
         )
         fetch.assert_not_called()
+
+
+    def test_increment_workspace_fulfillment_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.import_workspace_sessions(
+                    "owner@example.com----session-token-abcdefghijklmnopqrstuvwxyz"
+                    "----socks5://127.0.0.1:1080"
+                )
+                c1 = db.increment_workspace_fulfillment_counter(1, "prolite", 1)
+                c2 = db.increment_workspace_fulfillment_counter(1, "prolite", 2)
+                c3 = db.increment_workspace_fulfillment_counter(1, "default", 1)
+
+                stats = db.get_workspace_candidate_stats(1)
+
+        self.assertEqual(c1, 1)
+        self.assertEqual(c2, 3)
+        self.assertEqual(c3, 1)
+        self.assertEqual(stats["seat_fulfillment"]["prolite"]["fulfilled_total"], 3)
+        self.assertEqual(stats["seat_fulfillment"]["standard"]["fulfilled_total"], 1)
 
 
 if __name__ == "__main__":

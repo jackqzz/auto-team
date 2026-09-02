@@ -1,15 +1,16 @@
 import http from './request'
 export const listCandidateOptions = (workspace_id, params = {}) => http.get('/api/workspace-candidates/options', { params: { workspace_id, ...params } })
+export const getCandidateStats = (workspace_id) => http.get('/api/workspace-candidates/stats', { params: { workspace_id } })
 export const listCandidateGroups = (workspace_id) => http.get('/api/workspace-candidates/groups', { params: { workspace_id } })
 export const listCandidates = (workspace_id) => http.get('/api/workspace-candidates', { params: { workspace_id } })
 export const assignCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/assign', { workspace_id, emails })
 export const removeCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/remove', { workspace_id, emails })
 export const updateCandidateTagStatus = (workspace_id, emails, tag_status) => http.post('/api/workspace-candidates/tag-status', { workspace_id, emails, tag_status })
 // 母号批量邀请会在上游邀请后逐个复查候选状态，处理时间随邀请人数增长。
-// Axios 的 timeout 单位是毫秒；每个候选人预留 5 秒，避免沿用全局 60 秒导致大批量邀请被浏览器提前中断。
+// Axios 的 timeout 单位是毫秒；保底 60 秒，并根据人数动态增加（每人 5 秒），避免大批量邀请被浏览器提前中断。
 export const inviteCandidates = (workspace_id, emails, seat_type = 'default') => {
   const count = Array.isArray(emails) ? emails.length : 0
-  const timeout = Math.max(1, count) * 5000
+  const timeout = Math.max(60000, count * 5000)
   return http.post('/api/workspace-candidates/invite', { workspace_id, emails, seat_type }, { timeout })
 }
 export const setCandidateInviteStatus = (workspace_id, emails, join_status) => http.post('/api/workspace-candidates/invite-status', { workspace_id, emails, join_status })

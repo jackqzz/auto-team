@@ -169,12 +169,27 @@ class ProxyLeasePool:
         *,
         task_type: str = "",
         task_detail: str = "",
+        skip_cooldown: bool = False,
     ) -> tuple[str, int, int]:
-        """领取使用次数最少的代理；有其他选择时避开上一条失败代理。"""
+        """领取使用次数最少的代理；有其他选择时避开上一条失败代理。
+
+        ``skip_cooldown`` 打开时跳过处于候选人任务冷却期的代理。该开关只给
+        候选人路径使用——公开重登录等调用方共用本类，不应受此影响。若全部
+        代理都在冷却，仍退回完整列表：宁可用坏代理也不能让整批任务停摆。
+        """
         with self._lock:
             if not self._proxies:
                 return "", -1, 0
             candidates = list(range(len(self._proxies)))
+            if skip_cooldown:
+                available = [
+                    i for i in candidates
+                    if not db.is_proxy_in_cooldown(
+                        self._proxies[i], db.CANDIDATE_PROXY_ERROR_TYPE
+                    )
+                ]
+                if available:
+                    candidates = available
             alternatives = [i for i in candidates if self._proxies[i] != exclude_proxy]
             if alternatives:
                 candidates = alternatives

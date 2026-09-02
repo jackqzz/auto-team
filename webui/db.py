@@ -600,12 +600,16 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "interval_minutes": 30,
     "relogin_on_401": False,
     "proxy_pool": "",
+    # 候选人专属代理池：为空时回退到 proxy_pool（即前端同步下来的全局池），
+    # 非空时额度查询/401 重登录/凭证获取都改走它，与全局池解绑。
+    "quota_proxy_pool": "",
     "auto_push": False,
     "concurrency": 1,
     "otp_timeout": 180,
     "account_retry_count": 1,
     "cool_down_seconds": 0,
     "quota_enabled": False,
+    "quota_network_retries": 2,
     "trash_enabled": True,
     "trash_invalid_enabled": True,
     "trash_zero_delay_minutes": 60,
@@ -614,8 +618,17 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "seat_protect_refresh_time": "00:00",
     "seat_protect_used_count": 0,
     "seat_protect_window_key": "",
+    "prolite_seat_protect_enabled": False,
+    "prolite_seat_protect_threshold": 8,
+    "prolite_seat_protect_refresh_time": "00:00",
+    "prolite_seat_protect_used_count": 0,
+    "prolite_seat_protect_window_key": "",
     "auto_standard_seat_enabled": False,
     "auto_prolite_seat_enabled": False,
+    "auto_seat_interval_minutes": 5,
+    "auto_prolite_candidate_seat_type": "default",
+    "standard_fulfilled_total": 0,
+    "prolite_fulfilled_total": 0,
 }
 
 _CST = timezone(timedelta(hours=8))
@@ -671,6 +684,17 @@ def get_workspace_settings(workspace_id: int) -> dict:
             update_workspace_settings(int(workspace_id), {
                 "seat_protect_window_key": current_key,
                 "seat_protect_used_count": 0,
+            })
+    if values.get("prolite_seat_protect_enabled"):
+        refresh_time = _normalize_hhmm(values.get("prolite_seat_protect_refresh_time") or "00:00")
+        current_key = _workspace_seat_protect_window_key(time.time(), refresh_time)
+        stored_key = str(values.get("prolite_seat_protect_window_key") or "").strip()
+        if stored_key != current_key:
+            values["prolite_seat_protect_window_key"] = current_key
+            values["prolite_seat_protect_used_count"] = 0
+            update_workspace_settings(int(workspace_id), {
+                "prolite_seat_protect_window_key": current_key,
+                "prolite_seat_protect_used_count": 0,
             })
     result = dict(_WORKSPACE_SETTINGS_DEFAULTS)
     result.update(values)
@@ -787,6 +811,111 @@ def release_workspace_seat_protect_quota(workspace_id: int, amount: int = 1) -> 
         )
         con.commit()
         return True
+
+
+def reserve_workspace_prolite_seat_protect_quota(workspace_id: int, amount: int = 1) -> dict:
+    """Reserve one or more advanced (ProLite) seat-switch operations."""
+    amount = max(1, int(amount or 1))
+    with _lock:
+        con = _conn()
+        row = con.execute("SELECT settings_json FROM workspace_masters WHERE id=?", (int(workspace_id),)).fetchone()
+        if not row:
+            return {"ok": False, "allowed": False, "enabled": False, "error": "母号不存在"}
+        try:
+            raw = json.loads(row["settings_json"] or "{}")
+            settings = raw if isinstance(raw, dict) else {}
+        except Exception:
+            settings = {}
+        enabled = bool(settings.get("prolite_seat_protect_enabled", False))
+        threshold = int(settings.get("prolite_seat_protect_threshold") or 8)
+        refresh_time = _normalize_hhmm(settings.get("prolite_seat_protect_refresh_time") or "00:00")
+        window_key = _workspace_seat_protect_window_key(time.time(), refresh_time)
+        stored_window = str(settings.get("prolite_seat_protect_window_key") or "").strip()
+        used = int(settings.get("prolite_seat_protect_used_count") or 0)
+        if stored_window != window_key:
+            used = 0
+        allowed = (not enabled) or (used + amount <= threshold)
+        result = {
+            "ok": True,
+            "enabled": enabled,
+            "allowed": allowed,
+            "used_count": used,
+            "threshold": threshold,
+            "refresh_time": refresh_time,
+            "window_key": window_key,
+        }
+        if not allowed:
+            return result
+        if enabled:
+            settings["prolite_seat_protect_enabled"] = enabled
+            settings["prolite_seat_protect_threshold"] = threshold
+            settings["prolite_seat_protect_refresh_time"] = refresh_time
+            settings["prolite_seat_protect_window_key"] = window_key
+            settings["prolite_seat_protect_used_count"] = used + amount
+            con.execute(
+                "UPDATE workspace_masters SET settings_json=?, updated_at=? WHERE id=?",
+                (json.dumps(settings, ensure_ascii=False), time.time(), int(workspace_id)),
+            )
+            con.commit()
+            result["used_count"] = used + amount
+        return result
+
+
+def release_workspace_prolite_seat_protect_quota(workspace_id: int, amount: int = 1) -> bool:
+    """Release a previously reserved advanced seat protection quota."""
+    amount = max(1, int(amount or 1))
+    with _lock:
+        con = _conn()
+        row = con.execute("SELECT settings_json FROM workspace_masters WHERE id=?", (int(workspace_id),)).fetchone()
+        if not row:
+            return False
+        try:
+            raw = json.loads(row["settings_json"] or "{}")
+            settings = raw if isinstance(raw, dict) else {}
+        except Exception:
+            settings = {}
+        if not bool(settings.get("prolite_seat_protect_enabled", False)):
+            return False
+        refresh_time = _normalize_hhmm(settings.get("prolite_seat_protect_refresh_time") or "00:00")
+        window_key = _workspace_seat_protect_window_key(time.time(), refresh_time)
+        stored_window = str(settings.get("prolite_seat_protect_window_key") or "").strip()
+        used = int(settings.get("prolite_seat_protect_used_count") or 0)
+        if stored_window != window_key:
+            used = 0
+        settings["prolite_seat_protect_window_key"] = window_key
+        settings["prolite_seat_protect_used_count"] = max(0, used - amount)
+        con.execute(
+            "UPDATE workspace_masters SET settings_json=?, updated_at=? WHERE id=?",
+            (json.dumps(settings, ensure_ascii=False), time.time(), int(workspace_id)),
+        )
+        con.commit()
+        return True
+
+
+def increment_workspace_fulfillment_counter(workspace_id: int, seat_type: str, amount: int = 1) -> int:
+    """递增指定母号空间的席位补齐历史累计计数，并返回递增后的总数。"""
+    amount = max(1, int(amount or 1))
+    canonical_seat = _canonical_workspace_seat_type(seat_type)
+    counter_key = "prolite_fulfilled_total" if canonical_seat == "prolite" else "standard_fulfilled_total"
+    with _lock:
+        con = _conn()
+        row = con.execute("SELECT settings_json FROM workspace_masters WHERE id=?", (int(workspace_id),)).fetchone()
+        if not row:
+            return 0
+        try:
+            raw = json.loads(row["settings_json"] or "{}")
+            settings = raw if isinstance(raw, dict) else {}
+        except Exception:
+            settings = {}
+        current = max(0, int(settings.get(counter_key) or 0))
+        new_total = current + amount
+        settings[counter_key] = new_total
+        con.execute(
+            "UPDATE workspace_masters SET settings_json=?, updated_at=? WHERE id=?",
+            (json.dumps(settings, ensure_ascii=False), time.time(), int(workspace_id)),
+        )
+        con.commit()
+        return new_total
 
 
 def delete_workspace_master(workspace_id: int) -> bool:
@@ -1031,6 +1160,78 @@ def count_workspace_candidate_options(
         JOIN workspace_candidates c ON c.email=r.email
         LEFT JOIN workspace_credentials wc ON wc.email=r.email AND wc.workspace_master_id=?
         WHERE """ + where, [int(workspace_master_id), *args]).fetchone()[0])
+
+
+def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
+    """返回指定母号空间的候选人状态统计，包括垃圾回收与席位保护补齐相关统计。"""
+    wid = int(workspace_master_id)
+    con = _conn()
+    now = time.time()
+
+    # 候选表总数与垃圾箱状态统计
+    # 关联 registered，以准确识别 account_status
+    rows = con.execute("""
+        SELECT
+            COUNT(*) AS total_candidates,
+            SUM(CASE WHEN COALESCE(c.trash_status, 'active') = 'trashed' THEN 1 ELSE 0 END) AS trashed_count,
+            SUM(CASE WHEN COALESCE(c.trash_status, 'active') = 'scheduled' THEN 1 ELSE 0 END) AS scheduled_trash_count,
+            SUM(CASE WHEN COALESCE(c.trash_status, 'active') = 'scheduled' AND COALESCE(c.trash_due_at, 0) > 0 AND c.trash_due_at <= ? THEN 1 ELSE 0 END) AS due_scheduled_trash_count,
+            SUM(CASE WHEN COALESCE(r.account_status, 'active') = 'permanently_invalid' AND COALESCE(c.trash_status, 'active') <> 'trashed' THEN 1 ELSE 0 END) AS invalid_pending_trash_count,
+            SUM(CASE WHEN COALESCE(r.account_status, 'active') = 'permanently_invalid' THEN 1 ELSE 0 END) AS invalid_total_count,
+            SUM(CASE WHEN COALESCE(c.tag_status, 'active') = 'outbound' THEN 1 ELSE 0 END) AS outbound_count,
+            SUM(CASE WHEN COALESCE(c.seat_type, '') IN ('default', 'standard', 'standard_seat') OR (COALESCE(c.seat_type, '') = '' AND COALESCE(c.gpt_seat, '') <> '') THEN 1 ELSE 0 END) AS standard_seat_count,
+            SUM(CASE WHEN COALESCE(c.seat_type, '') IN ('prolite', 'pro_lite', 'advanced', 'premium') THEN 1 ELSE 0 END) AS prolite_seat_count,
+            SUM(CASE WHEN COALESCE(c.seat_type, '') IN ('usage_based', 'codex') OR (COALESCE(c.seat_type, '') = '' AND COALESCE(c.codex_seat, '') <> '') THEN 1 ELSE 0 END) AS codex_seat_count
+        FROM workspace_candidates c
+        JOIN registered r ON r.email = c.email
+        WHERE c.workspace_master_id = ?
+    """, (now, wid)).fetchone()
+
+    data = dict(rows) if rows else {}
+    settings = get_workspace_settings(wid)
+
+    return {
+        "workspace_id": wid,
+        "total_candidates": int(data.get("total_candidates") or 0),
+        "trash": {
+            "trashed_count": int(data.get("trashed_count") or 0),
+            "scheduled_count": int(data.get("scheduled_count") or data.get("scheduled_trash_count") or 0),
+            "due_scheduled_count": int(data.get("due_scheduled_trash_count") or 0),
+            "invalid_pending_trash_count": int(data.get("invalid_pending_trash_count") or 0),
+            "invalid_total_count": int(data.get("invalid_total_count") or 0),
+            "trash_enabled": bool(settings.get("trash_enabled", True)),
+            "trash_invalid_enabled": bool(settings.get("trash_invalid_enabled", True)),
+            "trash_zero_delay_minutes": int(settings.get("trash_zero_delay_minutes") or 60),
+        },
+        "seat_fulfillment": {
+            "standard": {
+                "count": int(data.get("standard_seat_count") or 0),
+                "fulfilled_total": int(settings.get("standard_fulfilled_total") or 0),
+                "auto_enabled": bool(settings.get("auto_standard_seat_enabled", False)),
+                "protect_enabled": bool(settings.get("seat_protect_enabled", False)),
+                "protect_used_count": int(settings.get("seat_protect_used_count") or 0),
+                "protect_threshold": int(settings.get("seat_protect_threshold") or 8),
+                "protect_refresh_time": str(settings.get("seat_protect_refresh_time") or "00:00"),
+                "protect_window_key": str(settings.get("seat_protect_window_key") or ""),
+            },
+            "prolite": {
+                "count": int(data.get("prolite_seat_count") or 0),
+                "fulfilled_total": int(settings.get("prolite_fulfilled_total") or 0),
+                "auto_enabled": bool(settings.get("auto_prolite_seat_enabled", False)),
+                "protect_enabled": bool(settings.get("prolite_seat_protect_enabled", False)),
+                "protect_used_count": int(settings.get("prolite_seat_protect_used_count") or 0),
+                "protect_threshold": int(settings.get("prolite_seat_protect_threshold") or 8),
+                "protect_refresh_time": str(settings.get("prolite_seat_protect_refresh_time") or "00:00"),
+                "protect_window_key": str(settings.get("prolite_seat_protect_window_key") or ""),
+            },
+            "codex": {
+                "count": int(data.get("codex_seat_count") or 0),
+            },
+            "outbound_count": int(data.get("outbound_count") or 0),
+            "auto_interval_minutes": int(settings.get("auto_seat_interval_minutes") or 5),
+            "auto_prolite_candidate_seat_type": str(settings.get("auto_prolite_candidate_seat_type") or "default"),
+        }
+    }
 
 
 def list_workspace_candidate_groups(workspace_master_id: int) -> list[str]:
@@ -3259,6 +3460,66 @@ def list_proxy_cooldown() -> list[dict]:
            ORDER BY cooldown_until DESC, proxy, error_type"""
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+# 候选人任务专用的代理错误分类。与 record_proxy_error 的一次即冷却不同，
+# 这里要求连续多次失败才熔断——日志显示 3 条代理制造了 70% 的失败，而
+# 偶发抖动的代理失败率只有 0.3%，一次就踢会把好代理误伤出池。
+CANDIDATE_PROXY_ERROR_TYPE = "candidate_quota"
+CANDIDATE_PROXY_FAILURE_STREAK = 3
+CANDIDATE_PROXY_COOLDOWN_SECONDS = 30 * 60
+
+
+def record_candidate_proxy_failure(
+    proxy: str,
+    *,
+    streak_threshold: int = CANDIDATE_PROXY_FAILURE_STREAK,
+    cooldown_seconds: int = CANDIDATE_PROXY_COOLDOWN_SECONDS,
+) -> int:
+    """记录候选人任务的一次代理网络失败，返回累计连击数。
+
+    连击数达到 *streak_threshold* 才写入冷却时间；未达阈值时只累加计数，
+    ``cooldown_until`` 保持 0，因此不影响租取。
+    """
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value:
+        return 0
+    threshold = max(1, int(streak_threshold or 1))
+    now = time.time()
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT error_count FROM proxy_cooldown WHERE proxy=? AND error_type=?",
+            (proxy_value, CANDIDATE_PROXY_ERROR_TYPE),
+        ).fetchone()
+        streak = int((row["error_count"] if row else 0) or 0) + 1
+        until = now + max(1, int(cooldown_seconds or 1)) if streak >= threshold else 0.0
+        con.execute(
+            """INSERT INTO proxy_cooldown(
+                   proxy, error_type, error_count, last_error_at, cooldown_until
+               ) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(proxy, error_type) DO UPDATE SET
+                   error_count=excluded.error_count,
+                   last_error_at=excluded.last_error_at,
+                   cooldown_until=excluded.cooldown_until""",
+            (proxy_value, CANDIDATE_PROXY_ERROR_TYPE, streak, now, until),
+        )
+        con.commit()
+    return streak
+
+
+def clear_candidate_proxy_failure(proxy: str) -> None:
+    """候选人任务成功后清零该代理的连击计数与冷却。"""
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "DELETE FROM proxy_cooldown WHERE proxy=? AND error_type=?",
+            (proxy_value, CANDIDATE_PROXY_ERROR_TYPE),
+        )
+        con.commit()
 
 
 def _setting_bool(value) -> bool:

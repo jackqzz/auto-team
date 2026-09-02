@@ -18,6 +18,9 @@ from . import db
 BASE = "https://chatgpt.com"
 WORKSPACE_ADMIN_REQUEST_INTERVAL_SECONDS = 1.0
 WORKSPACE_ADMIN_MAX_429_RETRIES = 3
+# 连续多少轮 403 才判定账号停用。单次 403 常是边缘节点瞬时拒绝，直接判死
+# 会误杀仍在正常使用的账号。
+DEACTIVATION_403_STREAK = 2
 
 _workspace_admin_state_lock = threading.Lock()
 _workspace_admin_locks: dict[int, threading.Lock] = {}
@@ -34,21 +37,50 @@ class QuotaHttpError(RuntimeError):
         super().__init__(f"额度查询失败 HTTP {status_code}")
 
 
+class QuotaNetworkError(RuntimeError):
+    """网络/TLS/超时/5xx —— 可重试类失败，重试次数耗尽后才抛出。"""
+
+
+class QuotaAccountDeactivated(RuntimeError):
+    """连续多轮 403，判定账号已停用。
+
+    单次 403 常常是边缘节点/风控的瞬时拒绝（日志里多次出现同一秒内跨账号
+    成组 403），因此必须连续命中才归因到账号本身。
+    """
+    def __init__(self, message: str, *, streak: int = 0):
+        self.streak = int(streak)
+        super().__init__(message)
+
+
+class QuotaPaymentRequired(RuntimeError):
+    """402 —— 母号空间订阅/计费异常，不归因到单个候选账号。"""
+
+
 class UpstreamHttpError(RuntimeError):
     def __init__(self, status_code: int, detail: object):
         self.status_code = int(status_code)
         super().__init__(f"上游 HTTP {self.status_code}: {detail}")
 
-def fetch_candidate_quota(workspace_db_id: int, email: str, *, proxy: str) -> dict:
-    """查询候选人的 Codex 额度，且必须使用本次从全局池租取的代理。
+def fetch_candidate_quota(
+    workspace_db_id: int,
+    email: str,
+    *,
+    proxy: str,
+    network_retries: int = 2,
+) -> dict:
+    """查询候选人的 Codex 额度，且必须使用本次从候选人代理池租取的代理。
 
     额度请求携带的是候选人的 Team Access Token，不属于母号管理请求，禁止
     复用 ``workspace_masters.proxy_url``。调用方必须显式传入代理，避免配置
     缺失时悄悄回退到母号出口或直连。
+
+    ``network_retries`` 控制网络异常（TLS 握手失败、连接超时等）与 5xx 的
+    重试次数，两者共用同一份预算；429 另有独立预算并按 ``Retry-After`` 退避。
+    传输层失败会累计到该代理的熔断连击上，拿到任何响应则清零。
     """
     proxy_value = str(proxy or "").strip()
     if not proxy_value:
-        raise ValueError("全局代理池为空，候选额度查询无法租取代理")
+        raise ValueError("候选人代理池为空，额度查询无法租取代理")
     master = db.get_workspace_master(workspace_db_id)
     if not master:
         raise RuntimeError("母号不存在")
@@ -56,22 +88,101 @@ def fetch_candidate_quota(workspace_db_id: int, email: str, *, proxy: str) -> di
     rows = db.list_workspace_credentials_by_emails(workspace_db_id, [email])
     if not rows: raise RuntimeError("候选人尚未获取当前空间凭证")
     cred = rows[0]; token = cred.get("access_token") or ""; wid = master.get("workspace_id") or ""
-    last = None
-    for attempt in range(3):
+    try:
+        prior_quota = json.loads(cred.get("quota_json") or "{}")
+        if not isinstance(prior_quota, dict):
+            prior_quota = {}
+    except Exception:
+        prior_quota = {}
+
+    net_left = max(0, int(network_retries or 0))
+    rate_left = max(0, int(WORKSPACE_ADMIN_MAX_429_RETRIES or 0))
+    net_attempt = 0
+    rate_attempt = 0
+    response = None
+    while True:
         try:
             response = session.get(f"{BASE}/backend-api/wham/usage", headers={**_headers(token, wid), "ChatGPT-Account-Id": wid, "User-Agent": "codex-cli"}, timeout=30)
-            if response.status_code >= 500 and attempt < 2:
-                time.sleep(1 + attempt); continue
-            break
         except Exception as exc:
-            last = exc
-            if attempt >= 2: raise RuntimeError(f"额度查询网络错误（已重试2次）：{exc}") from exc
-            time.sleep(1 + attempt)
+            if net_left <= 0:
+                # 只有传输层失败才归因到代理：拿到任何 HTTP 响应（哪怕 5xx）
+                # 都说明这条代理是通的，不该计入熔断连击。
+                streak = db.record_candidate_proxy_failure(proxy_value)
+                logger.warning(
+                    "额度查询代理传输失败 proxy=%s streak=%s/%s workspace_db_id=%s email=%s",
+                    proxy_value, streak, db.CANDIDATE_PROXY_FAILURE_STREAK,
+                    workspace_db_id, email,
+                )
+                raise QuotaNetworkError(
+                    f"额度查询网络错误（已重试{net_attempt}次）：{exc}"
+                ) from exc
+            net_left -= 1
+            net_attempt += 1
+            delay = min(10.0, float(net_attempt))
+            logger.warning(
+                "额度查询网络异常，将重试 workspace_db_id=%s email=%s attempt=%s wait=%.1fs error=%s",
+                workspace_db_id, email, net_attempt, delay, str(exc)[:180],
+            )
+            time.sleep(delay)
+            continue
+
+        # 5xx 与网络异常同源（多为出口/边缘抖动），共用同一份重试预算。
+        if response.status_code >= 500 and net_left > 0:
+            net_left -= 1
+            net_attempt += 1
+            delay = min(10.0, float(net_attempt))
+            logger.warning(
+                "额度查询上游 %s，将重试 workspace_db_id=%s email=%s attempt=%s wait=%.1fs",
+                response.status_code, workspace_db_id, email, net_attempt, delay,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code == 429 and rate_left > 0:
+            rate_left -= 1
+            delay = _retry_after_seconds(response, rate_attempt)
+            rate_attempt += 1
+            logger.warning(
+                "额度查询触发限流，退避重试 workspace_db_id=%s email=%s attempt=%s wait=%.1fs",
+                workspace_db_id, email, rate_attempt, delay,
+            )
+            time.sleep(delay)
+            continue
+        break
+
+    # 拿到响应即证明代理链路可用，清零连击（业务层错误另有各自的处理）。
+    db.clear_candidate_proxy_failure(proxy_value)
+
     if response.status_code >= 300:
         code = int(response.status_code)
-        db.update_workspace_quota(workspace_db_id, email, {"error_code": code, "updated_at": time.time()})
+        record = {"error_code": code, "updated_at": time.time()}
+        # 403 连击计数只在 403 分支写入；其余任何结果（含成功）落库时都不带
+        # 该键，等同于自动清零。
+        streak = 0
+        if code == 403:
+            streak = max(0, int(prior_quota.get("consecutive_403") or 0)) + 1
+            record["consecutive_403"] = streak
+        db.update_workspace_quota(workspace_db_id, email, record)
         db.update_workspace_candidate_status(workspace_db_id, email, f"quota_error_{code}")
-        if code == 401: raise QuotaUnauthorized("额度查询失败 HTTP 401")
+        if code == 401:
+            raise QuotaUnauthorized("额度查询失败 HTTP 401")
+        if code == 402:
+            raise QuotaPaymentRequired(
+                f"母号空间计费异常 HTTP 402：{_response_debug_body(response)[:300]}"
+            )
+        if code == 403:
+            logger.warning(
+                "额度查询 403 workspace_db_id=%s email=%s streak=%s/%s body=%s",
+                workspace_db_id, email, streak, DEACTIVATION_403_STREAK,
+                _response_debug_body(response)[:300],
+            )
+            if streak >= DEACTIVATION_403_STREAK:
+                raise QuotaAccountDeactivated(
+                    f"连续 {streak} 次额度查询 403，判定账号停用", streak=streak
+                )
+            raise QuotaHttpError(code)
+        if code >= 500:
+            raise QuotaNetworkError(f"额度查询失败 HTTP {code}（已重试{net_attempt}次）")
         raise QuotaHttpError(code)
     payload = response.json(); rate = payload.get("rate_limit") or {}; credits = payload.get("credits") or {}
     def window(key):
@@ -368,7 +479,9 @@ def invite_candidates(workspace_db_id: int, emails: list[str], seat_type: str = 
         raise RuntimeError("母号缺少 Workspace ID 或 Access Token，请重新导入完整 session.json")
     if seat_type not in {"default", "usage_based", "prolite"}:
         raise ValueError("席位类型只能是标准席位、Usage-based 或 ProLite")
-    logger.info("母号批量邀请开始 workspace_db_id=%s workspace_id=%s seat_type=%s count=%s emails=%s", workspace_db_id, workspace_id, seat_type, len(emails), emails[:20])
+    count = len(emails)
+    req_timeout = max(30, min(300, 20 + count * 2))
+    logger.info("母号批量邀请开始 workspace_db_id=%s workspace_id=%s seat_type=%s count=%s timeout=%ss emails=%s", workspace_db_id, workspace_id, seat_type, count, req_timeout, emails[:20])
     try:
         response = _workspace_admin_request(
             workspace_db_id,
@@ -377,7 +490,7 @@ def invite_candidates(workspace_db_id: int, emails: list[str], seat_type: str = 
             f"{BASE}/backend-api/accounts/{workspace_id}/invites",
             headers=_headers(token, workspace_id),
             json={"email_addresses": emails, "role": "standard-user", "seat_type": seat_type, "resend_emails": True},
-            timeout=30,
+            timeout=req_timeout,
         )
     except Exception:
         logger.exception("母号批量邀请网络异常 workspace_db_id=%s workspace_id=%s", workspace_db_id, workspace_id)
@@ -848,6 +961,8 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
     email = str(email or "").strip().lower()
     if not email:
         return {"ok": False, "error": "email 不能为空"}
+    if not db.get_workspace_master(workspace_db_id):
+        return {"ok": False, "pending_seat": False, "error": "母号不存在，不执行入箱"}
     row = db.get_workspace_candidate(workspace_db_id, email) or {}
     try:
         seat = _ensure_candidate_usage_based(workspace_db_id, email, row=row, retries=retries)
@@ -878,13 +993,20 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
             "seat": seat,
         }
     # 只有远端复查确认 usage_based 后，才允许改变垃圾箱状态。
-    db.update_workspace_candidate_trash(
+    updated = db.update_workspace_candidate_trash(
         workspace_db_id,
         email,
         status="trashed",
         reason=reason or "manual",
         due_at=0,
     )
+    if not updated:
+        return {
+            "ok": False,
+            "pending_seat": False,
+            "error": "候选关系不存在或母号已删除，不执行入箱",
+            "seat": seat,
+        }
     return {"ok": True, "seat": seat}
 
 
