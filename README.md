@@ -1,6 +1,3 @@
-<img width="280" height="265" alt="image" src="https://github.com/user-attachments/assets/a24f9f9b-0dfa-440e-8ee8-6e461d03eeea" />
-
-
 **完全无浏览器**：用 `curl_cffi` 模拟 TLS 指纹 + 纯 Python/QuickJS 解 OpenAI Sentinel PoW + IMAP XOAUTH2 取 OTP，直接走 OpenAI authorize 状态机。
 
 含轻量级 **WebUI**：批量导入号池、可视化触发注册、实时 SSE 日志、凭证一键复制。
