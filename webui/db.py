@@ -2859,6 +2859,12 @@ def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[st
             f"COALESCE(account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
             "AND length(COALESCE(access_token, '')) > 0"
         )
+    elif filt == "no_at":
+        # 只列还能补 AT 的号：永久失效/封号的号补不回来，全选后批量重登录会白跑。
+        conditions.append(
+            f"COALESCE(account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
+            "AND length(COALESCE(access_token, '')) = 0"
+        )
     elif filt == "has_rt":
         conditions.append("length(refresh_token) > 0")
     elif filt == "no_rt":

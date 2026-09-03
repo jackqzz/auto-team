@@ -22,6 +22,63 @@ class RegisteredFilterTests(unittest.TestCase):
                 self.assertEqual([row["email"] for row in rows], ["with-at@example.com"])
                 self.assertEqual(db.count_registered(filter_rt="has_at"), 1)
 
+    def test_no_at_returns_active_accounts_without_access_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.save_registered({"email": "with-at@example.com", "access_token": "token"})
+                db.save_registered({"email": "without-at@example.com", "access_token": ""})
+                db.save_registered({"email": "null-at@example.com"})
+                db.save_registered({"email": "invalid@example.com", "access_token": ""})
+                db.mark_registered_permanently_invalid("invalid@example.com", "test")
+                db.save_registered({"email": "banned@example.com", "access_token": ""})
+                db.update_plus_check("banned@example.com", {"status": "banned", "label": "封号"})
+
+                rows = db.list_registered(filter_rt="no_at")
+
+                # 永久失效/封号的号补不回 AT，不该混进这个筛选
+                self.assertCountEqual(
+                    [row["email"] for row in rows],
+                    ["without-at@example.com", "null-at@example.com"],
+                )
+                self.assertEqual(db.count_registered(filter_rt="no_at"), 2)
+
+    def test_has_at_and_no_at_partition_all_healthy_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.save_registered({"email": "a@example.com", "access_token": "token"})
+                db.save_registered({"email": "b@example.com", "access_token": ""})
+                db.save_registered({"email": "c@example.com", "access_token": "token"})
+                db.save_registered({"email": "dead@example.com", "access_token": "token"})
+                db.mark_registered_permanently_invalid("dead@example.com", "test")
+
+                has_at = db.count_registered(filter_rt="has_at")
+                no_at = db.count_registered(filter_rt="no_at")
+                invalid = db.count_registered(filter_rt="permanently_invalid")
+
+                self.assertEqual(has_at, 2)
+                self.assertEqual(no_at, 1)
+                # 两个筛选互斥且合起来覆盖所有非失效账号
+                self.assertEqual(has_at + no_at + invalid, db.count_registered(filter_rt="all"))
+
+    def test_no_at_respects_group_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                db.save_registered({"email": "g1@example.com", "access_token": ""})
+                db.save_registered({"email": "g2@example.com", "access_token": ""})
+                db.set_accounts_group(["g1@example.com"], "g1")
+                db.set_accounts_group(["g2@example.com"], "g2")
+
+                rows = db.list_registered(filter_rt="no_at", group_name="g1")
+
+                self.assertEqual([row["email"] for row in rows], ["g1@example.com"])
+                self.assertEqual(db.count_registered(filter_rt="no_at", group_name="g1"), 1)
+
     def test_permanently_invalid_filter_returns_invalid_accounts(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "test.db"
