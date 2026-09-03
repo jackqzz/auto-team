@@ -10,6 +10,7 @@ import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
 import LogPanel from '@/components/LogPanel.vue'
 import StatusDot from '@/components/StatusDot.vue'
+import FieldHint from '@/components/FieldHint.vue'
 
 const router = useRouter()
 const { form } = storeToRefs(useFormStore())
@@ -57,6 +58,27 @@ const progressStatus = computed(() => (
     : undefined
 ))
 const groups = ref([])
+
+// 高级选项、代理租借表默认折叠：多数任务不需要展开，
+// 展开状态只存在于本次会话，不做持久化。
+const advancedOpen = ref([])
+const usageOpen = ref([])
+
+// 折叠时也要能看出里面有没有设成非默认值，否则用户会忘记自己改过什么
+const advancedSummary = computed(() => {
+  const parts = []
+  if (form.value.autoAddPhoneMode !== 'api') parts.push('add-phone: Camoufox')
+  if (!form.value.autoLoginOnly) {
+    if (form.value.autoRegisterMode !== 'protocol') parts.push('注册: Camoufox')
+    if (form.value.autoDebugMode) parts.push('调试截图')
+    if (!form.value.autoWantPassword) parts.push('不强制密码')
+  }
+  return parts.length ? parts.join(' · ') : '默认配置'
+})
+
+const proxyUsageActive = computed(
+  () => proxyUsage.value.filter((r) => Number(r.active_count) > 0).length,
+)
 
 async function loadGroups() {
   try {
@@ -116,155 +138,185 @@ async function call(fn, name) {
         </span>
       </template>
 
-      <el-form-item label="任务模式">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoLoginOnly" />
-          <span>仅登录</span>
-        </div>
-        <div class="hint" style="margin-top: 6px">
-          开启后投送所选分组内的注册结果；“补齐2FA”开关打开时，只处理已有 OpenAI 密码、但缺少 TOTP 的账号。通用 OTP 外部账号还必须带 OTP 中转链接，不会创建密码。
-        </div>
-      </el-form-item>
-      <el-form-item v-if="form.autoLoginOnly" label="过滤条件">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoLoginNoRtOnly" />
-          <span>仅执行无 RT 账号</span>
-        </div>
-        <div class="hint" style="margin-top: 6px">
-          开启后仅从注册结果里挑选 refresh_token 为空的账号执行，仅影响“仅登录”任务。
-        </div>
-      </el-form-item>
-      <el-form-item label="补齐2FA">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoEnsureCredentials" />
-          <span>{{ form.autoLoginOnly ? '补齐缺失的 2FA（TOTP）' : '已有账号时补齐缺失的 2FA（TOTP）' }}</span>
-        </div>
-        <div class="hint" style="margin-top: 6px; line-height: 1.5">
-          {{ form.autoLoginOnly
-            ? '开启后只对已有 OpenAI 密码、但本地缺少 TOTP 的账号操作；绑定过程会再次使用邮箱 OTP，因此通用 OTP 导入必须带中转链接。系统不会创建密码，2FA secret 只下发一次，请及时备份。'
-            : '开启后普通注册遇到服务端已存在的邮箱会切换为密码登录并补绑缺失的 2FA；新邮箱仍按正常注册执行。没有密码的已有账号会跳过并提示。' }}
-        </div>
-      </el-form-item>
+      <!-- ① 任务模式：决定跑什么，最先要定的事 -->
+      <div class="cfg-group">
+        <div class="cfg-group-title">任务模式</div>
+        <div class="switch-grid">
+          <div class="switch-item">
+            <el-switch v-model="form.autoLoginOnly" />
+            <span class="switch-label">仅登录</span>
+            <FieldHint>
+              开启后投送所选分组内的注册结果；“补齐2FA”开关打开时，只处理已有 OpenAI 密码、但缺少 TOTP
+              的账号。通用 OTP 外部账号还必须带 OTP 中转链接，不会创建密码。
+            </FieldHint>
+          </div>
 
-      <el-space wrap :size="16" style="margin-bottom: 12px">
-        <el-form-item label="并发" style="margin: 0">
-          <el-input-number v-model="form.autoConcurrency" :min="1" :max="20" />
-        </el-form-item>
-        <el-form-item label="执行数量限制(0=不限)" style="margin: 0">
-          <el-input-number v-model="form.autoTargetCount" :min="0" :max="100000" />
-        </el-form-item>
-        <el-form-item label="冷却(秒)" style="margin: 0">
-          <el-input-number v-model="form.autoCoolDown" :min="0" :max="120" />
-        </el-form-item>
-        <el-form-item label="OTP 等待(秒)" style="margin: 0">
-          <el-input-number v-model="form.otpTimeout" :min="10" :max="600" />
-        </el-form-item>
-        <el-form-item label="账号失败重试" style="margin: 0">
-          <el-input-number v-model="form.autoAccountRetryCount" :min="0" :max="10" />
-        </el-form-item>
-        <el-form-item label="执行分组" style="margin: 0">
-          <el-select v-model="form.autoGroupName" style="width: 180px">
-            <el-option label="未分组" value="" />
-            <el-option label="全部分组" value="__all__" />
-            <el-option
-              v-for="g in groups.filter((g) => g.name)" :key="g.name"
-              :label="`${g.name}（${form.autoLoginOnly ? `可登录/补齐 ${(g.active_registered_total ?? g.registered_total) + (g.mailbox_only_total || 0)}` : `可用 ${g.available}`}）`" :value="g.name"
-            />
-          </el-select>
-        </el-form-item>
-      </el-space>
+          <div v-if="form.autoLoginOnly" class="switch-item">
+            <el-switch v-model="form.autoLoginNoRtOnly" />
+            <span class="switch-label">仅执行无 RT 账号</span>
+            <FieldHint>
+              开启后仅从注册结果里挑选 refresh_token 为空的账号执行，仅影响“仅登录”任务。
+            </FieldHint>
+          </div>
 
-      <el-form-item v-if="!form.autoLoginOnly" label="2FA">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoWant2fa" />
-          <span>每个号注册成功后自动绑定 2FA（TOTP）</span>
+          <div class="switch-item">
+            <el-switch v-model="form.autoEnsureCredentials" />
+            <span class="switch-label">
+              {{ form.autoLoginOnly ? '补齐缺失的 2FA' : '已有账号时补齐 2FA' }}
+            </span>
+            <FieldHint>
+              {{ form.autoLoginOnly
+                ? '开启后只对已有 OpenAI 密码、但本地缺少 TOTP 的账号操作；绑定过程会再次使用邮箱 OTP，因此通用 OTP 导入必须带中转链接。系统不会创建密码，2FA secret 只下发一次，请及时备份。'
+                : '开启后普通注册遇到服务端已存在的邮箱会切换为密码登录并补绑缺失的 2FA；新邮箱仍按正常注册执行。没有密码的已有账号会跳过并提示。' }}
+            </FieldHint>
+          </div>
         </div>
-        <div class="hint" style="margin-top: 6px; line-height: 1.5">
-          默认开。绑定不可逆：之后该号所有登录都需 6 位动态码；
-          secret 仅下发<b>一次</b>、服务端取不回，跑完请到「注册结果」页<b>导出备份</b>。
-          绑定失败<b>不会废号</b>（仅日志告警、账号照常入库）；
-          <b>无密码的号会自动跳过</b>，所以「每个号」实际是「每个有密码的号」。
-        </div>
-      </el-form-item>
+      </div>
 
-      <el-form-item label="OAuth RT">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoWantOauthRt" />
-          <span>任务完成后获取 refresh_token</span>
+      <!-- ② 运行参数：每次跑之前最常调的数值和开关 -->
+      <div class="cfg-group">
+        <div class="cfg-group-title">运行参数</div>
+        <div class="num-grid">
+          <div class="num-item">
+            <label class="num-label">并发</label>
+            <el-input-number v-model="form.autoConcurrency" :min="1" :max="20" controls-position="right" />
+          </div>
+          <div class="num-item">
+            <label class="num-label">
+              执行数量限制
+              <FieldHint>0 = 不限量，跑到号池耗尽或手动停止为止。</FieldHint>
+            </label>
+            <el-input-number v-model="form.autoTargetCount" :min="0" :max="100000" controls-position="right" />
+          </div>
+          <div class="num-item">
+            <label class="num-label">冷却(秒)</label>
+            <el-input-number v-model="form.autoCoolDown" :min="0" :max="120" controls-position="right" />
+          </div>
+          <div class="num-item">
+            <label class="num-label">OTP 等待(秒)</label>
+            <el-input-number v-model="form.otpTimeout" :min="10" :max="600" controls-position="right" />
+          </div>
+          <div class="num-item">
+            <label class="num-label">账号失败重试</label>
+            <el-input-number v-model="form.autoAccountRetryCount" :min="0" :max="10" controls-position="right" />
+          </div>
+          <div class="num-item num-item-wide">
+            <label class="num-label">执行分组</label>
+            <el-select v-model="form.autoGroupName" class="group-select">
+              <el-option label="未分组" value="" />
+              <el-option label="全部分组" value="__all__" />
+              <el-option
+                v-for="g in groups.filter((g) => g.name)" :key="g.name"
+                :label="`${g.name}（${form.autoLoginOnly ? `可登录/补齐 ${(g.active_registered_total ?? g.registered_total) + (g.mailbox_only_total || 0)}` : `可用 ${g.available}`}）`" :value="g.name"
+              />
+            </el-select>
+          </div>
         </div>
-        <div class="hint" style="margin-top: 6px">
-          关闭后跳过最后的 Codex OAuth，可缩短每个任务耗时；access token 和 session token 不受影响。
-        </div>
-      </el-form-item>
-      <el-form-item label="add-phone 模式">
-        <el-select v-model="form.autoAddPhoneMode" style="width: 220px">
-          <el-option label="API / SMS 接口" value="api" />
-          <el-option label="Camoufox 浏览器模式" value="camoufox" />
-        </el-select>
-        <div class="hint" style="margin-top: 6px">
-          仅在任务命中 add-phone 验证分支时使用；默认走接口模式。Linux 无桌面环境可改为 Camoufox。
-        </div>
-      </el-form-item>
-      <el-form-item v-if="!form.autoLoginOnly" label="注册流程">
-        <el-select v-model="form.autoRegisterMode" style="width: 220px">
-          <el-option label="协议直连" value="protocol" />
-          <el-option label="Camoufox 浏览器" value="camoufox" />
-        </el-select>
-        <div class="hint" style="margin-top: 6px">
-          Camoufox 浏览器注册；仅登录任务始终使用协议登录流程。
-        </div>
-      </el-form-item>
 
-      <el-form-item v-if="!form.autoLoginOnly" label="调试模式">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoDebugMode" />
-          <span>失败时保存 Camoufox 页面截图</span>
-        </div>
-        <div class="hint" style="margin-top: 6px">
-          仅在 Camoufox 注册遇到页面超时或提交失败时截图；默认关闭。截图保存在服务端 logs/camoufox_screenshots 目录。
-        </div>
-      </el-form-item>
+        <div class="switch-grid" style="margin-top: 14px">
+          <div v-if="!form.autoLoginOnly" class="switch-item">
+            <el-switch v-model="form.autoWant2fa" />
+            <span class="switch-label">自动绑定 2FA</span>
+            <!-- 「不可逆」留在页面上，不藏进悬停：这是会造成不可恢复后果的警告 -->
+            <span class="switch-warn">绑定不可逆</span>
+            <FieldHint type="warning">
+              绑定不可逆：之后该号所有登录都需 6 位动态码；secret 仅下发<b>一次</b>、服务端取不回，
+              跑完请到「注册结果」页<b>导出备份</b>。绑定失败<b>不会废号</b>（仅日志告警、账号照常入库）；
+              <b>无密码的号会自动跳过</b>，所以「每个号」实际是「每个有密码的号」。
+            </FieldHint>
+          </div>
 
-      <el-form-item v-if="!form.autoLoginOnly" label="密码">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoWantPassword" />
-          <span>强制创建账号密码</span>
-        </div>
-        <div class="hint" style="margin-top: 6px">
-          新邮箱开启时要求创建长期密码；该选项只影响新账号注册。已有账号的“补齐2FA”不会创建或修改密码。
-        </div>
-      </el-form-item>
+          <div class="switch-item">
+            <el-switch v-model="form.autoWantOauthRt" />
+            <span class="switch-label">获取 refresh_token</span>
+            <FieldHint>
+              关闭后跳过最后的 Codex OAuth，可缩短每个任务耗时；access token 和 session token 不受影响。
+            </FieldHint>
+          </div>
 
-      <el-form-item label="自动推送号池">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoExport" />
-          <span>任务成功后自动推送到已启用的 CPA / SUB2API</span>
-        </div>
-        <div class="hint" style="margin-top: 6px">
-          关闭只跳过本次任务，不会修改“自动导出”里的全局配置；注册和仅登录模式都生效。
-        </div>
-      </el-form-item>
-      <el-form-item v-if="form.autoExport" label="推送前刷新 OAuth">
-        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap">
-          <el-switch v-model="form.autoExportRefreshOauth" />
-          <span>推送前使用 RT 换取新的 Codex access token</span>
-        </div>
-        <div class="hint" style="margin-top: 6px">
-          默认关闭，直接使用现有 access token；开启后可能受 OpenAI 出口地区限制影响。
-        </div>
-      </el-form-item>
+          <div class="switch-item">
+            <el-switch v-model="form.autoExport" />
+            <span class="switch-label">自动推送号池</span>
+            <FieldHint>
+              任务成功后自动推送到已启用的 CPA / SUB2API。关闭只跳过本次任务，不会修改“自动导出”里的
+              全局配置；注册和仅登录模式都生效。
+            </FieldHint>
+          </div>
 
-      <el-form-item label="代理池">
-        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
-          <el-tag :type="proxyCount ? 'success' : 'info'" effect="light">
-            当前 {{ proxyCount }} 个代理
-          </el-tag>
-          <span class="hint">
-            {{ proxyCount ? '每个任务优先取使用次数最少的代理' : '为空：所有任务用「单次注册」页填的单代理' }}
-          </span>
-          <el-button size="small" @click="router.push('/proxy')">管理代理池</el-button>
+          <div v-if="form.autoExport" class="switch-item">
+            <el-switch v-model="form.autoExportRefreshOauth" />
+            <span class="switch-label">推送前刷新 OAuth</span>
+            <FieldHint>
+              默认关闭，直接使用现有 access token；开启后用 RT 换取新的 Codex access token，
+              可能受 OpenAI 出口地区限制影响。
+            </FieldHint>
+          </div>
         </div>
-      </el-form-item>
+      </div>
+
+      <!-- ③ 高级选项：默认折叠，多数任务不需要动 -->
+      <el-collapse v-model="advancedOpen" class="cfg-collapse">
+        <el-collapse-item name="advanced">
+          <template #title>
+            <span class="collapse-title">高级选项</span>
+            <span class="collapse-sub">{{ advancedSummary }}</span>
+          </template>
+
+          <div class="num-grid">
+            <div class="num-item num-item-wide">
+              <label class="num-label">
+                add-phone 模式
+                <FieldHint>
+                  仅在任务命中 add-phone 验证分支时使用；默认走接口模式。Linux 无桌面环境可改为 Camoufox。
+                </FieldHint>
+              </label>
+              <el-select v-model="form.autoAddPhoneMode" class="group-select">
+                <el-option label="API / SMS 接口" value="api" />
+                <el-option label="Camoufox 浏览器模式" value="camoufox" />
+              </el-select>
+            </div>
+            <div v-if="!form.autoLoginOnly" class="num-item num-item-wide">
+              <label class="num-label">
+                注册流程
+                <FieldHint>Camoufox 浏览器注册；仅登录任务始终使用协议登录流程。</FieldHint>
+              </label>
+              <el-select v-model="form.autoRegisterMode" class="group-select">
+                <el-option label="协议直连" value="protocol" />
+                <el-option label="Camoufox 浏览器" value="camoufox" />
+              </el-select>
+            </div>
+          </div>
+
+          <div v-if="!form.autoLoginOnly" class="switch-grid" style="margin-top: 14px">
+            <div class="switch-item">
+              <el-switch v-model="form.autoDebugMode" />
+              <span class="switch-label">失败时保存截图</span>
+              <FieldHint>
+                仅在 Camoufox 注册遇到页面超时或提交失败时截图；默认关闭。
+                截图保存在服务端 logs/camoufox_screenshots 目录。
+              </FieldHint>
+            </div>
+            <div class="switch-item">
+              <el-switch v-model="form.autoWantPassword" />
+              <span class="switch-label">强制创建账号密码</span>
+              <FieldHint>
+                新邮箱开启时要求创建长期密码；该选项只影响新账号注册。
+                已有账号的“补齐2FA”不会创建或修改密码。
+              </FieldHint>
+            </div>
+          </div>
+        </el-collapse-item>
+      </el-collapse>
+
+      <div class="proxy-row">
+        <el-tag :type="proxyCount ? 'success' : 'info'" effect="light">
+          当前 {{ proxyCount }} 个代理
+        </el-tag>
+        <span class="hint">
+          {{ proxyCount ? '每个任务优先取使用次数最少的代理' : '为空：所有任务用「单次注册」页填的单代理' }}
+        </span>
+        <el-button size="small" @click="router.push('/proxy')">管理代理池</el-button>
+      </div>
 
       <el-space wrap style="margin-top: 8px">
         <el-button type="primary" :disabled="!canStart" @click="start">
@@ -333,25 +385,30 @@ async function call(fn, name) {
     </el-card>
 
     <el-card v-if="proxyUsage.length" shadow="never" style="margin-bottom: 16px">
-      <template #header>
-        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap">
-          <span class="section-title" style="margin: 0">当前代理租用计数</span>
-          <span class="hint">仅统计本次任务快照，任务结束后自动清空</span>
-        </div>
-      </template>
-      <el-table :data="proxyUsage" border size="small" style="width: 100%">
-        <el-table-column prop="index" label="#" width="60" />
-        <el-table-column prop="proxy" label="代理" min-width="260" show-overflow-tooltip />
-        <el-table-column prop="leased_count" label="租用次数" width="110" align="center" />
-        <el-table-column prop="active_count" label="当前执行" width="100" align="center" />
-        <el-table-column label="状态" width="100" align="center">
-          <template #default="scope">
-            <el-tag :type="scope.row.active_count ? 'warning' : 'info'" size="small">
-              {{ scope.row.active_count ? '使用中' : '空闲' }}
-            </el-tag>
+      <el-collapse v-model="usageOpen" class="usage-collapse">
+        <el-collapse-item name="usage">
+          <template #title>
+            <span class="collapse-title">当前代理租用计数</span>
+            <span class="collapse-sub">
+              {{ proxyUsage.length }} 个代理 · {{ proxyUsageActive }} 个使用中
+            </span>
           </template>
-        </el-table-column>
-      </el-table>
+          <p class="hint" style="margin: 0 0 10px">仅统计本次任务快照，任务结束后自动清空</p>
+          <el-table :data="proxyUsage" border size="small" max-height="320" style="width: 100%">
+            <el-table-column prop="index" label="#" width="60" />
+            <el-table-column prop="proxy" label="代理" min-width="260" show-overflow-tooltip />
+            <el-table-column prop="leased_count" label="租用次数" width="110" align="center" />
+            <el-table-column prop="active_count" label="当前执行" width="100" align="center" />
+            <el-table-column label="状态" width="100" align="center">
+              <template #default="scope">
+                <el-tag :type="scope.row.active_count ? 'warning' : 'info'" size="small">
+                  {{ scope.row.active_count ? '使用中' : '空闲' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-collapse-item>
+      </el-collapse>
     </el-card>
 
     <el-card shadow="never">
@@ -359,3 +416,137 @@ async function call(fn, name) {
     </el-card>
   </div>
 </template>
+
+<style scoped>
+/* 配置分区：用细分隔线分组，避免十几个选项糊成一片 */
+.cfg-group {
+  padding: 14px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.cfg-group:first-of-type {
+  padding-top: 0;
+  border-top: none;
+}
+
+.cfg-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  margin-bottom: 12px;
+}
+
+/* 数值/下拉项：自适应列数，窄屏自动换行而不是挤成一行 */
+.num-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 12px 16px;
+}
+
+.num-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.num-item-wide {
+  grid-column: span 2;
+}
+
+@media (max-width: 700px) {
+  .num-item-wide {
+    grid-column: span 1;
+  }
+}
+
+.num-label {
+  font-size: 12px;
+  color: var(--el-text-color-regular);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.num-item :deep(.el-input-number) {
+  width: 100%;
+}
+
+.group-select {
+  width: 100%;
+}
+
+/* 开关项：一行一个，说明收进 ⓘ，所以每项只占单行高度 */
+.switch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px 16px;
+}
+
+.switch-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.switch-label {
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+}
+
+/* 不可逆操作的警示留在页面上，不靠悬停才能看到 */
+.switch-warn {
+  font-size: 11px;
+  color: var(--el-color-warning);
+  border: 1px solid var(--el-color-warning-light-5);
+  background: var(--el-color-warning-light-9);
+  border-radius: var(--app-radius-xs);
+  padding: 0 5px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+
+.cfg-collapse {
+  border-top: 1px solid var(--el-border-color-lighter);
+  border-bottom: none;
+}
+
+.cfg-collapse :deep(.el-collapse-item__header),
+.usage-collapse :deep(.el-collapse-item__header) {
+  border-bottom: none;
+  font-weight: 600;
+}
+
+.cfg-collapse :deep(.el-collapse-item__wrap),
+.usage-collapse :deep(.el-collapse-item__wrap) {
+  border-bottom: none;
+}
+
+.usage-collapse {
+  border-top: none;
+  border-bottom: none;
+}
+
+.collapse-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.collapse-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--el-text-color-secondary);
+  margin-left: 10px;
+}
+
+.proxy-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 0;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+</style>

@@ -37,6 +37,7 @@ import {
   trashCandidates,
   restoreCandidatesFromTrash,
 } from "@/api/workspaceCandidates";
+import { PAGE_SIZE_OPTIONS, SELECT_ALL_FETCH_LIMIT } from "@/utils/pagination";
 
 const spaces = ref([]);
 const workspaceId = ref(null);
@@ -78,12 +79,24 @@ const taskCooldown = ref(0);
 const quotaNetworkRetries = ref(2);
 const quotaProxyPool = ref("");
 
+const quotaProxyPoolCount = computed(
+  () => new Set(quotaProxyPool.value.split("\n").map((x) => x.trim()).filter(Boolean)).size,
+);
+
 // 专属池为空即回退全局池，所以提示要说清当前实际生效的是哪一份。
-const quotaProxyPoolHint = computed(() => {
-  const lines = quotaProxyPool.value.split("\n").map((x) => x.trim()).filter(Boolean);
-  if (!lines.length) return `未配置，回退全局池（${proxyList.value.length} 条）`;
-  return `已配置 ${new Set(lines).size} 条，不再使用全局池`;
-});
+const quotaProxyPoolHint = computed(() =>
+  quotaProxyPoolCount.value
+    ? `已配置 ${quotaProxyPoolCount.value} 条，不再使用全局池`
+    : `未配置，回退全局池（${proxyList.value.length} 条）`,
+);
+
+// 定时额度 tab 里那句代理来源说明。配了专属池还写"从全局代理池租取"会让人
+// 以为专属池没生效，所以跟着实际生效的池子走。
+const quotaProxySourceDesc = computed(() =>
+  quotaProxyPoolCount.value
+    ? `只查询当前空间已获得 Team 凭证的候选人，使用本空间专属代理池（${quotaProxyPoolCount.value} 条）。`
+    : `只查询当前空间已获得 Team 凭证的候选人，从全局代理池租取代理（${proxyList.value.length} 条）。`,
+);
 
 function importGlobalProxyPool() {
   if (!proxyList.value.length) return ElMessage.warning("全局代理池为空");
@@ -605,7 +618,7 @@ async function remove() {
   try {
     await removeCandidates(workspaceId.value, emails);
     ElMessage.success("已移除候选划分");
-    selected.value = [];
+    clearSelection();
     await load();
   } catch (e) {
     ElMessage.error(e.message);
@@ -622,7 +635,7 @@ async function setOutboundStatus(tagStatus, label) {
   try {
     const r = await updateCandidateTagStatus(workspaceId.value, emails, tagStatus);
     ElMessage.success(`${label}完成：${r.changed || 0} 个`);
-    selected.value = [];
+    clearSelection();
     await load();
   } catch (e) {
     ElMessage.error(`${label}失败: ` + e.message);
@@ -639,7 +652,7 @@ async function moveToTrash() {
   try {
     const r = await trashCandidates(workspaceId.value, emails);
     ElMessage[r.failed ? "warning" : "success"](`已移入垃圾箱 ${r.trashed || 0} 个${r.failed ? `，失败 ${r.failed}` : ""}`);
-    selected.value = [];
+    clearSelection();
     await load();
   } catch (e) {
     ElMessage.error("移入垃圾箱失败: " + e.message);
@@ -657,7 +670,7 @@ async function restoreFromTrash() {
     const r = await restoreCandidatesFromTrash(workspaceId.value, emails);
     const skipped = Number(r.skipped || 0);
     ElMessage[skipped ? "warning" : "success"](`已移出垃圾箱 ${r.restored || 0} 个${skipped ? `，跳过 ${skipped}` : ""}`);
-    selected.value = [];
+    clearSelection();
     await load();
   } catch (e) {
     ElMessage.error("移出垃圾箱失败: " + e.message);
@@ -983,6 +996,53 @@ async function runCandidateAction(command) {
   if (command === "select_quota_401") return selectQuota401Candidates();
   if (command === "trash") return moveToTrash();
   if (command === "restore_trash") return restoreFromTrash();
+}
+
+function clearSelection() {
+  // 开了 reserve-selection 后，只清 selected 不会取消表格里已勾的行，
+  // 必须走表格实例的 clearSelection 才能把跨页保留的勾选一起清掉。
+  candidateTableRef.value?.clearSelection();
+  selected.value = [];
+}
+
+async function selectAllFiltered() {
+  if (!workspaceId.value) return;
+  try {
+    const a = await listCandidateOptions(workspaceId.value, {
+      limit: SELECT_ALL_FETCH_LIMIT,
+      offset: 0,
+      account_status: accountStatusFilter.value,
+      join_status: joinStatusFilter.value,
+      credential_status: credentialStatusFilter.value,
+      seat_type: seatTypeFilter.value,
+      trash_status: trashStatusFilter.value,
+      tag_status: tagStatusFilter.value,
+      group_name: groupNameFilter.value,
+      keyword: searchKeyword.value || undefined,
+    });
+    const items = a.items || [];
+    // 后端把 limit 夹在 1000（app.py），候选人真超过这个数时全选会被截断，
+    // 必须明说，否则用户以为选全了、批量操作却只落到前 1000 个。
+    const truncated = Number(a.total || 0) > items.length;
+    // 表格的 :selectable 会挡住外发候选人，全选也照同一套规则跳过，
+    // 否则 selected 里混进勾不上的行，批量操作数量会对不上。
+    const all = items.filter((row) => isSelectableCandidate(row));
+    const table = candidateTableRef.value;
+    if (!table) return ElMessage.warning("候选列表尚未加载完成");
+    table.clearSelection();
+    await nextTick();
+    // 全量结果里只有当前页那部分行存在于表格中；靠 row-key="email" 匹配，
+    // 其余行由 selected 兜住，翻页时 reserve-selection 会自动补上勾选态。
+    all.forEach((row) => table.toggleRowSelection(row, true));
+    selected.value = all;
+    if (truncated) {
+      ElMessage.warning(`已选 ${all.length} 个候选人，但当前筛选共 ${a.total} 个，超出单次上限未全部选中，请收窄筛选条件`);
+    } else {
+      ElMessage.success(`已全选当前筛选条件下的 ${all.length} 个候选人`);
+    }
+  } catch (e) {
+    ElMessage.error("全选失败: " + e.message);
+  }
 }
 
 async function selectCandidateRows(predicate, emptyMessage, successMessage) {
@@ -1394,7 +1454,7 @@ async function exportAndOutbound() {
     const result = await doExport({ id: "sub2api", label: "加密 Sub2API" }, { encryptCredentials: true, markOutbound: true });
     if (result?.outbound_marked !== undefined) {
       succeeded = true;
-      selected.value = [];
+      clearSelection();
       await load();
       ElMessage.success(`加密导出完成，已标记出库 ${result.outbound_marked} 个`);
     }
@@ -1429,6 +1489,9 @@ watch(workspaceId, async (id) => {
   clearTimeout(settingsSaveTimer);
   settingsSaveTimer = null;
   taskLogs.value = [];
+  // 换空间等于换了一整批候选人，reserve-selection 保留的旧空间勾选必须丢掉，
+  // 否则批量操作会带着上一个空间的邮箱打到新空间上。
+  clearSelection();
   if (!id) return;
   await load();
   await loadCandidateGroups();
@@ -1475,13 +1538,20 @@ watch(
   [accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter, searchKeyword],
   () => {
     page.value = 1;
-    selected.value = [];
+    clearSelection();
     if (workspaceId.value) load();
   }
 );
 
-watch([page, pageSize], () => {
-  selected.value = [];
+// 翻页不再清空选择：reserve-selection 会跨页保留勾选，清掉反而让跨页全选失效。
+// 每页条数变化会重排行序，此时保留选中容易与用户预期不符，故只在 pageSize 变化时清。
+watch(page, () => {
+  if (workspaceId.value) load();
+});
+
+watch(pageSize, () => {
+  page.value = 1;
+  clearSelection();
   if (workspaceId.value) load();
 });
 
@@ -1924,6 +1994,20 @@ onBeforeUnmount(() => {
               <Icon icon="lucide:check-circle-2" class="btn-icon" />
               校验候选状态
             </el-button>
+
+            <el-dropdown @command="runInviteStatusAction">
+              <el-button type="info" plain size="small">
+                <Icon icon="lucide:user-check" class="btn-icon" />
+                邀请状态
+                <Icon icon="lucide:chevron-down" class="btn-icon-end" />
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="manual_pending_invite">标记待接受邀请</el-dropdown-item>
+                  <el-dropdown-item command="manual_joined">标记已加入</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </div>
 
           <el-divider direction="vertical" class="toolbar-divider" />
@@ -2052,16 +2136,30 @@ onBeforeUnmount(() => {
         />
       </div>
 
+      <!-- 跨页选择栏：全选按当前筛选条件拉全量，翻页由 reserve-selection 保持勾选 -->
+      <div class="selection-bar">
+        <span class="selection-count">
+          已选 <strong>{{ selected.length }}</strong> / {{ total }}
+        </span>
+        <el-button link type="primary" size="small" :disabled="!total" @click="selectAllFiltered">
+          全选当前筛选
+        </el-button>
+        <el-button link type="info" size="small" :disabled="!selected.length" @click="clearSelection">
+          清空选择
+        </el-button>
+      </div>
+
       <!-- 候选人数据表格 -->
       <el-table
         ref="candidateTableRef"
         v-loading="loading"
         :data="options"
         stripe
+        row-key="email"
         class="modern-candidate-table"
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="46" :selectable="isSelectableCandidate" />
+        <el-table-column type="selection" width="46" :selectable="isSelectableCandidate" :reserve-selection="true" />
 
         <!-- 候选账号与分组 -->
         <el-table-column label="候选账号" min-width="260">
@@ -2251,7 +2349,7 @@ onBeforeUnmount(() => {
         <el-pagination
           v-model:current-page="page"
           v-model:page-size="pageSize"
-          :page-sizes="[100, 200, 500, 1000]"
+          :page-sizes="PAGE_SIZE_OPTIONS"
           :total="total"
           layout="total, sizes, prev, pager, next, jumper"
           background
@@ -2308,7 +2406,7 @@ onBeforeUnmount(() => {
               <div class="setting-switch-row">
                 <div class="switch-meta">
                   <span class="switch-title">定时额度轮询</span>
-                  <span class="switch-desc">只查询当前空间已获得 Team 凭证的候选人，从全局代理池租取代理。</span>
+                  <span class="switch-desc">{{ quotaProxySourceDesc }}</span>
                 </div>
                 <el-switch v-model="quotaRunning" @change="toggleQuotaSchedule" />
               </div>
@@ -2443,9 +2541,31 @@ onBeforeUnmount(() => {
             </div>
           </el-tab-pane>
 
-          <!-- Tab 3: 运行参数与垃圾箱 -->
-          <el-tab-pane label="参数与回收" name="tasks">
+          <!-- Tab 3: 代理池、运行参数与垃圾箱 -->
+          <el-tab-pane label="代理与参数" name="tasks">
             <div class="settings-tab-pane">
+              <div class="setting-group-box">
+                <div class="group-box-title">
+                  <Icon icon="lucide:globe" class="box-icon" />
+                  <span>候选人专属代理池</span>
+                </div>
+                <el-input
+                  v-model="quotaProxyPool"
+                  type="textarea"
+                  :rows="5"
+                  placeholder="每行一个代理，如 socks5://user:pass@host:1080&#10;留空则使用全局代理池"
+                  style="width: 100%"
+                />
+                <div class="proxy-pool-actions">
+                  <el-button size="small" @click="importGlobalProxyPool">从全局池导入</el-button>
+                  <el-button size="small" @click="quotaProxyPool = ''">清空（回退全局池）</el-button>
+                  <span class="hint">{{ quotaProxyPoolHint }}</span>
+                </div>
+                <div class="field-hint">
+                  额度查询、401 重登录与凭证获取都走这里；连续 3 次传输失败的代理会自动冷却 30 分钟。
+                </div>
+              </div>
+
               <el-form label-position="top" class="settings-form">
                 <el-form-item label="并发处理数">
                   <el-input-number v-model="taskConcurrency" :min="1" :max="20" style="width: 100%" />
@@ -2462,23 +2582,6 @@ onBeforeUnmount(() => {
                 <el-form-item label="额度查询网络失败重试次数">
                   <el-input-number v-model="quotaNetworkRetries" :min="0" :max="5" style="width: 100%" />
                   <div class="hint">TLS 握手失败、连接超时与 5xx 共用此重试预算；429 另按 Retry-After 退避。</div>
-                </el-form-item>
-                <el-form-item label="候选人专属代理池">
-                  <el-input
-                    v-model="quotaProxyPool"
-                    type="textarea"
-                    :rows="5"
-                    placeholder="每行一个代理，如 socks5://user:pass@host:1080&#10;留空则使用全局代理池"
-                    style="width: 100%"
-                  />
-                  <div class="proxy-pool-actions">
-                    <el-button size="small" @click="importGlobalProxyPool">从全局池导入</el-button>
-                    <el-button size="small" @click="quotaProxyPool = ''">清空（回退全局池）</el-button>
-                    <span class="hint">{{ quotaProxyPoolHint }}</span>
-                  </div>
-                  <div class="hint">
-                    额度查询、401 重登录与凭证获取都走这里；连续 3 次传输失败的代理会自动冷却 30 分钟。
-                  </div>
                 </el-form-item>
               </el-form>
 
@@ -3211,6 +3314,22 @@ onBeforeUnmount(() => {
   color: var(--el-color-warning);
   font-size: 12px;
   font-weight: 500;
+}
+
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 -4px;
+  font-size: 12px;
+}
+
+.selection-count {
+  color: var(--el-text-color-secondary);
+}
+
+.selection-count strong {
+  color: var(--el-color-primary);
 }
 
 .pagination-row {

@@ -6,6 +6,7 @@ import { Icon } from '@iconify/vue'
 import { useProxyStore, isValidProxy, proxyScheme } from '@/stores/proxy'
 import { getProxyUsage, resetProxyUsage, testProxies } from '@/api/proxy'
 import { copyText } from '@/api/request'
+import { SAMPLE_RATIO, sampleProxies, summarizeLatency } from '@/utils/proxyCheck'
 
 const proxyStore = useProxyStore()
 const { list, count } = storeToRefs(proxyStore)
@@ -13,6 +14,8 @@ const { list, count } = storeToRefs(proxyStore)
 const draft = ref('')
 const testResults = ref({}) // proxy -> { status:'testing'|'ok'|'fail', latency_ms, ip, error }
 const testingAll = ref(false)
+const checking = ref(false)
+const assessment = ref(null) // 快速评估汇总，见 utils/proxyCheck.js 的 summarizeLatency
 const usageLoading = ref(false)
 const usage = ref({
   persistent: true,
@@ -40,6 +43,15 @@ const usageCategoryMap = computed(() =>
   ),
 )
 const currentProxySet = computed(() => new Set(list.value))
+const samplePercentLabel = computed(() => `${Math.round(SAMPLE_RATIO * 100)}%`)
+// 可用率配色：低于 60% 视为整池有问题，60~90% 提醒关注。
+const assessTone = computed(() => {
+  const a = assessment.value
+  if (!a) return 'text-muted'
+  if (a.availability >= 90) return 'text-success'
+  if (a.availability >= 60) return 'text-warning'
+  return 'text-danger'
+})
 const usageRows = computed(() =>
   (usage.value.proxies || []).map((item) => ({
     ...item,
@@ -89,16 +101,18 @@ async function clearUsage() {
 }
 
 async function runTest(targets) {
-  if (!targets.length) return
+  if (!targets.length) return null
   for (const p of targets) testResults.value[p] = { status: 'testing' }
   try {
     const { results } = await testProxies(targets)
     for (const [proxy, res] of Object.entries(results)) {
       testResults.value[proxy] = { status: res.ok ? 'ok' : 'fail', ...res }
     }
+    return results
   } catch (e) {
     for (const p of targets) testResults.value[p] = { status: 'fail', error: e.message }
     ElMessage.error('测试失败: ' + e.message)
+    return null
   }
 }
 async function testOne(proxy) {
@@ -111,6 +125,27 @@ async function testAll() {
     await runTest([...list.value])
   } finally {
     testingAll.value = false
+  }
+}
+
+/** 快速评估：随机抽 10% 的代理测延迟，用样本估算整池的可用率和延迟水平。 */
+async function quickCheck() {
+  if (!count.value) return
+  const sample = sampleProxies(list.value)
+  checking.value = true
+  try {
+    const results = await runTest(sample)
+    if (!results) return
+    const rowsForSummary = sample
+      .filter((p) => results[p])
+      .map((p) => ({ proxy: p, ...results[p] }))
+    assessment.value = summarizeLatency(rowsForSummary, count.value)
+    const s = assessment.value
+    ElMessage.success(
+      `抽样 ${s.sampled}/${s.total} 个代理：可用率 ${s.availability}%，中位延迟 ${s.medianMs}ms`,
+    )
+  } finally {
+    checking.value = false
   }
 }
 
@@ -215,6 +250,36 @@ onBeforeUnmount(() => {
 
       <div class="kpi-card">
         <div class="kpi-header">
+          <span class="kpi-title">代理池快速评估</span>
+          <Icon icon="lucide:gauge" class="kpi-type-icon" :class="assessTone" />
+        </div>
+        <div class="kpi-body">
+          <div class="kpi-val" :class="assessTone">
+            {{ assessment ? assessment.availability + '%' : '—' }}
+          </div>
+          <div class="kpi-hint">
+            <template v-if="assessment">
+              样本 {{ assessment.sampled }}/{{ assessment.total }} · 可用 {{ assessment.okCount }}
+            </template>
+            <template v-else>随机抽取 {{ samplePercentLabel }} 节点测延迟</template>
+          </div>
+        </div>
+        <div class="kpi-footer">
+          <template v-if="assessment">
+            <span class="kpi-sub-item">中位 {{ assessment.medianMs }}ms</span>
+            <span class="kpi-sub-item">P95 {{ assessment.p95Ms }}ms</span>
+            <span class="kpi-sub-item" :class="assessment.failCount ? 'text-danger' : ''">
+              失败 {{ assessment.failCount }}
+            </span>
+          </template>
+          <el-button v-else link size="small" type="primary" :loading="checking" :disabled="!count" @click="quickCheck">
+            立即评估
+          </el-button>
+        </div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
           <span class="kpi-title">统计运行时间</span>
           <Icon icon="lucide:clock" class="kpi-type-icon" />
         </div>
@@ -281,6 +346,9 @@ onBeforeUnmount(() => {
               <span class="header-title">活跃代理池明细 ({{ count }} 条)</span>
             </div>
             <div class="header-actions">
+              <el-button size="small" type="primary" :loading="checking" :disabled="!count" @click="quickCheck">
+                <Icon icon="lucide:gauge" style="margin-right: 4px" /> 快速评估 {{ samplePercentLabel }}
+              </el-button>
               <el-button size="small" type="primary" plain :loading="testingAll" :disabled="!count" @click="testAll">
                 <Icon icon="lucide:zap" style="margin-right: 4px" /> 测试全部
               </el-button>

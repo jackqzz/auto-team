@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Icon } from '@iconify/vue'
@@ -20,6 +20,7 @@ import { useRuntimeStore } from '@/stores/runtime'
 import { listWorkspaceMasters } from '@/api/workspaces'
 import { assignCandidates } from '@/api/workspaceCandidates'
 import StatusDot from '@/components/StatusDot.vue'
+import { PAGE_SIZE_OPTIONS, SELECT_ALL_FETCH_LIMIT } from '@/utils/pagination'
 
 const { form } = storeToRefs(useFormStore())
 // 检测用的代理必须能从代理池里挑：以前这页只在代码里读 form.proxy，页面上
@@ -40,6 +41,7 @@ const groupFilter = ref('__all__')
 const groups = ref([])
 const groupManagerVisible = ref(false)
 const selected = ref([])
+const registeredTableRef = ref(null)
 const loading = ref(false)
 const checking = ref(false)
 const plusCheckConcurrency = ref(4)
@@ -100,11 +102,33 @@ async function load(resetPage) {
   }
 }
 
+function clearSelection() {
+  // 开了 reserve-selection 后，只清 selected 不会取消表格里已勾的行，
+  // 必须走表格实例的 clearSelection 才能把跨页保留的勾选一起清掉。
+  registeredTableRef.value?.clearSelection()
+  selected.value = []
+}
+
 async function selectAllFiltered() {
   try {
-    const r = await listRegistered({ limit: 100000, offset: 0, filter: filter.value, group_name: groupFilter.value })
-    selected.value = r.items || []
-    ElMessage.success(`已全选当前筛选条件下的 ${selected.value.length} 个账号`)
+    const r = await listRegistered({
+      limit: SELECT_ALL_FETCH_LIMIT, offset: 0, filter: filter.value, group_name: groupFilter.value,
+    })
+    const all = r.items || []
+    const table = registeredTableRef.value
+    if (!table) return ElMessage.warning('列表尚未加载完成')
+    table.clearSelection()
+    await nextTick()
+    // 全量结果里只有当前页那部分行存在于表格中；靠 row-key="email" 匹配，
+    // 其余行由 selected 兜住，翻页时 reserve-selection 会自动补上勾选态。
+    all.forEach((row) => table.toggleRowSelection(row, true))
+    selected.value = all
+    if (Number(r.total || 0) > all.length) {
+      // 真超过单次拉取上限时必须明说，否则用户以为选全了、批量操作却只落到前一批。
+      ElMessage.warning(`已选 ${all.length} 个，但当前筛选共 ${r.total} 个，超出单次上限未全部选中，请收窄筛选条件`)
+    } else {
+      ElMessage.success(`已全选当前筛选条件下的 ${all.length} 个账号`)
+    }
   } catch (e) { ElMessage.error('全选失败: ' + e.message) }
 }
 
@@ -229,20 +253,20 @@ async function confirm(msg) {
 }
 async function deleteOne(email) {
   if (!(await confirm(`删除 ${email} 的凭证？`))) return
-  try { await deleteRegistered(email); ElMessage.success('已删除'); load() }
+  try { await deleteRegistered(email); ElMessage.success('已删除'); clearSelection(); load() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteSelected() {
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) return
   if (!(await confirm(`确定删除选中的 ${emails.length} 条凭证？(不可恢复)`))) return
-  try { const r = await bulkDeleteRegistered({ emails }); ElMessage.success(`已删除 ${r.deleted} 条`); load() }
+  try { const r = await bulkDeleteRegistered({ emails }); ElMessage.success(`已删除 ${r.deleted} 条`); clearSelection(); load() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteAll() {
   if (!(await confirm('这会清空注册结果表里的所有凭证！邮箱列表不受影响，确定？'))) return
   if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
-  try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); load() }
+  try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); clearSelection(); load() }
   catch (e) { ElMessage.error(e.message) }
 }
 
@@ -429,7 +453,7 @@ async function downloadAndDelete() {
     ElMessage.success(`已删除：注册结果 ${r1.deleted} 条 / 邮箱列表 ${poolDeleted} 条`)
     exportVisible.value = false
     exportedEmails.value = []
-    selected.value = []
+    clearSelection()
     load(true)          // 回第一页：这一批没了，停在旧页码多半是空页
     runtime.bumpData()  // 通知「邮箱列表」那一页也刷新，否则主人切过去还看得到已删的号
   } catch (e) {
@@ -662,8 +686,8 @@ async function reloginSelected() {
 }
 
 watch(page, () => load())
-watch(pageSize, () => { page.value = 1; selected.value = []; load() })
-watch([filter, groupFilter], () => { selected.value = [] })
+watch(pageSize, () => { page.value = 1; clearSelection(); load() })
+watch([filter, groupFilter], () => { clearSelection() })
 watch(dataVersion, () => load())
 onActivated(() => load())
 </script>
@@ -715,7 +739,7 @@ onActivated(() => load())
         </div>
         <div class="kpi-footer">
           <el-button link type="primary" size="small" :disabled="!total" @click="selectAllFiltered">全选当前筛选</el-button>
-          <el-button link type="info" size="small" :disabled="!selected.length" @click="selected = []">清空选择</el-button>
+          <el-button link type="info" size="small" :disabled="!selected.length" @click="clearSelection">清空选择</el-button>
         </div>
       </div>
     </div>
@@ -727,6 +751,7 @@ onActivated(() => load())
           v-for="item in [
             { label: '全部', value: 'all', icon: 'lucide:layers' },
             { label: '已获取 AT', value: 'has_at', icon: 'lucide:key' },
+            { label: '无 AT', value: 'no_at', icon: 'lucide:key-round' },
             { label: '有 RT', value: 'has_rt', icon: 'lucide:refresh-cw' },
             { label: '无 RT', value: 'no_rt', icon: 'lucide:alert-circle' },
             { label: '未检测', value: 'unchecked', icon: 'lucide:help-circle' },
@@ -874,13 +899,15 @@ onActivated(() => load())
       <el-skeleton v-if="loading && !rows.length" :rows="8" animated style="padding: 16px" />
       <el-table
         v-else
+        ref="registeredTableRef"
         v-loading="loading"
         :data="rows"
         size="default"
+        row-key="email"
         class="modern-table"
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="48" align="center" />
+        <el-table-column type="selection" width="48" align="center" :reserve-selection="true" />
 
         <!-- 账号信息复合列 -->
         <el-table-column label="账号与分组" min-width="220">
@@ -1038,7 +1065,7 @@ onActivated(() => load())
         <el-pagination
           v-model:current-page="page"
           v-model:page-size="pageSize"
-          :page-sizes="[20, 50, 100, 500, 1000]"
+          :page-sizes="PAGE_SIZE_OPTIONS"
           :total="total"
           layout="total, sizes, prev, pager, next, jumper"
           background

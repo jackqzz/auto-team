@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -22,6 +22,7 @@ import { getMailProviders } from '@/api/settings'
 import { useStatsStore } from '@/stores/stats'
 import { useRuntimeStore } from '@/stores/runtime'
 import { copyText } from '@/api/request'
+import { PAGE_SIZE_OPTIONS, SELECT_ALL_FETCH_LIMIT } from '@/utils/pagination'
 
 const router = useRouter()
 const statsStore = useStatsStore()
@@ -29,7 +30,7 @@ const { stats } = storeToRefs(statsStore)
 const runtime = useRuntimeStore()
 const { dataVersion } = storeToRefs(runtime)
 
-const PAGE_SIZE = 20
+const pageSize = ref(20)
 const rows = ref([])
 const total = ref(0)
 const page = ref(1)
@@ -38,6 +39,7 @@ const kindFilter = ref('')
 const groupFilter = ref('__all__')
 const selected = ref([])
 const loading = ref(false)
+const accountTableRef = ref(null)
 
 const providers = ref([])
 const byKind = ref({})
@@ -82,8 +84,8 @@ async function load(resetPage) {
       status: statusFilter.value,
       kind: kindFilter.value,
       group_name: groupFilter.value,
-      limit: PAGE_SIZE,
-      offset: (page.value - 1) * PAGE_SIZE,
+      limit: pageSize.value,
+      offset: (page.value - 1) * pageSize.value,
     })
     rows.value = items
     total.value = t
@@ -96,7 +98,46 @@ async function load(resetPage) {
   }
 }
 
+function clearSelection() {
+  // 开了 reserve-selection 后，只清 selected 不会取消表格里已勾的行，
+  // 必须走表格实例的 clearSelection 才能把跨页保留的勾选一起清掉。
+  accountTableRef.value?.clearSelection()
+  selected.value = []
+}
+
+async function selectAllFiltered() {
+  try {
+    const { items, total: t } = await listAccounts({
+      status: statusFilter.value,
+      kind: kindFilter.value,
+      group_name: groupFilter.value,
+      limit: SELECT_ALL_FETCH_LIMIT,
+      offset: 0,
+    })
+    const all = items || []
+    const table = accountTableRef.value
+    if (!table) return ElMessage.warning('列表尚未加载完成')
+    table.clearSelection()
+    await nextTick()
+    // 全量结果里只有当前页那部分行存在于表格中；靠 row-key="email" 匹配，
+    // 其余行由 selected 兜住，翻页时 reserve-selection 会自动补上勾选态。
+    all.forEach((row) => table.toggleRowSelection(row, true))
+    selected.value = all
+    if (Number(t || 0) > all.length) {
+      // 真超过单次拉取上限时必须明说，否则用户以为选全了、批量操作却只落到前一批。
+      ElMessage.warning(`已选 ${all.length} 个，但当前筛选共 ${t} 个，超出单次上限未全部选中，请收窄筛选条件`)
+    } else {
+      ElMessage.success(`已全选当前筛选条件下的 ${all.length} 个邮箱`)
+    }
+  } catch (e) {
+    ElMessage.error('全选失败: ' + e.message)
+  }
+}
+
 function afterMutate() {
+  // reserve-selection 会跨页记住勾选，但增删改之后被选中的行可能已经不存在了，
+  // 留着会让后续批量操作打到已删的号上，所以每次变更后都清干净重新选。
+  clearSelection()
   load()
   statsStore.refresh()
 }
@@ -291,6 +332,8 @@ async function enterPassword(row) {
 }
 
 watch(page, () => load())
+watch(pageSize, () => { page.value = 1; clearSelection(); load() })
+watch([statusFilter, kindFilter, groupFilter], () => clearSelection())
 watch(dataVersion, () => load())
 onActivated(() => load())
 loadProviders()
@@ -418,6 +461,14 @@ loadProviders()
       <!-- Toolbar Section -->
       <div class="workflow-action-bar">
         <div class="action-left">
+          <el-button plain :disabled="!total" @click="selectAllFiltered" class="action-btn">
+            <Icon icon="lucide:list-checks" class="btn-icon" /> 全选当前筛选
+          </el-button>
+
+          <el-button plain :disabled="!selected.length" @click="clearSelection" class="action-btn">
+            <Icon icon="lucide:square-dashed" class="btn-icon" /> 清空选择
+          </el-button>
+
           <el-button type="primary" plain :disabled="!selected.length" @click="resetSelected" class="action-btn">
             <Icon icon="lucide:refresh-ccw" class="btn-icon" /> 重置选中 ({{ selected.length }})
           </el-button>
@@ -476,6 +527,7 @@ loadProviders()
 
       <!-- Account Table -->
       <el-table
+        ref="accountTableRef"
         v-loading="loading"
         :data="rows"
         style="width: 100%; margin-top: 12px"
@@ -484,7 +536,7 @@ loadProviders()
         class="modern-table"
         @selection-change="(v) => (selected = v)"
       >
-        <el-table-column type="selection" width="46" align="center" />
+        <el-table-column type="selection" width="46" align="center" :reserve-selection="true" />
 
         <el-table-column prop="email" label="邮箱地址" min-width="260">
           <template #default="{ row }">
@@ -587,9 +639,10 @@ loadProviders()
       <div class="pagination-footer">
         <el-pagination
           v-model:current-page="page"
-          :page-size="PAGE_SIZE"
+          v-model:page-size="pageSize"
+          :page-sizes="PAGE_SIZE_OPTIONS"
           :total="total"
-          layout="total, prev, pager, next, jumper"
+          layout="total, sizes, prev, pager, next, jumper"
           background
         />
       </div>

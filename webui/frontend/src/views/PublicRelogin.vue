@@ -57,8 +57,13 @@ const sub2RefreshOauth = ref(false)
 const plainCredentialMode = ref(false)
 const encryptCredentials = computed(() => !plainCredentialMode.value)
 const aliveOnly = ref(false)
+const selectedAccounts = ref([])
+const accountTableRef = ref(null)
 const poolPushResults = ref({})
 const poolPushStats = reactive({ queued: 0, running: 0, success: 0, failed: 0, lastMessage: '' })
+// 缺 email 的账号无法用语义键标识，只能发一个进程内唯一的 id。必须是模块级
+// 自增而不是文件内下标，否则追加导入第二个文件时会与第一个文件的行撞号。
+let anonAccountSeq = 0
 
 const defaultPoolPushConfig = () => ({
   autoEnabled: false,
@@ -389,7 +394,11 @@ const normalizeAccount = (item, idx) => {
   })()
   const proxy = String(first('proxy') || '').trim()
   return {
-    id: `${workspaceId || 'ws'}:${email || idx}`,
+    // id 同时是 updateOne / lastResults / poolPushResults 的主键，也是追加导入
+    // 的去重键。email 缺失时无法判断两行是不是同一个账号，此时退回全局自增
+    // 序号：宁可重复导入，也不能让两个不同账号撞成同一个 id 互相串数据
+    //（旧的文件内下标兜底在追加模式下必然跨文件冲突）。
+    id: email ? `${workspaceId || 'ws'}:${email}` : `anon:${(anonAccountSeq += 1)}`,
     email,
     access_token: accessToken,
     refresh_token: refreshToken,
@@ -497,6 +506,43 @@ const parsePayloadWithDecryption = async (payload, plainMode = false) => {
   return { accounts: imported, skipped }
 }
 
+/**
+ * 把新导入的账号并入现有列表（追加式导入）。
+ *
+ * 同 id（workspace+email）视为同一个账号：凭证字段用新文件的值刷新，但保留
+ * 旧行的运行时状态。拿新文件多半是为了补 token，不该把刚跑完的巡检结果清掉。
+ * 列表里没有的追加到尾部，保持导入顺序。
+ */
+const mergeImportedAccounts = (incoming) => {
+  const indexById = new Map(accounts.value.map((item, index) => [item.id, index]))
+  const merged = accounts.value.slice()
+  let added = 0
+  let updated = 0
+  for (const account of incoming) {
+    const existingIndex = indexById.get(account.id)
+    if (existingIndex === undefined) {
+      indexById.set(account.id, merged.length)
+      merged.push(account)
+      added += 1
+      continue
+    }
+    const previous = merged[existingIndex]
+    merged[existingIndex] = {
+      ...account,
+      // 运行时状态归旧行所有：新文件只带凭证，带不来检查结果。
+      status: previous.status,
+      quota: previous.quota,
+      error: previous.error,
+      last_checked_at: previous.last_checked_at,
+      // 手工在页面上填过的独立代理，不该被没有该字段的新文件抹掉。
+      proxy: account.proxy || previous.proxy,
+    }
+    updated += 1
+  }
+  accounts.value = merged
+  return { added, updated }
+}
+
 const handleFile = async (event) => {
   const file = event.target.files?.[0]
   event.target.value = ''
@@ -506,9 +552,9 @@ const handleFile = async (event) => {
     rawText.value = await file.text()
     const payload = JSON.parse(rawText.value)
     const parsed = await parsePayloadWithDecryption(payload, plainCredentialMode.value)
-    accounts.value = parsed.accounts
-    lastResults.value = {}
-    stopInspection(false)
+    // 追加式导入不清空 lastResults、也不停巡检：已有账号的检查结果和正在跑的
+    // 巡检都与这次导入无关，清掉纯属误伤。
+    const { added, updated } = mergeImportedAccounts(parsed.accounts)
     if (parsed.skipped.length) {
       const details = parsed.skipped
         .slice(0, 3)
@@ -516,21 +562,22 @@ const handleFile = async (event) => {
         .join('；')
       const suffix = parsed.skipped.length > 3 ? '；其余账号略' : ''
       const message = `已跳过 ${parsed.skipped.length} 个无法导入的账号${details ? `（${details}${suffix}）` : ''}`
-      if (!accounts.value.length) {
+      if (!parsed.accounts.length) {
         ElMessage.error(`${message}，没有账号成功导入`)
         return
       }
-      ElMessage.warning(`${message}；成功导入 ${accounts.value.length} 个`)
+      ElMessage.warning(`${message}；本次新增 ${added} 个、更新 ${updated} 个`)
     }
-    if (!accounts.value.length) {
+    if (!parsed.accounts.length) {
       ElMessage.warning('文件中没有可导入的账号')
       return
     }
-    const missingTokenCount = accounts.value.filter((item) => !item.access_token).length
+    const missingTokenCount = parsed.accounts.filter((item) => !item.access_token).length
+    const summary = `本次新增 ${added} 个、更新 ${updated} 个，列表共 ${accounts.value.length} 个账号`
     if (missingTokenCount) {
-      ElMessage.warning(`已导入 ${accounts.value.length} 个账号，其中 ${missingTokenCount} 个缺少 access_token，无法查询额度`)
-    } else {
-      ElMessage.success(`已导入 ${accounts.value.length} 个账号，已解析 access_token`)
+      ElMessage.warning(`${summary}；其中 ${missingTokenCount} 个缺少 access_token，无法查询额度`)
+    } else if (!parsed.skipped.length) {
+      ElMessage.success(`${summary}，已解析 access_token`)
     }
   } catch (e) {
     ElMessage.error(e.message || '导入失败')
@@ -541,6 +588,81 @@ const handleFile = async (event) => {
 
 const updateOne = (targetId, patch) => {
   accounts.value = accounts.value.map((item) => (item.id === targetId ? { ...item, ...patch } : item))
+}
+
+/**
+ * 从面板移除账号，并清掉它们在 lastResults / poolPushResults 里的残留。
+ * 不清的话，之后重新导入同一个账号（id 相同）会直接看到上一轮的检查和推送结果。
+ */
+const removeAccountsByIds = (targetIds) => {
+  const ids = targetIds instanceof Set ? targetIds : new Set(targetIds)
+  if (!ids.size) return 0
+  const doomed = accounts.value.filter((item) => ids.has(item.id))
+  if (!doomed.length) return 0
+  // reserve-selection 打开后表格不会在数据变化时自动剔除已消失的行，被移除的
+  // 账号会赖在表格内部的 selection 里变成幽灵勾选。必须显式取消勾选再删。
+  const table = accountTableRef.value
+  if (table) doomed.forEach((row) => table.toggleRowSelection(row, false))
+  accounts.value = accounts.value.filter((item) => !ids.has(item.id))
+  const removed = doomed.length
+  const nextResults = { ...lastResults.value }
+  for (const id of ids) delete nextResults[id]
+  lastResults.value = nextResults
+  // poolPushResults 的键是 `${id}:${target}`，得按前缀清。
+  const nextPushResults = {}
+  for (const [key, value] of Object.entries(poolPushResults.value)) {
+    if (!ids.has(key.slice(0, key.lastIndexOf(':')))) nextPushResults[key] = value
+  }
+  poolPushResults.value = nextPushResults
+  selectedAccounts.value = selectedAccounts.value.filter((item) => !ids.has(item.id))
+  return removed
+}
+
+const removeOne = async (row) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定从面板移除 ${row.email || '该账号'}？仅影响当前页面列表，不会删除任何服务器数据。`,
+      '移除账号',
+      { type: 'warning', confirmButtonText: '移除', cancelButtonText: '取消' },
+    )
+  } catch (_) { return }
+  if (removeAccountsByIds([row.id])) ElMessage.success('已移除 1 个账号')
+}
+
+const removeSelected = async () => {
+  const rows = selectedAccounts.value
+  if (!rows.length) return ElMessage.warning('请先勾选要移除的账号')
+  try {
+    await ElMessageBox.confirm(
+      `确定从面板移除选中的 ${rows.length} 个账号？仅影响当前页面列表，不会删除任何服务器数据。`,
+      '批量移除',
+      { type: 'warning', confirmButtonText: '移除', cancelButtonText: '取消' },
+    )
+  } catch (_) { return }
+  const removed = removeAccountsByIds(rows.map((item) => item.id))
+  if (removed) ElMessage.success(`已移除 ${removed} 个账号`)
+}
+
+const clearAccounts = async () => {
+  if (!accounts.value.length) return ElMessage.warning('列表已经是空的')
+  try {
+    await ElMessageBox.confirm(
+      `确定清空全部 ${accounts.value.length} 个账号？仅影响当前页面列表，不会删除任何服务器数据。`,
+      '清空列表',
+      { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' },
+    )
+  } catch (_) { return }
+  const removed = accounts.value.length
+  // 同 removeAccountsByIds：reserve-selection 不会自己清，得手动收尾。
+  accountTableRef.value?.clearSelection()
+  accounts.value = []
+  lastResults.value = {}
+  poolPushResults.value = {}
+  selectedAccounts.value = []
+  rawText.value = ''
+  // 列表空了，巡检没有对象可跑，留着定时器只会空转报错。
+  if (inspectionRunning.value) stopInspection(false)
+  ElMessage.success(`已清空 ${removed} 个账号`)
 }
 
 const applyCheckResult = (item, result, checkedAt = Date.now()) => {
@@ -1315,7 +1437,21 @@ onBeforeUnmount(() => {
           <input ref="fileInput" type="file" accept="application/json,.json" hidden @change="handleFile" />
 
           <el-button :loading="loading" @click="openFile" class="action-btn">
-            <Icon icon="lucide:folder-open" class="btn-icon" /> 导入 JSON
+            <Icon icon="lucide:folder-open" class="btn-icon" /> 导入 JSON（追加）
+          </el-button>
+
+          <el-button
+            type="danger"
+            plain
+            :disabled="!selectedAccounts.length"
+            @click="removeSelected"
+            class="action-btn"
+          >
+            <Icon icon="lucide:trash-2" class="btn-icon" /> 移除选中 ({{ selectedAccounts.length }})
+          </el-button>
+
+          <el-button type="danger" plain :disabled="!accounts.length" @click="clearAccounts" class="action-btn">
+            <Icon icon="lucide:eraser" class="btn-icon" /> 清空列表
           </el-button>
 
           <el-button :loading="checking" type="primary" @click="doCheck" class="action-btn">
@@ -1441,12 +1577,16 @@ onBeforeUnmount(() => {
 
       <!-- Account Table -->
       <el-table
+        ref="accountTableRef"
         :data="visibleAccounts"
         style="width: 100%; margin-top: 12px"
         height="600"
         row-key="id"
         class="modern-table"
+        @selection-change="(v) => (selectedAccounts = v)"
       >
+        <el-table-column type="selection" width="46" align="center" :reserve-selection="true" />
+
         <el-table-column prop="email" label="账号 / 邮箱" min-width="260">
           <template #default="{ row }">
             <div class="account-cell">
@@ -1553,6 +1693,14 @@ onBeforeUnmount(() => {
               </span>
               <span v-else class="text-muted">-</span>
             </div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="操作" width="80" align="center" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="danger" size="small" title="从面板移除该账号" @click="removeOne(row)">
+              <Icon icon="lucide:x" />
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
