@@ -1191,7 +1191,7 @@ def sync_seat_info(workspace_db_id: int) -> dict:
                 available_by_type[seat_type] = int(item.get("available") or 0)
             except (TypeError, ValueError):
                 available_by_type[seat_type] = 0
-            # held 是已占住席位但还没落定的成员（待处理）。它既不在
+            # held 是已占住席位但还没落定的成员（页面上叫"待解决"）。它既不在
             # seat_type_counts 的在用数里，也不算进 available，所以
             # paid = 在用 + held + available，不展示会对不上账。
             try:

@@ -257,7 +257,8 @@ class WorkspaceMemberPaginationTests(unittest.TestCase):
 
     def test_missing_seat_capacity_leaves_available_unknown(self):
         # 没有 seat_capacity 时 available 必须留 None（"未同步"），
-        # 落成 0 会让前端误报"无空位"。held 同理，不能凭空显示"待处理 0 席"。
+        # 落成 0 会让前端误报"无空位"。held 同理，null 才是"没数据不显示"，
+        # 落成 0 会显示"待解决 0 席"。
         result = self._sync_with(
             {"seats_in_use": 79, "seats_entitled": 8},
             {"amount_due": {"amount": 0}},

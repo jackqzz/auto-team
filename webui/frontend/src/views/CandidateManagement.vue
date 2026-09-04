@@ -340,11 +340,13 @@ function seatAvailableText(available) {
   return available === null || available === undefined ? "空位未同步" : `可分配 ${available} 席`;
 }
 
-// paid = 在用 + held + available，held 是已占住席位但还没落定的成员（待处理）。
-// 0 和"未同步"都不该显示这块，前者没意义、后者是没数据。分隔符跟着一起返回，
-// 免得模板里再套一层 v-if 拼空格。
+// paid = 在用 + held + available，held 是已占住席位但还没落定的成员（待解决）。
+// 只要同步过就显示，哪怕是 0——这是个需要盯的运营指标，藏起来会让人以为没做。
+// null/undefined 才是没数据，那时不显示。
+// 注意：候选人状态里另有"待处理申请"(pending_request)，是完全不同的东西，
+// 所以这里叫"待解决"，不要跟着改成"待处理"。
 function seatHeldText(held) {
-  return held ? ` · 待处理 ${held} 席` : "";
+  return held === null || held === undefined ? "" : ` · 待解决 ${held} 席`;
 }
 
 // 进度条分段宽度。已购为 0（或未同步）时不画任何段，避免除零后整条涂满。
@@ -1703,22 +1705,23 @@ onBeforeUnmount(() => {
             <div class="kpi-value-row">
               <span class="kpi-main-val">{{ currentWorkspace.seats_default ?? 0 }}</span>
               <span class="kpi-sub-val">/ {{ currentWorkspace.seats_default_entitled ?? 0 }} 席</span>
+              <!-- 数字始终在页脚显示（含 0），这里的 tag 只在 >0 时出现当告警用。 -->
               <el-tag
                 v-if="currentWorkspace.seats_default_held"
                 size="small"
                 type="warning"
                 effect="plain"
                 class="kpi-inline-tag"
-                title="已占住席位但尚未落定的成员"
+                title="已占住席位但尚未落定的成员，需要人工跟进"
               >
-                待处理 {{ currentWorkspace.seats_default_held }}
+                待解决 {{ currentWorkspace.seats_default_held }}
               </el-tag>
               <el-tag v-if="standardSeatsFull" size="small" type="danger" effect="plain" class="kpi-inline-tag">
                 无空位
               </el-tag>
             </div>
-            <!-- 已购席位分三段：在用 + 待处理(held) + 空闲。只画前两段，
-                 剩下的槽底色就是空闲，held 单列出来才解释得清"2/4 却无空位"。 -->
+            <!-- 已购席位分三段：在用 + 待解决(held) + 空闲。只画前两段，
+                 剩下的槽底色就是空闲，held 单列出来才解释得清"4/4 却无空位"。 -->
             <div class="kpi-bar-track">
               <div class="kpi-bar-fill fill-primary" :style="{ width: seatBarPct(currentWorkspace.seats_default, currentWorkspace.seats_default_entitled) }" />
               <div
@@ -1759,9 +1762,9 @@ onBeforeUnmount(() => {
                 type="warning"
                 effect="plain"
                 class="kpi-inline-tag"
-                title="已占住席位但尚未落定的成员"
+                title="已占住席位但尚未落定的成员，需要人工跟进"
               >
-                待处理 {{ currentWorkspace.seats_prolite_held }}
+                待解决 {{ currentWorkspace.seats_prolite_held }}
               </el-tag>
               <el-tag v-if="proliteSeatsFull" size="small" type="danger" effect="plain" class="kpi-inline-tag">
                 无空位
