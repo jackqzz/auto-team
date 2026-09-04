@@ -291,6 +291,91 @@ def _normalize_camoufox_birthday(value: Any) -> str:
     raise ValueError(f"生日必须是有效日期，实际值={raw[:32]!r}")
 
 
+# React Aria 日期选择器（<div role="group" data-rac">）的 segment 选择器。
+# 这个控件不是 <input>，对它调 fill() 会直接抛
+# "Element is not an <input>, <textarea>, <select> or [contenteditable]"。
+_RAC_DATE_SEGMENT_SELECTOR = "[role='spinbutton']"
+
+
+def _is_rac_date_group(locator) -> bool:
+    """判断定位到的是不是 React Aria 的日期分段控件（而非普通 input）。
+
+    判据用 DOM 事实而不是 class 名：class 是构建期哈希（实测
+    `_input_12ici_5`），每次发版都会变；tag/role 不会。
+    """
+    try:
+        tag = str(locator.evaluate("el => el.tagName") or "").lower()
+    except Exception:
+        return False
+    if tag == "input":
+        return False
+    try:
+        return int(locator.locator(_RAC_DATE_SEGMENT_SELECTOR).count() or 0) > 0
+    except Exception:
+        return False
+
+
+def _rac_birthday_digits(birthday_iso: str, segment_count: int) -> list[str]:
+    """把 ISO 生日拆成按 segment 顺序输入的数字串。
+
+    段顺序跟随页面 locale：en-US 是 MM/DD/YYYY（截图与日志里就是这个），
+    所以默认按月、日、年。段数不等于 3 时不猜，交由调用方报错。
+    """
+    parsed = datetime.strptime(birthday_iso, "%Y-%m-%d").date()
+    if segment_count != 3:
+        raise ValueError(f"未知的日期分段数: {segment_count}")
+    return [f"{parsed.month:02d}", f"{parsed.day:02d}", f"{parsed.year:04d}"]
+
+
+def _fill_rac_date_group(group, birthday_iso: str) -> None:
+    """按真人方式填写 React Aria 日期控件：聚焦分段后逐位敲数字。
+
+    不用 evaluate 去改 React 内部 state —— 那样绕过了组件的 onChange，
+    表单拿不到值，而且更容易被风控识别。这里走键盘输入，每敲满一段组件
+    会自己跳到下一段，与手动操作完全一致。
+    """
+    segments = group.locator(_RAC_DATE_SEGMENT_SELECTOR)
+    count = int(segments.count() or 0)
+    digits = _rac_birthday_digits(birthday_iso, count)
+    for index, value in enumerate(digits):
+        segment = segments.nth(index)
+        # 逐段点击聚焦：组件会自动前进，但显式聚焦能避免上一段没填满时
+        # 焦点停在原处导致数字串到一起。
+        segment.click()
+        for char in value:
+            segment.press(char)
+
+
+def _read_rac_date_group(group) -> str:
+    """读回 React Aria 日期控件的值，返回 YYYY-MM-DD。
+
+    分段控件没有 input_value()，只能读各段的 aria-valuenow / 文本。
+    """
+    segments = group.locator(_RAC_DATE_SEGMENT_SELECTOR)
+    count = int(segments.count() or 0)
+    if count != 3:
+        raise ValueError(f"未知的日期分段数: {count}")
+    values: list[int] = []
+    for index in range(count):
+        segment = segments.nth(index)
+        raw = ""
+        try:
+            raw = str(segment.get_attribute("aria-valuenow") or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            # 未填写的段 aria-valuenow 缺省，文本是 mm/dd/yyyy 之类的占位符。
+            try:
+                raw = str(segment.inner_text(timeout=800) or "").strip()
+            except Exception:
+                raw = ""
+        if not re.fullmatch(r"\d{1,4}", raw):
+            raise ValueError(f"日期分段 #{index + 1} 未填写有效数字: {raw[:16]!r}")
+        values.append(int(raw))
+    month, day, year = values
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
 def _classify_camoufox_profile_response(status: int | None, body: str = "") -> str:
     """分类资料提交响应，返回 success/retry/age/permanent/unknown。"""
     try:
@@ -5502,10 +5587,53 @@ class AuthFlow:
             body = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", "<email>", body)
             logger.info("[camoufox] page_text label=%s text=%s", label, re.sub(r"\s+", " ", body)[:600])
 
+        def _debug_enabled() -> bool:
+            value = str(self._get_env("OPENAI_CAMOUFOX_DEBUG", "0") or "").strip().lower()
+            return value in {"1", "true", "yes", "on", "debug"}
+
+        def _page_html(page, label: str) -> str:
+            """调试模式下把整页 HTML 落盘，供页面改版后比对真实结构。
+
+            截图只能看出「长什么样」，看不出控件到底是 input 还是自定义组件。
+            Birthday 那次就是靠报错文本才推断出是 React Aria 分段控件；有了
+            HTML 就能直接查证，不用再靠猜。
+            """
+            if not _debug_enabled():
+                return ""
+            try:
+                html = str(page.content() or "")
+            except Exception as exc:
+                logger.warning("[camoufox] 页面 HTML 获取失败 label=%s error=%s", label, str(exc)[:240])
+                return ""
+            try:
+                html_dir = str(
+                    self._get_env("OPENAI_CAMOUFOX_SCREENSHOT_DIR", "logs/camoufox_screenshots")
+                    or "logs/camoufox_screenshots"
+                ).strip()
+                if not os.path.isabs(html_dir):
+                    html_dir = os.path.join(os.getcwd(), html_dir)
+                os.makedirs(html_dir, exist_ok=True)
+                safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(label or "page"))[:80] or "page"
+                stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+                path = os.path.abspath(os.path.join(
+                    html_dir, f"camoufox_{safe_label}_{stamp}.html"
+                ))
+                # HTML 里可能带注册邮箱，与 page_text 一样做脱敏后再落盘。
+                html = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", "<email>", html)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(html)
+                logger.info(
+                    "[camoufox] 页面 HTML 已保存 label=%s bytes=%s path=%s",
+                    label, len(html), path,
+                )
+                return path
+            except Exception as exc:
+                logger.warning("[camoufox] 页面 HTML 保存失败 label=%s error=%s", label, str(exc)[:240])
+                return ""
+
         def _page_screenshot(page, label: str) -> str:
             """保存 Camoufox 当前页面截图，供无头模式排查页面卡住原因。"""
-            debug_value = str(self._get_env("OPENAI_CAMOUFOX_DEBUG", "0") or "").strip().lower()
-            if debug_value not in {"1", "true", "yes", "on", "debug"}:
+            if not _debug_enabled():
                 return ""
             try:
                 screenshot_dir = str(
@@ -5924,6 +6052,12 @@ class AuthFlow:
                     "input[placeholder*='MM/DD/YYYY']",
                     "input[placeholder*='YYYY']",
                     "input[type='date']",
+                    # React Aria 分段日期控件：不是 input，上面那些一个都匹配
+                    # 不上。用 id 后缀 + role=group 定位（实测 id 形如
+                    # "_r_1i_-birthday"，前缀是 React 的随机串，只有后缀稳定）。
+                    "[role='group'][id$='-birthday']",
+                    "[role='group'][id*='birthday']",
+                    "[role='group'][id*='birthdate']",
                 )
                 labels = ("Birthday", "Birth date", "Date of birth")
                 fallback_selectors = ()
@@ -5974,21 +6108,31 @@ class AuthFlow:
 
             # fill("") + fill(value) 强制同步 React 受控输入状态；每次重试
             # 都重新获取 locator，避免页面重渲染后沿用旧的 OTP locator。
+            #
+            # 但 Birthday 有两种形态：普通 <input>，和 React Aria 的分段日期
+            # 控件（<div role="group">，内含三个 role=spinbutton）。后者不是
+            # input，fill() 会直接抛错 —— 线上就是栽在这里，10 次重试全废。
+            rac_date_group = birthday_mode and _is_rac_date_group(current_age)
             current_name.fill("")
-            current_age.fill("")
+            if not rac_date_group:
+                current_age.fill("")
             current_name.fill(str(person_name))
             if birthday_mode:
                 birthday_iso = _camoufox_birthday_for_age(normalized_age)
-                try:
-                    input_type = str(current_age.get_attribute("type") or "").lower()
-                except Exception:
-                    input_type = ""
-                birthday_value = (
-                    birthday_iso
-                    if input_type == "date"
-                    else datetime.strptime(birthday_iso, "%Y-%m-%d").strftime("%m/%d/%Y")
-                )
-                current_age.fill(birthday_value)
+                if rac_date_group:
+                    logger.info("[camoufox] Birthday 为 React Aria 分段控件，改用键盘输入")
+                    _fill_rac_date_group(current_age, birthday_iso)
+                else:
+                    try:
+                        input_type = str(current_age.get_attribute("type") or "").lower()
+                    except Exception:
+                        input_type = ""
+                    birthday_value = (
+                        birthday_iso
+                        if input_type == "date"
+                        else datetime.strptime(birthday_iso, "%Y-%m-%d").strftime("%m/%d/%Y")
+                    )
+                    current_age.fill(birthday_value)
             else:
                 current_age.fill(str(normalized_age))
             try:
@@ -5999,7 +6143,12 @@ class AuthFlow:
 
             try:
                 actual_name = str(current_name.input_value() or "").strip()
-                actual_age = str(current_age.input_value() or "").strip()
+                # 分段控件没有 input_value()，得从各段的 aria-valuenow 读回。
+                actual_age = (
+                    _read_rac_date_group(current_age)
+                    if rac_date_group
+                    else str(current_age.input_value() or "").strip()
+                )
             except Exception as exc:
                 raise RuntimeError(f"Camoufox 资料填写后无法读取 DOM 值: {exc}") from exc
             if actual_name != str(person_name).strip():
@@ -7166,9 +7315,13 @@ class AuthFlow:
             ):
                 _page_screenshot(page, "profile_inputs_missing")
                 _page_text(page, "profile_inputs_missing")
+                _page_html(page, "profile_inputs_missing")
                 raise RuntimeError("Camoufox 年龄/姓名页面未找到 Full name 或 Age/Birthday 输入框")
             if name_input is not None and (age_input is not None or birthday_input is not None):
                 logger.info("[camoufox] 检测到年龄/姓名页面，提交注册资料")
+                # 调试模式下无论成败都先存一份资料页 HTML：等失败了再抓，页面
+                # 往往已经跳走或重渲染，拿到的结构不是当时那份。
+                _page_html(page, "profile_page")
                 try:
                     from auto_manq import generate_random_person
                     person_name, person_age = generate_random_person()
@@ -7420,6 +7573,9 @@ class AuthFlow:
                     if not submitted_profile:
                         _page_screenshot(page, "profile_submit_failed")
                         _page_text(page, "profile_submit_failed")
+                        # 资料页是改版重灾区（Age → Birthday 分段控件就是一次），
+                        # 失败时留一份 HTML，下次页面再变可以直接查证结构。
+                        _page_html(page, "profile_submit_failed")
                         # 保留原有安全网截图标签，便于和历史失败样本对照；
                         # 新流程已经在此之前完成了有上限的重填表单重试。
                         _page_screenshot(page, "profile_safety_net_failed")
