@@ -70,6 +70,162 @@ def goto_with_timeout(page, url: str, config: Any = None, **kwargs):
     return page.goto(url, **kwargs)
 
 
+def _left_session_ended_page(page) -> bool:
+    """页面是否已经离开 session-ended 页。
+
+    用 URL 判断而不是标题：标题会按出口 IP 本地化（复现时不传 locale
+    实测拿到过泰语 "เซสชันของคุณสิ้นสุดแล้ว"），URL 不会。
+    """
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        return False
+    return bool(url) and "/create-account" not in url
+
+
+_LOGIN_CLICK_TIMEOUT_MS = 10_000
+# 点击已经打出去、但导航没在 click 超时内跑完时，额外再等这么久。实测正常跳转
+# 链 2~6s 能跑完，慢的走完也在 10s 出头；超过就基本是导航被中止了。
+_LOGIN_NAV_GRACE_S = 8.0
+# 四个定位器都试完、但确实点出去过时的最后一轮等待。这条跳转链走代理最慢见过
+# 30s 出头，给足余量总比丢掉一次已经注册成功的号划算。
+_LOGIN_NAV_FINAL_GRACE_S = 25.0
+
+
+def _wait_left_session_ended(page, timeout_s: float, check_deadline=None) -> bool:
+    """等页面真的离开 session-ended，超时返回 False。
+
+    只读 page.url，不碰 locator —— 页面正在跳转时任何 locator 操作都会挂在
+    "waiting for navigation to finish" 上（复现时 evaluate 直接吃满 30s）。
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        if _left_session_ended_page(page):
+            return True
+        if time.time() >= deadline:
+            return False
+        if check_deadline is not None:
+            check_deadline("login_click_nav")
+        time.sleep(0.5)
+
+
+def click_session_ended_login(page, *, label: str = "", check_deadline=None) -> bool:
+    """点击 session-ended 页面的 Log in，返回是否成功离开该页。
+
+    不能用 `locator.click()` 的成败当判据。Playwright 的 click 在真正点下去
+    之后还要「waiting for scheduled navigations to finish」，而这个 Log in 是
+    个 <a href>，点击会触发一条跨域跳转链：
+
+        create-account → chatgpt.com/auth/login_with
+                       → auth.openai.com/api/accounts/authorize
+                       → auth.openai.com/log-in
+
+    走代理时这条链经常超过 10s，于是 click 抛 TimeoutError——但按钮早就点下去
+    了，浏览器也确实在跳转。旧代码把这个超时当成「这个定位器不好使」，转头拿
+    下一个定位器对着正在跳转的页面再点一次，四个轮完报 "未找到可点击的
+    Log in"。实测 283 次此类失败里元素全是 count=1 visible=True，且相邻两次
+    尝试的间隔精确等于 10s 超时值。
+
+    所以判据改成「页面有没有离开 session-ended」：只要走掉了就算成功，不管
+    click 本身是正常返回还是超时。
+
+    但「click action done」不等于跳转一定会发生。实测同一条 Call log（点击完成、
+    等导航超时）下有两种结局：
+
+      A. 导航在跑，只是慢。超时后再等几秒 URL 就变了 —— 占多数。
+      B. 导航被中止，页面纹丝不动，元素还在原地、readyState=complete。
+         这时换个定位器再点一次往往就成了（复现 round 8 即如此：#1 点击后
+         页面没动，#3 再点一次成功跳走）。
+
+    所以超时后不能直接返回成功，要先 _wait_left_session_ended 观察几秒：走掉了
+    才算成功；没走掉说明是 B，继续用下一个定位器重试。四个定位器都试完时，只要
+    期间有过「确实点下去了」的证据，就再多等一轮 —— 实测这种局面下后续定位器的
+    报错是 "waiting for navigation to finish"，说明导航还在飞，只是特别慢。
+    """
+    clicked_at_least_once = False
+    for index, build in enumerate((
+        lambda: page.get_by_role("link", name="Log in", exact=True),
+        lambda: page.get_by_role("button", name="Log in", exact=True),
+        lambda: page.get_by_text("Log in", exact=True),
+        lambda: page.locator("a:has-text('Log in')").first,
+    ), 1):
+        if check_deadline is not None:
+            check_deadline("login_click")
+        if _left_session_ended_page(page):
+            return True
+        try:
+            locator = build()
+            count = locator.count()
+            visible = bool(count and locator.first.is_visible())
+        except Exception as exc:
+            logger.info(
+                "[camoufox] Log in 定位器 #%s%s 预检异常: %s",
+                index, label, str(exc)[:180],
+            )
+            continue
+        logger.info(
+            "[camoufox] Log in 定位器 #%s%s count=%s visible=%s",
+            index, label, count, visible,
+        )
+        if not visible:
+            continue
+        try:
+            locator.first.click(timeout=_LOGIN_CLICK_TIMEOUT_MS)
+            return True
+        except Exception as exc:
+            text = str(exc)
+            # 点击已经打出去，只是导航没在超时内跑完。多数情况下再等几秒就跳
+            # 走了；但也有导航被中止、页面纹丝不动的情况，那时必须换定位器
+            # 重试，不能当成功返回。
+            if "click action done" in text:
+                clicked_at_least_once = True
+                if _wait_left_session_ended(
+                    page, _LOGIN_NAV_GRACE_S, check_deadline
+                ):
+                    logger.info(
+                        "[camoufox] Log in 定位器 #%s%s 点击已生效，"
+                        "导航超出 click 超时但已跳走",
+                        index, label,
+                    )
+                    return True
+                logger.warning(
+                    "[camoufox] Log in 定位器 #%s%s 点击已生效但导航未发生，"
+                    "再等 %.0fs 仍停在 session ended 页，换下一个定位器重试",
+                    index, label, _LOGIN_NAV_GRACE_S,
+                )
+                continue
+            if _left_session_ended_page(page):
+                logger.info(
+                    "[camoufox] Log in 定位器 #%s%s 点击报错但页面已跳走",
+                    index, label,
+                )
+                return True
+            # 真正的点击失败要能在日志里看见。旧代码用的是 logger.debug，而
+            # debug 没开，排查时只剩下无法解释的 10s 空档。
+            logger.warning(
+                "[camoufox] Log in 定位器 #%s%s 点击失败: %s",
+                index, label, text[:300],
+            )
+            # 后续定位器卡在 "waiting for navigation to finish" 说明前面那次
+            # 点击触发的导航还在飞，只是慢 —— 这也算「点下去了」。
+            if "navigation to finish" in text:
+                clicked_at_least_once = True
+    if _left_session_ended_page(page):
+        return True
+    if clicked_at_least_once:
+        # 点是点出去了，只是这条跨域跳转链特别慢。宣告失败前再等一轮，
+        # 免得把一次本来会成功的注册白白丢掉。
+        logger.warning(
+            "[camoufox] Log in%s 四个定位器都试完仍在 session ended 页，"
+            "但点击确已生效，再等 %.0fs 观察导航",
+            label, _LOGIN_NAV_FINAL_GRACE_S,
+        )
+        return _wait_left_session_ended(
+            page, _LOGIN_NAV_FINAL_GRACE_S, check_deadline
+        )
+    return False
+
+
 _PERMANENT_INVALID_MARKERS = (
     "account because it has been deleted or deactivated",
     "deleted or deactivated",
@@ -5949,6 +6105,11 @@ class AuthFlow:
             logger.info("[camoufox] title_poll %s/%s timeout, last_title=%s", attempts, attempts, last_title[:120])
             return False
 
+        def _click_login_button(page, label: str = "") -> bool:
+            return click_session_ended_login(
+                page, label=label, check_deadline=_check_deadline
+            )
+
         def _sync_cookies(context) -> None:
             try:
                 cookies = context.cookies()
@@ -6270,32 +6431,10 @@ class AuthFlow:
             )
             if session_ended:
                 logger.info("[camoufox] 强制等待到 session ended，准备点击 Log in")
-                login_locators = []
-                try:
-                    login_locators.extend([
-                        page.get_by_role("link", name="Log in", exact=True),
-                        page.get_by_role("button", name="Log in", exact=True),
-                        page.get_by_text("Log in", exact=True),
-                        page.locator("a:has-text('Log in')").first,
-                    ])
-                except Exception:
-                    pass
-                clicked = False
-                for index, locator in enumerate(login_locators, 1):
-                    try:
-                        count = locator.count()
-                        visible = bool(count and locator.first.is_visible())
-                        logger.info("[camoufox] Log in 定位器 #%s count=%s visible=%s", index, count, visible)
-                        if visible:
-                            locator.first.click(timeout=10_000)
-                            clicked = True
-                            break
-                    except Exception as exc:
-                        logger.debug("[camoufox] Log in 定位器 #%s 点击失败: %s", index, str(exc)[:180])
-                if not clicked:
-                    _page_screenshot(page, "login_locator_missing")
-                    _page_text(page, "login_locator_missing")
-                    raise RuntimeError("Camoufox session ended 页面未找到可点击的 Log in")
+                if not _click_login_button(page):
+                    _page_screenshot(page, "login_click_failed")
+                    _page_text(page, "login_click_failed")
+                    raise RuntimeError("Camoufox session ended 页面点击 Log in 后未离开该页")
                 _page_state(page, "after_login_click")
             # ── 点击 Log in 后等待 Welcome back，遇到 Oops 错误页则点 Go back 重试 ──
             _WELCOME_BACK_MAX_RETRIES = 3
@@ -6387,25 +6526,9 @@ class AuthFlow:
                             logger.info(
                                 "[camoufox] 注册页面再次出现 session ended，重新点击 Log in"
                             )
-                            clicked = False
-                            for index, locator in enumerate([
-                                page.get_by_role("link", name="Log in", exact=True),
-                                page.get_by_role("button", name="Log in", exact=True),
-                                page.get_by_text("Log in", exact=True),
-                                page.locator("a:has-text('Log in')").first,
-                            ], 1):
-                                try:
-                                    count = locator.count()
-                                    visible = bool(count and locator.first.is_visible())
-                                    if visible:
-                                        locator.first.click(timeout=10_000)
-                                        clicked = True
-                                        break
-                                except Exception:
-                                    pass
-                            if not clicked:
+                            if not _click_login_button(page, f" retry{_wb_attempt}"):
                                 raise RuntimeError(
-                                    "Camoufox Oops 重试后 session ended 页面未找到 Log in"
+                                    "Camoufox Oops 重试后点击 Log in 未离开 session ended 页"
                                 )
                             _page_state(page, f"after_login_click_retry_{_wb_attempt}")
                             continue  # 回到循环顶部重新等待 Welcome back
@@ -6436,25 +6559,9 @@ class AuthFlow:
                         logger.info(
                             "[camoufox] Oops 重试后回到 session ended，重新点击 Log in"
                         )
-                        clicked = False
-                        for index, locator in enumerate([
-                            page.get_by_role("link", name="Log in", exact=True),
-                            page.get_by_role("button", name="Log in", exact=True),
-                            page.get_by_text("Log in", exact=True),
-                            page.locator("a:has-text('Log in')").first,
-                        ], 1):
-                            try:
-                                count = locator.count()
-                                visible = bool(count and locator.first.is_visible())
-                                if visible:
-                                    locator.first.click(timeout=10_000)
-                                    clicked = True
-                                    break
-                            except Exception:
-                                pass
-                        if not clicked:
+                        if not _click_login_button(page, f" oops{_wb_attempt}"):
                             raise RuntimeError(
-                                "Camoufox Oops 重试后 session ended 页面未找到 Log in"
+                                "Camoufox Oops 重试后点击 Log in 未离开 session ended 页"
                             )
                         _page_state(page, f"after_login_click_retry_{_wb_attempt}")
                         continue  # 回到循环顶部重新等待 Welcome back
