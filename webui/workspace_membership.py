@@ -1152,8 +1152,20 @@ def sync_seat_info(workspace_db_id: int) -> dict:
         "seats_usage_based": None,
         "seats_prolite": None,
         "seats_prolite_entitled": None,
+        "seats_default_available": None,
+        "seats_prolite_available": None,
+        "seats_default_held": None,
+        "seats_prolite_held": None,
         "seat_cost": "",
-        "renewal_date": "",
+        # subscriptions.active_until 就是本期订阅到期日。实测两个空间上它与
+        # preview.renewal_date 完全一致（同为 ISO Z 串），所以先在这里落定，
+        # 后面 preview 成功了再覆盖。这样 preview 请求失败/被跳过时页面仍有
+        # 续费日期可显示，而不是退回"未同步"。
+        "renewal_date": usage.get("active_until") or "",
+        # 字段缺失按"会续订、不欠费"处理，与建表默认值一致；否则一次响应少了
+        # will_renew 就会让页面凭空冒出"（不再续订）"。
+        "will_renew": 1 if usage.get("will_renew", True) else 0,
+        "is_delinquent": 1 if usage.get("is_delinquent") else 0,
     }
     # 新版 subscriptions 响应按席位类型返回订阅容量。default 与
     # prolite 都属于已购订阅席位，但必须分别保存，不能只使用总数
@@ -1161,6 +1173,8 @@ def sync_seat_info(workspace_db_id: int) -> dict:
     seat_capacity = usage.get("seat_capacity") if isinstance(usage, dict) else None
     if isinstance(seat_capacity, list):
         paid_by_type = {}
+        available_by_type = {}
+        held_by_type = {}
         for item in seat_capacity:
             if not isinstance(item, dict):
                 continue
@@ -1171,8 +1185,25 @@ def sync_seat_info(workspace_db_id: int) -> dict:
                 paid_by_type[seat_type] = int(item.get("paid") or 0)
             except (TypeError, ValueError):
                 paid_by_type[seat_type] = 0
+            # available=0 表示已购席位全部占满，自动补齐/升级任务此时必然失败。
+            # 提前显示出来，省得用户只看到 4/4 还以为能继续补。
+            try:
+                available_by_type[seat_type] = int(item.get("available") or 0)
+            except (TypeError, ValueError):
+                available_by_type[seat_type] = 0
+            # held 是已占住席位但还没落定的成员（待处理）。它既不在
+            # seat_type_counts 的在用数里，也不算进 available，所以
+            # paid = 在用 + held + available，不展示会对不上账。
+            try:
+                held_by_type[seat_type] = int(item.get("held") or 0)
+            except (TypeError, ValueError):
+                held_by_type[seat_type] = 0
         result["seats_default_entitled"] = paid_by_type.get("default", 0)
         result["seats_prolite_entitled"] = paid_by_type.get("prolite", 0)
+        result["seats_default_available"] = available_by_type.get("default", 0)
+        result["seats_prolite_available"] = available_by_type.get("prolite", 0)
+        result["seats_default_held"] = held_by_type.get("default", 0)
+        result["seats_prolite_held"] = held_by_type.get("prolite", 0)
         if entitled is None:
             result["seats_entitled"] = sum(paid_by_type.values())
     counts = _json(_workspace_admin_request(
@@ -1197,18 +1228,41 @@ def sync_seat_info(workspace_db_id: int) -> dict:
             or 0
         )
         logger.info("席位分类同步 workspace_db_id=%s workspace_id=%s default=%s usage_based=%s prolite=%s automation=%s", workspace_db_id, workspace_id, result["seats_default"], result["seats_usage_based"], result["seats_prolite"], seat_counts.get("automation", 0))
+    # preview 只为了拿"加购一席"的差价（seat_cost），subscriptions 里没有等价字段，
+    # 所以这个请求省不掉。但它是三个请求里唯一可有可无的一个：失败了不该把前两个
+    # 已经拿到的席位数一起丢掉，所以这里单独吞掉异常，让席位照常落库。
     if entitled is not None:
-        preview = _json(_workspace_admin_request(
-            workspace_db_id,
-            session,
-            "get",
-            f"{BASE}/backend-api/subscriptions/update/preview",
-            params={"account_id": workspace_id, "updated_seats": int(entitled) + 1},
-            headers=headers,
-            timeout=30,
-        ))
+        try:
+            preview = _json(_workspace_admin_request(
+                workspace_db_id,
+                session,
+                "get",
+                f"{BASE}/backend-api/subscriptions/update/preview",
+                params={"account_id": workspace_id, "updated_seats": int(entitled) + 1},
+                headers=headers,
+                timeout=30,
+            ))
+        except Exception:
+            logger.warning(
+                "加购单席位报价查询失败，仅跳过 seat_cost workspace_db_id=%s workspace_id=%s",
+                workspace_db_id,
+                workspace_id,
+                exc_info=True,
+            )
+            preview = {}
         amount = preview.get("amount_due") or {}
         if amount.get("amount") is not None:
-            result["seat_cost"] = f"{int(amount['amount']) / 100:.2f} {str(amount.get('currency') or '').upper()}"
-        result["renewal_date"] = preview.get("renewal_date") or ""
+            # 币种实测在 preview 顶层的 currency 上，amount_due 里始终没有
+            #（库里那条 "58.36 " 就是只读 amount_due.currency 的结果）。
+            # 三级兜底：amount_due.currency → preview.currency → subscriptions
+            # 的 billing_currency，同一笔订阅的结算币种三者一致。
+            currency = str(
+                amount.get("currency")
+                or preview.get("currency")
+                or usage.get("billing_currency")
+                or ""
+            ).upper()
+            result["seat_cost"] = f"{int(amount['amount']) / 100:.2f} {currency}".strip()
+        # preview 拿到了就以它为准，没拿到就保留上面 active_until 的兜底值。
+        result["renewal_date"] = preview.get("renewal_date") or result["renewal_date"]
     return result

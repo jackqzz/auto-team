@@ -331,6 +331,29 @@ function quotaSkipSummary(rows) {
 
 const currentWorkspace = computed(() => spaces.value.find((x) => x.id === workspaceId.value) || null);
 
+// available=0 表示已购席位全部占满，自动补齐/升级此时必然失败。null 是"没同步过"，
+// 不能当成 0 报警，所以两种情况要分开判。
+const standardSeatsFull = computed(() => currentWorkspace.value?.seats_default_available === 0);
+const proliteSeatsFull = computed(() => currentWorkspace.value?.seats_prolite_available === 0);
+
+function seatAvailableText(available) {
+  return available === null || available === undefined ? "空位未同步" : `可分配 ${available} 席`;
+}
+
+// paid = 在用 + held + available，held 是已占住席位但还没落定的成员（待处理）。
+// 0 和"未同步"都不该显示这块，前者没意义、后者是没数据。分隔符跟着一起返回，
+// 免得模板里再套一层 v-if 拼空格。
+function seatHeldText(held) {
+  return held ? ` · 待处理 ${held} 席` : "";
+}
+
+// 进度条分段宽度。已购为 0（或未同步）时不画任何段，避免除零后整条涂满。
+function seatBarPct(value, entitled) {
+  const total = Number(entitled) || 0;
+  if (total <= 0) return "0%";
+  return `${Math.min(100, Math.round(((Number(value) || 0) / total) * 100))}%`;
+}
+
 const currentSpaceLabel = () => {
   const s = currentWorkspace.value;
   return s ? `${s.account} · ${s.workspace_id || "无空间ID"}` : "未选择母号空间";
@@ -1680,18 +1703,35 @@ onBeforeUnmount(() => {
             <div class="kpi-value-row">
               <span class="kpi-main-val">{{ currentWorkspace.seats_default ?? 0 }}</span>
               <span class="kpi-sub-val">/ {{ currentWorkspace.seats_default_entitled ?? 0 }} 席</span>
+              <el-tag
+                v-if="currentWorkspace.seats_default_held"
+                size="small"
+                type="warning"
+                effect="plain"
+                class="kpi-inline-tag"
+                title="已占住席位但尚未落定的成员"
+              >
+                待处理 {{ currentWorkspace.seats_default_held }}
+              </el-tag>
+              <el-tag v-if="standardSeatsFull" size="small" type="danger" effect="plain" class="kpi-inline-tag">
+                无空位
+              </el-tag>
             </div>
+            <!-- 已购席位分三段：在用 + 待处理(held) + 空闲。只画前两段，
+                 剩下的槽底色就是空闲，held 单列出来才解释得清"2/4 却无空位"。 -->
             <div class="kpi-bar-track">
+              <div class="kpi-bar-fill fill-primary" :style="{ width: seatBarPct(currentWorkspace.seats_default, currentWorkspace.seats_default_entitled) }" />
               <div
-                class="kpi-bar-fill fill-primary"
-                :style="{
-                  width: `${Math.min(100, Math.round(((currentWorkspace.seats_default || 0) / Math.max(1, currentWorkspace.seats_default_entitled || 1)) * 100))}%`
-                }"
+                v-if="currentWorkspace.seats_default_held"
+                class="kpi-bar-fill fill-held"
+                :style="{ width: seatBarPct(currentWorkspace.seats_default_held, currentWorkspace.seats_default_entitled) }"
               />
             </div>
           </div>
           <div class="kpi-footer">
-            <span>占用率 {{ Math.round(((currentWorkspace.seats_default || 0) / Math.max(1, currentWorkspace.seats_default_entitled || 1)) * 100) }}% · 累计补齐 {{ candidateStats.seat_fulfillment?.standard?.fulfilled_total || 0 }} 席</span>
+            <span>
+              {{ seatAvailableText(currentWorkspace.seats_default_available) }}{{ seatHeldText(currentWorkspace.seats_default_held) }} · 累计补齐 {{ candidateStats.seat_fulfillment?.standard?.fulfilled_total || 0 }} 席
+            </span>
             <span v-if="seatProtectEnabled" class="kpi-protect-badge" title="今日席位保护消耗 / 阈值">
               保护消耗: {{ seatProtectUsedCount }}/{{ seatProtectThreshold }}
             </span>
@@ -1713,18 +1753,33 @@ onBeforeUnmount(() => {
             <div class="kpi-value-row">
               <span class="kpi-main-val">{{ currentWorkspace.seats_prolite ?? 0 }}</span>
               <span class="kpi-sub-val">/ {{ currentWorkspace.seats_prolite_entitled ?? 0 }} 席</span>
+              <el-tag
+                v-if="currentWorkspace.seats_prolite_held"
+                size="small"
+                type="warning"
+                effect="plain"
+                class="kpi-inline-tag"
+                title="已占住席位但尚未落定的成员"
+              >
+                待处理 {{ currentWorkspace.seats_prolite_held }}
+              </el-tag>
+              <el-tag v-if="proliteSeatsFull" size="small" type="danger" effect="plain" class="kpi-inline-tag">
+                无空位
+              </el-tag>
             </div>
             <div class="kpi-bar-track">
+              <div class="kpi-bar-fill fill-warning" :style="{ width: seatBarPct(currentWorkspace.seats_prolite, currentWorkspace.seats_prolite_entitled) }" />
               <div
-                class="kpi-bar-fill fill-warning"
-                :style="{
-                  width: `${Math.min(100, Math.round(((currentWorkspace.seats_prolite || 0) / Math.max(1, currentWorkspace.seats_prolite_entitled || 1)) * 100))}%`
-                }"
+                v-if="currentWorkspace.seats_prolite_held"
+                class="kpi-bar-fill fill-held"
+                :style="{ width: seatBarPct(currentWorkspace.seats_prolite_held, currentWorkspace.seats_prolite_entitled) }"
               />
             </div>
           </div>
           <div class="kpi-footer">
-            <span>占用率 {{ Math.round(((currentWorkspace.seats_prolite || 0) / Math.max(1, currentWorkspace.seats_prolite_entitled || 1)) * 100) }}% · 累计补齐 {{ candidateStats.seat_fulfillment?.prolite?.fulfilled_total || 0 }} 席</span>
+            <span>
+              {{ seatAvailableText(currentWorkspace.seats_prolite_available) }}{{ seatHeldText(currentWorkspace.seats_prolite_held) }} · 累计补齐 {{ candidateStats.seat_fulfillment?.prolite?.fulfilled_total || 0 }} 席
+            </span>
             <span v-if="proliteSeatProtectEnabled" class="kpi-protect-badge" title="今日高级席位保护消耗 / 阈值">
               保护消耗: {{ proliteSeatProtectUsedCount }}/{{ proliteSeatProtectThreshold }}
             </span>
@@ -1763,18 +1818,25 @@ onBeforeUnmount(() => {
               <span class="kpi-dot dot-info" />
               <span class="kpi-title">Codex 席位</span>
             </div>
+            <el-tag size="small" type="info" effect="plain" class="kpi-tag">按量计费</el-tag>
           </div>
           <div class="kpi-body">
             <div class="kpi-value-row">
               <span class="kpi-main-val">{{ currentWorkspace.seats_usage_based ?? 0 }}</span>
               <span class="kpi-sub-val">在用</span>
             </div>
+            <!-- 旧文案是"已购总席位 8 · 在用合计 79"，两个数并排看着像超额 10 倍。
+                 实际 79 = 标准 + ProLite + Codex，而 Codex 按量计费不占已购席位，
+                 所以这里把加数拆开写清楚。 -->
             <div class="kpi-stat-subtext">
-              已购总席位 {{ currentWorkspace.seats_entitled ?? '-' }} · 在用合计 {{ currentWorkspace.seats_in_use ?? '-' }}
+              不占已购席位（订阅席位 {{ currentWorkspace.seats_entitled ?? '-' }}）
             </div>
           </div>
           <div class="kpi-footer">
-            <span>按量计费与使用</span>
+            <span>
+              空间在用合计 {{ currentWorkspace.seats_in_use ?? '-' }} =
+              标准 {{ currentWorkspace.seats_default ?? 0 }} + ProLite {{ currentWorkspace.seats_prolite ?? 0 }} + Codex {{ currentWorkspace.seats_usage_based ?? 0 }}
+            </span>
           </div>
         </div>
 
@@ -1785,8 +1847,11 @@ onBeforeUnmount(() => {
               <span class="kpi-dot dot-success" />
               <span class="kpi-title">母号信息</span>
             </div>
+            <el-tag v-if="currentWorkspace.is_delinquent" size="small" type="danger" effect="dark" class="kpi-tag">
+              账单欠费
+            </el-tag>
             <button
-              v-if="currentWorkspace.workspace_id"
+              v-else-if="currentWorkspace.workspace_id"
               class="copy-chip-btn"
               title="点击复制 Workspace ID"
               @click="copyText(currentWorkspace.workspace_id)"
@@ -1797,12 +1862,17 @@ onBeforeUnmount(() => {
           </div>
           <div class="kpi-body meta-body">
             <div class="meta-item">
-              <span class="meta-label">空间费用:</span>
+              <!-- seat_cost 问的是 updated_seats = entitled + 1 的差价，即"再加一个
+                   席位要补多少钱"，不是空间月费。标成"空间费用"会被读成月费。 -->
+              <span class="meta-label">加购单席位:</span>
               <span class="meta-val highlight-val">{{ currentWorkspace.seat_cost || '未同步' }}</span>
             </div>
             <div class="meta-item">
-              <span class="meta-label">续费日期:</span>
-              <span class="meta-val">{{ cst(currentWorkspace.renewal_date) }}</span>
+              <span class="meta-label">{{ currentWorkspace.will_renew === 0 ? '到期日期:' : '续费日期:' }}</span>
+              <span class="meta-val" :class="{ 'text-danger': currentWorkspace.will_renew === 0 }">
+                {{ cst(currentWorkspace.renewal_date) }}
+                <template v-if="currentWorkspace.will_renew === 0">（不再续订）</template>
+              </span>
             </div>
           </div>
           <div class="kpi-footer">
@@ -2831,22 +2901,43 @@ onBeforeUnmount(() => {
   color: var(--el-text-color-secondary);
 }
 
+/* 值行是 align-items: baseline，el-tag 的基线会把它顶歪，单独拉回来。 */
+.kpi-inline-tag {
+  align-self: center;
+  margin-left: 2px;
+}
+
+/* 在用段和 held 段要横排接续，所以轨道自己做 flex 容器。分段不再各自带圆角，
+   接缝处才不会豁开，两端的圆头由轨道的 overflow 裁出来。 */
 .kpi-bar-track {
   height: 6px;
   width: 100%;
   background: var(--el-fill-color-dark);
   border-radius: 999px;
   overflow: hidden;
+  display: flex;
 }
 
 .kpi-bar-fill {
   height: 100%;
-  border-radius: 999px;
+  flex: 0 0 auto;
   transition: width 0.3s ease;
 }
 
 .fill-primary { background: var(--el-color-primary); }
 .fill-warning { background: var(--el-color-warning); }
+
+/* held 用斜条纹而不是纯色：席位被占住但还没落定，跟"在用"不是一回事，
+   两张卡片的主色又各不相同，所以统一走中性的 info 色。 */
+.fill-held {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--el-color-info-light-3),
+    var(--el-color-info-light-3) 3px,
+    var(--el-color-info-light-5) 3px,
+    var(--el-color-info-light-5) 6px
+  );
+}
 
 .kpi-footer {
   font-size: 11px;

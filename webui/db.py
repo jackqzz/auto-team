@@ -118,6 +118,12 @@ def init_db():
             seats_usage_based INTEGER,
             seats_prolite   INTEGER,
             seats_prolite_entitled INTEGER,
+            seats_default_available INTEGER,
+            seats_prolite_available INTEGER,
+            seats_default_held INTEGER,
+            seats_prolite_held INTEGER,
+            will_renew      INTEGER NOT NULL DEFAULT 1,
+            is_delinquent   INTEGER NOT NULL DEFAULT 0,
             seat_cost       TEXT NOT NULL DEFAULT '',
             renewal_date    TEXT NOT NULL DEFAULT '',
             session_token   TEXT NOT NULL UNIQUE,
@@ -191,6 +197,13 @@ def init_db():
         ("seats_usage_based", "INTEGER"),
         ("seats_prolite", "INTEGER"),
         ("seats_prolite_entitled", "INTEGER"),
+        ("seats_default_available", "INTEGER"),
+        ("seats_prolite_available", "INTEGER"),
+        ("seats_default_held", "INTEGER"),
+        ("seats_prolite_held", "INTEGER"),
+        # 未同步过的旧母号按"会续订、不欠费"处理，与改造前页面的隐含假设一致。
+        ("will_renew", "INTEGER NOT NULL DEFAULT 1"),
+        ("is_delinquent", "INTEGER NOT NULL DEFAULT 0"),
         ("seat_cost", "TEXT NOT NULL DEFAULT ''"),
         ("renewal_date", "TEXT NOT NULL DEFAULT ''"),
         ("settings_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -553,7 +566,7 @@ def count_workspace_masters() -> int:
 
 def list_workspace_masters(limit: int = 20, offset: int = 0) -> list[dict]:
     rows = _conn().execute(
-        "SELECT id, account, email, workspace_id, seats_in_use, seats_entitled, seats_default, seats_default_entitled, seats_usage_based, seats_prolite, seats_prolite_entitled, seat_cost, renewal_date, status, length(session_token) AS session_len, "
+        "SELECT id, account, email, workspace_id, seats_in_use, seats_entitled, seats_default, seats_default_entitled, seats_usage_based, seats_prolite, seats_prolite_entitled, seats_default_available, seats_prolite_available, seats_default_held, seats_prolite_held, will_renew, is_delinquent, seat_cost, renewal_date, status, length(session_token) AS session_len, "
         "substr(session_token, 1, 8) AS session_head, "
         "substr(session_token, -6) AS session_tail, proxy_url, imported_at, updated_at "
         "FROM workspace_masters ORDER BY updated_at DESC LIMIT ? OFFSET ?",
@@ -1609,7 +1622,7 @@ def update_workspace_candidate_status(workspace_master_id: int, email: str, stat
 
 
 def update_workspace_seat_info(workspace_master_id: int, **values) -> bool:
-    allowed = {k: values[k] for k in ('seats_in_use','seats_entitled','seats_default','seats_default_entitled','seats_usage_based','seats_prolite','seats_prolite_entitled','seat_cost','renewal_date') if k in values}
+    allowed = {k: values[k] for k in ('seats_in_use','seats_entitled','seats_default','seats_default_entitled','seats_usage_based','seats_prolite','seats_prolite_entitled','seats_default_available','seats_prolite_available','seats_default_held','seats_prolite_held','will_renew','is_delinquent','seat_cost','renewal_date') if k in values}
     if not allowed: return False
     clause = ', '.join(f'{k}=?' for k in allowed)
     with _lock:

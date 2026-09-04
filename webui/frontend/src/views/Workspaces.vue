@@ -44,6 +44,14 @@ function setRowBusy(target, id, busy) {
   target.value = { ...target.value, [id]: busy }
 }
 
+// available=0 才是买满，null/undefined 是没同步过，不能混为一谈。
+function seatFullText(row) {
+  const full = []
+  if (row.seats_default_available === 0) full.push('标准')
+  if (row.seats_prolite_available === 0) full.push('ProLite')
+  return full.length ? `${full.join(' / ')} 已无空位` : ''
+}
+
 const totalDefaultSeats = computed(() => {
   return rows.value.reduce((acc, cur) => acc + (Number(cur.seats_default) || 0), 0)
 })
@@ -406,11 +414,11 @@ onActivated(() => load())
           <template #default="{ row }">
             <div class="seat-stats-cell">
               <div class="seat-pills-row">
-                <div class="seat-pill default-pill">
+                <div class="seat-pill default-pill" :class="{ 'pill-full': row.seats_default_available === 0 }">
                   <span class="seat-name">标准</span>
                   <span class="seat-nums">{{ row.seats_default ?? '-' }} / {{ row.seats_default_entitled ?? '-' }}</span>
                 </div>
-                <div class="seat-pill prolite-pill">
+                <div class="seat-pill prolite-pill" :class="{ 'pill-full': row.seats_prolite_available === 0 }">
                   <span class="seat-name">ProLite</span>
                   <span class="seat-nums">{{ row.seats_prolite ?? '-' }} / {{ row.seats_prolite_entitled ?? '-' }}</span>
                 </div>
@@ -419,6 +427,9 @@ onActivated(() => load())
                   <span class="seat-nums">{{ row.seats_usage_based ?? '-' }}</span>
                 </div>
               </div>
+              <!-- available=0 时自动补齐/升级必然失败，列表页也标出来，
+                   省得逐个空间点进候选管理才发现买满了。 -->
+              <div v-if="seatFullText(row)" class="seat-full-note">{{ seatFullText(row) }}</div>
             </div>
           </template>
         </el-table-column>
@@ -428,12 +439,15 @@ onActivated(() => load())
           <template #default="{ row }">
             <div class="cost-cell">
               <div class="cost-val-row">
-                <span class="cost-label">费用:</span>
+                <!-- seat_cost 是加购一个席位的差价，不是空间月费，标签要说清。 -->
+                <span class="cost-label">加购单席位:</span>
                 <span class="cost-val">{{ row.seat_cost || '未同步' }}</span>
               </div>
               <div class="renewal-row">
-                <span class="renewal-label">到期:</span>
-                <span class="renewal-val">{{ cst(row.renewal_date) }}</span>
+                <span class="renewal-label">{{ row.will_renew === 0 ? '到期:' : '续费:' }}</span>
+                <span class="renewal-val" :class="{ 'is-expiring': row.will_renew === 0 }">{{ cst(row.renewal_date) }}</span>
+                <el-tag v-if="row.is_delinquent" size="small" type="danger" effect="dark">欠费</el-tag>
+                <el-tag v-else-if="row.will_renew === 0" size="small" type="warning" effect="plain">不续订</el-tag>
               </div>
             </div>
           </template>
@@ -885,6 +899,18 @@ onActivated(() => load())
   border-color: var(--el-border-color-lighter);
 }
 
+/* 买满的席位类型用危险色边框描出来，配合下面那行文字提示。 */
+.pill-full {
+  border-color: var(--el-color-danger-light-5);
+  border-style: dashed;
+}
+
+.seat-full-note {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--el-color-danger);
+}
+
 .cost-cell {
   display: flex;
   flex-direction: column;
@@ -918,6 +944,11 @@ onActivated(() => load())
 .renewal-val {
   font-family: ui-monospace, SFMono-Regular, monospace;
   color: var(--el-text-color-regular);
+}
+
+/* style 是 scoped 的，不能蹭别处的 .text-danger，得在本文件里定义。 */
+.renewal-val.is-expiring {
+  color: var(--el-color-danger);
 }
 
 .tech-cell {

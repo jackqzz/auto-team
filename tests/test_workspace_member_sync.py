@@ -111,7 +111,7 @@ class WorkspaceMemberPaginationTests(unittest.TestCase):
                 "seats_entitled": 8,
                 "seat_capacity": [
                     {"type": "default", "paid": 4, "available": 4},
-                    {"type": "prolite", "paid": 4, "available": 1},
+                    {"type": "prolite", "paid": 4, "available": 1, "held": 2},
                 ],
             }),
             response({"seat_type_counts": {"default": 0, "usage_based": 73, "prolite": 3}}),
@@ -129,6 +129,143 @@ class WorkspaceMemberPaginationTests(unittest.TestCase):
         self.assertEqual(result["seats_default"], 0)
         self.assertEqual(result["seats_prolite"], 3)
         self.assertEqual(result["seats_usage_based"], 73)
+        self.assertEqual(result["seats_default_available"], 4)
+        self.assertEqual(result["seats_prolite_available"], 1)
+        # 缺 held 字段按 0 处理，有则原样取；prolite 这行满足 paid = 在用 + held + available。
+        self.assertEqual(result["seats_default_held"], 0)
+        self.assertEqual(result["seats_prolite_held"], 2)
+
+    @staticmethod
+    def _mock_response(payload):
+        item = Mock(status_code=200, headers={})
+        item.json.return_value = payload
+        return item
+
+    def _sync_with(self, subscriptions, preview):
+        session = Mock()
+        master = {"workspace_id": "workspace-1", "access_token": "token"}
+        responses = [
+            self._mock_response(subscriptions),
+            self._mock_response({"seat_type_counts": {"default": 4, "usage_based": 71, "prolite": 4}}),
+            self._mock_response(preview),
+        ]
+        with (
+            patch.object(workspace_membership, "create_workspace_http_session", return_value=(session, master)),
+            patch.object(workspace_membership, "_workspace_admin_request", side_effect=responses),
+        ):
+            return workspace_membership.sync_seat_info(5)
+
+    def test_seat_cost_falls_back_to_subscription_billing_currency(self):
+        # preview 不返回 currency 时（线上确实出现过，库里存成 "58.36 "），
+        # 用 subscriptions 的 billing_currency 兜底。
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8, "billing_currency": "SGD"},
+            {"amount_due": {"amount": 5836}, "renewal_date": "2026-09-14"},
+        )
+        self.assertEqual(result["seat_cost"], "58.36 SGD")
+
+    def test_seat_cost_prefers_preview_currency_over_subscription(self):
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8, "billing_currency": "SGD"},
+            {"amount_due": {"amount": 5836, "currency": "usd"}},
+        )
+        self.assertEqual(result["seat_cost"], "58.36 USD")
+
+    def test_seat_cost_reads_currency_from_preview_top_level(self):
+        # 实测线上 amount_due 里没有 currency，币种在 preview 顶层。
+        # 只读 amount_due.currency 正是库里 "58.36 " 缺币种的成因。
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8},
+            {"amount_due": {"amount": 5821}, "currency": "sgd"},
+        )
+        self.assertEqual(result["seat_cost"], "58.21 SGD")
+
+    def test_seat_cost_without_any_currency_has_no_trailing_space(self):
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8},
+            {"amount_due": {"amount": 5836}},
+        )
+        self.assertEqual(result["seat_cost"], "58.36")
+
+    def test_subscription_flags_are_normalized_to_int(self):
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8, "will_renew": True, "is_delinquent": False},
+            {"amount_due": {"amount": 0}},
+        )
+        self.assertEqual(result["will_renew"], 1)
+        self.assertEqual(result["is_delinquent"], 0)
+
+        delinquent = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8, "will_renew": False, "is_delinquent": True},
+            {"amount_due": {"amount": 0}},
+        )
+        self.assertEqual(delinquent["will_renew"], 0)
+        self.assertEqual(delinquent["is_delinquent"], 1)
+
+    def test_missing_will_renew_defaults_to_renewing(self):
+        # 响应里没这个字段时不能当成 False，否则页面会凭空显示"（不再续订）"。
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8},
+            {"amount_due": {"amount": 0}},
+        )
+        self.assertEqual(result["will_renew"], 1)
+        self.assertEqual(result["is_delinquent"], 0)
+
+    def test_renewal_date_falls_back_to_subscription_active_until(self):
+        # preview 会返回同一个日期（两个空间实测一致），但它是第三个请求。
+        # preview 没给日期时用 subscriptions 的 active_until 兜底。
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8, "active_until": "2026-09-14T14:15:25Z"},
+            {"amount_due": {"amount": 0}},
+        )
+        self.assertEqual(result["renewal_date"], "2026-09-14T14:15:25Z")
+
+    def test_renewal_date_prefers_preview_over_active_until(self):
+        # 有 pending 变更时两者可能不同，preview 是加购后的实际账期，优先它。
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8, "active_until": "2026-09-14T14:15:25Z"},
+            {"amount_due": {"amount": 0}, "renewal_date": "2026-10-01T00:00:00Z"},
+        )
+        self.assertEqual(result["renewal_date"], "2026-10-01T00:00:00Z")
+
+    def test_preview_failure_keeps_seat_counts_and_active_until(self):
+        # preview 只贡献 seat_cost，它挂了不该把前两个请求已拿到的席位数一起丢掉。
+        session = Mock()
+        master = {"workspace_id": "workspace-1", "access_token": "token"}
+        responses = [
+            self._mock_response({
+                "seats_in_use": 79,
+                "seats_entitled": 8,
+                "active_until": "2026-09-14T14:15:25Z",
+                "seat_capacity": [{"type": "default", "paid": 4, "available": 0, "held": 1}],
+            }),
+            self._mock_response({"seat_type_counts": {"default": 3, "usage_based": 71, "prolite": 4}}),
+            workspace_membership.UpstreamHttpError(500, "boom"),
+        ]
+        with (
+            patch.object(workspace_membership, "create_workspace_http_session", return_value=(session, master)),
+            patch.object(workspace_membership, "_workspace_admin_request", side_effect=responses),
+        ):
+            result = workspace_membership.sync_seat_info(5)
+
+        self.assertEqual(result["seats_default"], 3)
+        self.assertEqual(result["seats_default_entitled"], 4)
+        self.assertEqual(result["seats_default_held"], 1)
+        self.assertEqual(result["seats_default_available"], 0)
+        self.assertEqual(result["renewal_date"], "2026-09-14T14:15:25Z")
+        self.assertEqual(result["seat_cost"], "")
+
+    def test_missing_seat_capacity_leaves_available_unknown(self):
+        # 没有 seat_capacity 时 available 必须留 None（"未同步"），
+        # 落成 0 会让前端误报"无空位"。held 同理，不能凭空显示"待处理 0 席"。
+        result = self._sync_with(
+            {"seats_in_use": 79, "seats_entitled": 8},
+            {"amount_due": {"amount": 0}},
+        )
+        self.assertIsNone(result["seats_default_available"])
+        self.assertIsNone(result["seats_prolite_available"])
+        self.assertIsNone(result["seats_default_held"])
+        self.assertIsNone(result["seats_prolite_held"])
 
     def test_bulk_member_sync_paginates_and_matches_locally(self):
         first = Mock(status_code=200, headers={})
