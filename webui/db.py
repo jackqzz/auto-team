@@ -171,6 +171,27 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_proxy_cooldown_until
             ON proxy_cooldown(cooldown_until DESC);
+
+        -- 公开重登录页的惩罚记录。那边的账号只存在用户浏览器里，后端没有任何
+        -- 按账号的持久行（不像候选人有 workspace_credentials），403 连击和 402
+        -- 判死都得自己找地方落库。
+        --   account_403    subject=email      detail=''     连击缓刑计数
+        --   workspace_402  subject=workspace  detail=email  一行一个账号，
+        --                  COUNT(*) 就是「吃到 402 的不同账号数」
+        --   workspace_dead subject=workspace  detail=''     判死墓碑，永久有效
+        CREATE TABLE IF NOT EXISTS public_relogin_penalty (
+            scope       TEXT NOT NULL,
+            subject     TEXT NOT NULL,
+            detail      TEXT NOT NULL DEFAULT '',
+            count       INTEGER NOT NULL DEFAULT 0,
+            first_at    REAL NOT NULL DEFAULT 0,
+            last_at     REAL NOT NULL DEFAULT 0,
+            note        TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (scope, subject, detail)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_public_relogin_penalty_scope
+            ON public_relogin_penalty(scope, subject);
     """)
     con.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_usage_since', ?)",
@@ -3541,6 +3562,174 @@ def clear_candidate_proxy_failure(proxy: str) -> None:
         con.commit()
 
 
+# ──────────────────── 公开重登录页的 403 缓刑 / 402 空间判死 ────────────────────
+
+# 连续多少轮 403 才判定账号停用。单次 403 常是边缘节点瞬时拒绝，直接判死会把
+# 还活着的号永久踢出巡检（deactivated 在公开页是终态）。与空间侧的
+# workspace_membership.DEACTIVATION_403_STREAK 同口径。
+PUBLIC_RELOGIN_403_STREAK = 2
+# 同一个 workspace 下有多少个**不同账号**吃到 402 才宣布空间死亡。402 是母号
+# 空间的订阅/付款异常，会打到该空间所有成员身上，所以按账号数而不是按次数算：
+# 同一个账号 402 十次仍然只算 1 个，不会自己把空间判死。
+PUBLIC_RELOGIN_402_DEAD_ACCOUNTS = 3
+
+_PENALTY_403 = "account_403"
+_PENALTY_402 = "workspace_402"
+_PENALTY_DEAD = "workspace_dead"
+
+
+def record_public_relogin_403(
+    email: str,
+    *,
+    streak_threshold: int = PUBLIC_RELOGIN_403_STREAK,
+) -> int:
+    """记录公开页一次 403，返回累计连击数。email 为空时不记账，返回 0。
+
+    返回 0 意味着调用方永远不会判死——没有 email 的账号本来也重登不了，
+    把它标成停用只是丢信息。
+    """
+    key = str(email or "").strip().lower()
+    if not key:
+        return 0
+    now = time.time()
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT count FROM public_relogin_penalty WHERE scope=? AND subject=? AND detail=''",
+            (_PENALTY_403, key),
+        ).fetchone()
+        streak = int((row["count"] if row else 0) or 0) + 1
+        con.execute(
+            """INSERT INTO public_relogin_penalty(
+                   scope, subject, detail, count, first_at, last_at, note
+               ) VALUES (?, ?, '', ?, ?, ?, ?)
+               ON CONFLICT(scope, subject, detail) DO UPDATE SET
+                   count=excluded.count,
+                   last_at=excluded.last_at,
+                   note=excluded.note""",
+            (_PENALTY_403, key, streak, now, now,
+             f"连续 403 {streak}/{max(1, int(streak_threshold or 1))}"),
+        )
+        con.commit()
+    return streak
+
+
+def clear_public_relogin_403(email: str) -> None:
+    """额度查询成功后清零该账号的 403 连击——缓刑期内恢复正常即销案。"""
+    key = str(email or "").strip().lower()
+    if not key:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "DELETE FROM public_relogin_penalty WHERE scope=? AND subject=? AND detail=''",
+            (_PENALTY_403, key),
+        )
+        con.commit()
+
+
+def record_public_relogin_402(
+    workspace_id: str,
+    email: str,
+    *,
+    dead_threshold: int = PUBLIC_RELOGIN_402_DEAD_ACCOUNTS,
+) -> tuple[int, bool]:
+    """记录一次 402，返回 (该空间命中 402 的不同账号数, 是否刚好判死)。
+
+    workspace_id 为空时无从归属，返回 (0, False) 不记账。
+    """
+    workspace = str(workspace_id or "").strip()
+    if not workspace:
+        return 0, False
+    # detail 存 email；没有 email 时用固定占位符，避免一堆匿名行各自占一个主键
+    # 把账号数刷上去。
+    key_email = str(email or "").strip().lower() or "-"
+    threshold = max(1, int(dead_threshold or 1))
+    now = time.time()
+    with _lock:
+        con = _conn()
+        con.execute(
+            """INSERT INTO public_relogin_penalty(
+                   scope, subject, detail, count, first_at, last_at, note
+               ) VALUES (?, ?, ?, 1, ?, ?, '')
+               ON CONFLICT(scope, subject, detail) DO UPDATE SET
+                   count=public_relogin_penalty.count + 1,
+                   last_at=excluded.last_at""",
+            (_PENALTY_402, workspace, key_email, now, now),
+        )
+        row = con.execute(
+            "SELECT COUNT(*) AS n FROM public_relogin_penalty WHERE scope=? AND subject=?",
+            (_PENALTY_402, workspace),
+        ).fetchone()
+        accounts = int((row["n"] if row else 0) or 0)
+        dead = False
+        if accounts >= threshold:
+            # 墓碑用 INSERT OR IGNORE：第一次判死的时间才有意义，后续 402 不该
+            # 把 first_at 往后推，所以命中账号数另用 UPDATE 刷新。
+            note = f"{accounts} 个账号返回 HTTP 402"
+            con.execute(
+                """INSERT OR IGNORE INTO public_relogin_penalty(
+                       scope, subject, detail, count, first_at, last_at, note
+                   ) VALUES (?, ?, '', ?, ?, ?, ?)""",
+                (_PENALTY_DEAD, workspace, accounts, now, now, note),
+            )
+            con.execute(
+                """UPDATE public_relogin_penalty
+                      SET count=?, last_at=?, note=?
+                    WHERE scope=? AND subject=? AND detail=''""",
+                (accounts, now, note, _PENALTY_DEAD, workspace),
+            )
+            dead = True
+        con.commit()
+    return accounts, dead
+
+
+def is_public_workspace_dead(workspace_id: str) -> bool:
+    workspace = str(workspace_id or "").strip()
+    if not workspace:
+        return False
+    con = _conn()
+    row = con.execute(
+        "SELECT 1 FROM public_relogin_penalty WHERE scope=? AND subject=? AND detail=''",
+        (_PENALTY_DEAD, workspace),
+    ).fetchone()
+    return row is not None
+
+
+def list_dead_public_workspaces() -> list[dict]:
+    con = _conn()
+    rows = con.execute(
+        """SELECT subject AS workspace_id, count AS account_count,
+                  first_at AS dead_at, last_at, note
+             FROM public_relogin_penalty
+            WHERE scope=? AND detail=''
+            ORDER BY first_at DESC""",
+        (_PENALTY_DEAD,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def clear_dead_public_workspace(workspace_id: str) -> bool:
+    """手动解除判死。墓碑和该空间的 402 明细一起删——只删墓碑的话，解除后
+    随便再来一个 402 就会立刻重新达阈值判死，等于没解除。"""
+    workspace = str(workspace_id or "").strip()
+    if not workspace:
+        return False
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            "DELETE FROM public_relogin_penalty WHERE scope=? AND subject=? AND detail=''",
+            (_PENALTY_DEAD, workspace),
+        )
+        removed = cur.rowcount > 0
+        con.execute(
+            "DELETE FROM public_relogin_penalty WHERE scope=? AND subject=?",
+            (_PENALTY_402, workspace),
+        )
+        con.commit()
+    return removed
+
+
 def _setting_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -3816,6 +4005,11 @@ def get_public_relogin_config() -> dict:
         "retry_count": get_setting("public_relogin_retry_count", "2"),
         "quota_timeout": get_setting("public_relogin_quota_timeout", "30"),
         "login_timeout": get_setting("public_relogin_login_timeout", "180"),
+        "rate_limit_retries": get_setting("public_relogin_rate_limit_retries", "2"),
+        "forbidden_streak": get_setting(
+            "public_relogin_forbidden_streak", str(PUBLIC_RELOGIN_403_STREAK)),
+        "payment_dead_accounts": get_setting(
+            "public_relogin_payment_dead_accounts", str(PUBLIC_RELOGIN_402_DEAD_ACCOUNTS)),
     }
 
 
@@ -3831,6 +4025,9 @@ def save_public_relogin_config(data: dict) -> None:
         ("retry_count", "public_relogin_retry_count"),
         ("quota_timeout", "public_relogin_quota_timeout"),
         ("login_timeout", "public_relogin_login_timeout"),
+        ("rate_limit_retries", "public_relogin_rate_limit_retries"),
+        ("forbidden_streak", "public_relogin_forbidden_streak"),
+        ("payment_dead_accounts", "public_relogin_payment_dead_accounts"),
     ):
         if key_in in data:
             set_setting(key_out, _setting_text(data[key_in]))

@@ -7,6 +7,8 @@ import {
   savePublicReloginConfig,
   createPublicReloginAccessKey,
   revokePublicReloginAccessKey,
+  listDeadPublicWorkspaces,
+  clearDeadPublicWorkspace,
 } from '@/api/settings'
 import { copyText, fmtTime } from '@/api/request'
 import FooterToolbar from '@/components/FooterToolbar.vue'
@@ -16,6 +18,7 @@ const saving = ref(false)
 const creatingKey = ref(false)
 const accessKeys = ref([])
 const newAccessKey = ref('')
+const deadWorkspaces = ref([])
 
 const form = reactive({
   enabled: false,
@@ -27,6 +30,9 @@ const form = reactive({
   retryCount: 2,
   quotaTimeout: 30,
   loginTimeout: 180,
+  rateLimitRetries: 2,
+  forbiddenStreak: 2,
+  paymentDeadAccounts: 3,
   adminPassword: '',
   clearAdminPassword: false,
   authEnabled: false,
@@ -54,12 +60,41 @@ async function load() {
     form.retryCount = Number(config.retry_count || 2)
     form.quotaTimeout = Number(config.quota_timeout || 30)
     form.loginTimeout = Number(config.login_timeout || 180)
+    // 用 ?? 而不是 ||：0 是合法取值（完全不退避），|| 会把它悄悄回填成 2。
+    form.rateLimitRetries = Number(config.rate_limit_retries ?? 2)
+    form.forbiddenStreak = Number(config.forbidden_streak || 2)
+    form.paymentDeadAccounts = Number(config.payment_dead_accounts || 3)
     form.adminPassword = ''
     form.clearAdminPassword = false
     form.authEnabled = !!config.auth_enabled
     accessKeys.value = config.access_keys || []
   } catch (e) {
     ElMessage.error(e.message)
+  }
+  await loadDeadWorkspaces()
+}
+
+async function loadDeadWorkspaces() {
+  try {
+    const { workspaces } = await listDeadPublicWorkspaces()
+    deadWorkspaces.value = workspaces || []
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function reviveWorkspace(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确定解除 workspace ${row.workspace_id} 的判死状态？解除后该空间下的账号会重新参与额度检查和重登。`,
+      '解除判死',
+      { type: 'warning' },
+    )
+    const { workspaces } = await clearDeadPublicWorkspace(row.workspace_id)
+    deadWorkspaces.value = workspaces || []
+    ElMessage.success('已解除')
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error(e.message || e)
   }
 }
 
@@ -76,6 +111,9 @@ async function save() {
       retry_count: form.retryCount,
       quota_timeout: form.quotaTimeout,
       login_timeout: form.loginTimeout,
+      rate_limit_retries: form.rateLimitRetries,
+      forbidden_streak: form.forbiddenStreak,
+      payment_dead_accounts: form.paymentDeadAccounts,
       admin_password: form.adminPassword.trim(),
       clear_admin_password: form.clearAdminPassword,
     })
@@ -181,6 +219,41 @@ onActivated(() => load())
           </el-form-item>
         </div>
 
+        <el-divider content-position="left">额度查询错误处理</el-divider>
+        <div class="grid grid-hinted">
+          <el-form-item label="429 退避重试">
+            <el-input-number v-model="form.rateLimitRetries" :min="0" :max="5" />
+            <div class="hint">按上游 Retry-After 退避后重试；退避耗尽才换代理。0 表示不退避。</div>
+          </el-form-item>
+          <el-form-item label="403 判死连击轮数">
+            <el-input-number v-model="form.forbiddenStreak" :min="1" :max="10" />
+            <div class="hint">单次 403 多为边缘节点瞬时拒绝，未达轮数只记缓刑；中间查通一次即清零。</div>
+          </el-form-item>
+          <el-form-item label="402 判死账号数">
+            <el-input-number v-model="form.paymentDeadAccounts" :min="1" :max="50" />
+            <div class="hint">同一 workspace 下有这么多个不同账号返回 402 即判定空间死亡。</div>
+          </el-form-item>
+        </div>
+
+        <el-divider content-position="left">已判死 workspace</el-divider>
+        <div class="hint" style="margin-bottom: 12px">
+          判死后该空间下所有账号在额度检查和重登时直接跳过，不再发请求。判死永久有效，只能在这里手动解除。
+        </div>
+        <el-table v-if="deadWorkspaces.length" :data="deadWorkspaces" size="small" border style="margin-bottom: 12px">
+          <el-table-column label="workspace_id" prop="workspace_id" min-width="240" />
+          <el-table-column label="命中账号数" prop="account_count" width="110" />
+          <el-table-column label="判死时间" width="180">
+            <template #default="{ row }">{{ fmtTime(row.dead_at) }}</template>
+          </el-table-column>
+          <el-table-column label="原因" prop="note" min-width="180" />
+          <el-table-column label="操作" width="100">
+            <template #default="{ row }">
+              <el-button link type="primary" @click="reviveWorkspace(row)">解除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-else description="暂无判死记录" :image-size="60" />
+
         <el-divider content-position="left">公开页访问密钥</el-divider>
         <div class="hint" style="margin-bottom: 12px">
           创建后只显示一次完整密钥；公开页用户输入一次后会缓存在浏览器本地。
@@ -273,6 +346,12 @@ onActivated(() => load())
   display: flex;
   gap: 16px;
   flex-wrap: wrap;
+}
+/* 带说明文字的一栏。不定宽的话，说明文字会把 flex item 撑到整行，三项各占
+   一行反而更难扫。固定基准宽 + 允许收缩，窄屏才换行。 */
+.grid-hinted .el-form-item {
+  flex: 1 1 260px;
+  max-width: 320px;
 }
 .key-create {
   display: flex;

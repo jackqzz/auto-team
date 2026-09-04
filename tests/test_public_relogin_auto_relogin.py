@@ -42,6 +42,9 @@ class PublicReloginAutoReloginTests(unittest.TestCase):
             "retry_count": 0,
             "proxy_pool": "",
             "use_system_proxy_pool": True,
+            "rate_limit_retries": 2,
+            "forbidden_streak": 2,
+            "payment_dead_accounts": 3,
         }
         request = app.PublicReloginCheckReq(
             accounts=[account],
@@ -84,6 +87,9 @@ class PublicReloginAutoReloginTests(unittest.TestCase):
             "retry_count": 0,
             "proxy_pool": "",
             "use_system_proxy_pool": True,
+            "rate_limit_retries": 2,
+            "forbidden_streak": 2,
+            "payment_dead_accounts": 3,
         }
         request = app.PublicReloginCheckReq(
             accounts=[account], access_key="valid-key", auto_relogin_on_401=False,

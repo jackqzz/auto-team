@@ -8,10 +8,9 @@ import re
 import threading
 import time
 import uuid
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from http_client import create_http_session
+from http_client import create_http_session, retry_after_seconds
 from .workspace_client import create_workspace_http_session
 from . import db
 
@@ -211,20 +210,9 @@ def _workspace_admin_lock(workspace_db_id: int) -> threading.Lock:
 
 
 def _retry_after_seconds(response, attempt: int) -> float:
-    raw = response.headers.get("Retry-After") if getattr(response, "headers", None) else None
-    try:
-        delay = float(raw)
-    except (TypeError, ValueError):
-        delay = 0.0
-        if raw:
-            try:
-                parsed = parsedate_to_datetime(str(raw))
-                delay = parsed.timestamp() - time.time()
-            except (TypeError, ValueError, OverflowError):
-                delay = 0.0
-        if delay <= 0:
-            delay = min(30.0, 2.0 * (2 ** max(0, attempt)))
-    return max(1.0, min(60.0, delay))
+    # 实现已上提到 http_client，公开重登录页那边共用同一套 Retry-After 解析。
+    # 这里保留同名薄壳，本文件的两处调用点和既有测试都不用改。
+    return retry_after_seconds(response, attempt)
 
 
 def _workspace_admin_request(

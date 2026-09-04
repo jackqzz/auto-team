@@ -3,6 +3,8 @@ HTTP 客户端 - 使用 curl_cffi 实现 TLS 指纹模拟
 支持 Cloudflare 绕过，降级到 requests
 """
 import logging
+import time
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,29 @@ _TLS_ERROR_MARKERS = ("curl: (35)", "tls connect error", "openssl_internal", "ss
 def _is_tls_handshake_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(m in msg for m in _TLS_ERROR_MARKERS)
+
+
+def retry_after_seconds(response, attempt: int, *, max_delay: float = 60.0) -> float:
+    """算出 429 之后该睡多久。
+
+    优先听上游的 Retry-After（秒数或 HTTP-date 两种写法都认），上游没说才退回
+    指数退避。下限固定 1s——0 秒重试等于没退避；上限由调用方给，同步 HTTP 端点
+    里 60s 会把请求拖死，那种场景传小一点。
+    """
+    raw = response.headers.get("Retry-After") if getattr(response, "headers", None) else None
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError):
+        delay = 0.0
+        if raw:
+            try:
+                parsed = parsedate_to_datetime(str(raw))
+                delay = parsed.timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                delay = 0.0
+        if delay <= 0:
+            delay = min(30.0, 2.0 * (2 ** max(0, attempt)))
+    return max(1.0, min(float(max_delay), delay))
 
 
 class _TlsRetrySession:

@@ -41,6 +41,35 @@ class PublicReloginConfigTests(unittest.TestCase):
         db.save_public_relogin_config({"public_relogin_enabled": False})
         self.assertEqual(db.get_public_relogin_config()["enabled"], "0")
 
+    def test_error_handling_thresholds_round_trip(self):
+        cfg = db.get_public_relogin_config()
+        self.assertEqual(cfg["rate_limit_retries"], "2")
+        self.assertEqual(cfg["forbidden_streak"], str(db.PUBLIC_RELOGIN_403_STREAK))
+        self.assertEqual(cfg["payment_dead_accounts"], str(db.PUBLIC_RELOGIN_402_DEAD_ACCOUNTS))
+
+        db.save_public_relogin_config({
+            # 0 是合法取值（完全不退避），不能被 falsy 兜底吃掉。
+            "rate_limit_retries": 0,
+            "forbidden_streak": 4,
+            "payment_dead_accounts": 5,
+        })
+
+        cfg = db.get_public_relogin_config()
+        self.assertEqual(cfg["rate_limit_retries"], "0")
+        self.assertEqual(cfg["forbidden_streak"], "4")
+        self.assertEqual(cfg["payment_dead_accounts"], "5")
+
+
+    def test_effective_config_keeps_explicit_zero_but_defaults_blank(self):
+        from webui import public_relogin
+
+        db.save_public_relogin_config({"rate_limit_retries": 0})
+        self.assertEqual(public_relogin.get_effective_config()["rate_limit_retries"], 0)
+
+        # 存成空串（比如手工改库）时才该退回默认值 2，而不是跟着 0 一起不退避。
+        db.set_setting("public_relogin_rate_limit_retries", "")
+        self.assertEqual(public_relogin.get_effective_config()["rate_limit_retries"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

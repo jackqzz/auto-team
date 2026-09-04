@@ -30,3 +30,6 @@ export const createPublicReloginAccessKey = (payload) =>
   http.post('/api/settings/public-relogin/access-keys', payload)
 export const revokePublicReloginAccessKey = (keyId) =>
   http.delete(`/api/settings/public-relogin/access-keys/${encodeURIComponent(keyId)}`)
+export const listDeadPublicWorkspaces = () => http.get('/api/settings/public-relogin/dead-workspaces')
+export const clearDeadPublicWorkspace = (workspaceId) =>
+  http.delete(`/api/settings/public-relogin/dead-workspaces/${encodeURIComponent(workspaceId)}`)

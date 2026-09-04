@@ -306,6 +306,10 @@ class PublicReloginSettingsReq(BaseModel):
     retry_count: int = Field(2, ge=0, le=5)
     quota_timeout: int = Field(30, ge=5, le=120)
     login_timeout: int = Field(180, ge=30, le=900)
+    rate_limit_retries: int = Field(2, ge=0, le=5, description="429 退避重试次数；0 表示不退避")
+    forbidden_streak: int = Field(2, ge=1, le=10, description="连续多少次 403 才判定账号停用")
+    payment_dead_accounts: int = Field(
+        3, ge=1, le=50, description="同一 workspace 下多少个不同账号 402 才判定空间死亡")
     admin_password: str = Field("", description="留空不修改；传入新值则启用/更新管理端鉴权")
     clear_admin_password: bool = Field(False, description="清空管理员密码并关闭管理端鉴权")
 
@@ -425,6 +429,22 @@ def _public_relogin_validate(account: dict, cfg: dict) -> tuple[dict | None, dic
     return normalized, None
 
 
+def _public_relogin_dead_workspace_result(normalized: dict) -> dict:
+    """已判死空间的统一返回体。
+
+    复用 deactivated 这个既有终态：前端已经把它渲染成红标「已停用」，并且会把
+    这些账号排除出后续巡检和批量重登，正好是判死想要的效果。
+    """
+    workspace_id = normalized.get("chatgpt_account_id", "")
+    return {
+        "ok": False,
+        "status": "deactivated",
+        "email": normalized.get("email", ""),
+        "workspace_id": workspace_id,
+        "error": f"workspace {workspace_id} 已判定死亡（402），已跳过；可在后台配置页手动解除",
+    }
+
+
 def _run_public_relogin_account(
     account: dict,
     normalized: dict,
@@ -434,6 +454,12 @@ def _run_public_relogin_account(
     initial_exclude_proxy: str = "",
 ) -> dict:
     """执行单账号公开重登；巡检和手动重登共用同一套代理轮换规则。"""
+    # 判死空间里的账号重登也是白费——402 是空间级的订阅/付款问题，换号换代理
+    # 都救不回来。放在最前面，一次登录尝试和一次代理租借都不消耗。
+    if db.is_public_workspace_dead(normalized.get("chatgpt_account_id", "")):
+        result = _public_relogin_dead_workspace_result(normalized)
+        result["attempt"] = 0
+        return result
     account_proxy = str(account.get("proxy") or "").strip()
     previous_proxy = initial_exclude_proxy
     last_error = ""
@@ -564,6 +590,21 @@ def api_revoke_public_relogin_access_key(key_id: str):
     return {"ok": True, "access_keys": db.list_public_relogin_access_keys()}
 
 
+# 判死名单的读写只开给管理端：_is_public_api_path 只放行 /api/auth 和
+# /api/public-relogin，落在 /api/settings 下就自动受管理员鉴权中间件保护，
+# 公开页既看不到名单也解除不了。
+@app.get("/api/settings/public-relogin/dead-workspaces")
+def api_list_dead_public_workspaces():
+    return {"ok": True, "workspaces": db.list_dead_public_workspaces()}
+
+
+@app.delete("/api/settings/public-relogin/dead-workspaces/{workspace_id}")
+def api_clear_dead_public_workspace(workspace_id: str):
+    if not db.clear_dead_public_workspace(workspace_id):
+        raise HTTPException(404, "该 workspace 不在判死名单里")
+    return {"ok": True, "workspaces": db.list_dead_public_workspaces()}
+
+
 @app.post("/api/public-relogin/check")
 async def api_public_relogin_check(req: PublicReloginCheckReq):
     logger.info(
@@ -583,12 +624,25 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
     proxies = _public_relogin_effective_proxy_pool(req.proxy_pool, cfg)
     proxy_leases = public_relogin.ProxyLeasePool(proxies)
     results: dict[str, dict] = {}
+    # 判死名单整批只查一次库，之后在内存里判。500 个账号跑一轮就省下 500 次
+    # 查询——这正是把判死记录落后端的意义。集合在本批内还会随新判死增长，
+    # 所以排在后面的同空间账号立刻受益，不用等下一轮。
+    dead_workspaces = {
+        str(row.get("workspace_id") or "")
+        for row in db.list_dead_public_workspaces()
+    }
+    dead_lock = threading.Lock()
 
     def check_one(index: int, account: dict) -> tuple[str, dict]:
         key = _public_relogin_account_key(account, index)
         normalized, error = _public_relogin_validate(account, cfg)
         if error:
             return key, error
+        workspace_id = normalized.get("chatgpt_account_id", "")
+        with dead_lock:
+            already_dead = bool(workspace_id) and workspace_id in dead_workspaces
+        if already_dead:
+            return key, _public_relogin_dead_workspace_result(normalized)
         proxy = str(account.get("proxy") or "").strip()
         if not proxy:
             proxy, _, _ = proxy_leases.lease(
@@ -597,8 +651,9 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
             )
         try:
             # 额度查询也可能遇到失效/超时代理。网络类异常换下一条代理
-            # 重试，避免一个坏出口直接把账号标成错误；401/403 等账号响应
-            # 不换代理，交给下面的账号状态分支处理。
+            # 重试，避免一个坏出口直接把账号标成错误；401/403/402 等账号或
+            # 空间级响应不换代理，交给下面的状态分支处理。429 例外：限流
+            # 多半按出口 IP 算，换一条出口正是正确的升级路径。
             quota = None
             last_network_error = None
             for quota_attempt in range(1, 4):
@@ -607,9 +662,17 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
                         normalized or account,
                         proxy=proxy,
                         timeout=cfg["quota_timeout"],
+                        rate_retries=cfg["rate_limit_retries"],
+                        forbidden_streak=cfg["forbidden_streak"],
+                        dead_threshold=cfg["payment_dead_accounts"],
                     )
                     break
-                except (public_relogin.PublicQuotaUnauthorized, public_relogin.PublicAccountDeactivated):
+                except (
+                    public_relogin.PublicQuotaUnauthorized,
+                    public_relogin.PublicAccountDeactivated,
+                    public_relogin.PublicQuotaForbidden,
+                    public_relogin.PublicPaymentRequired,
+                ):
                     raise
                 except Exception as exc:
                     last_network_error = exc
@@ -661,8 +724,26 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
                 # 等待 relogin_future，不占用额度查询并发。
                 return key, {"_relogin_future": relogin_future}
             return key, {"ok": False, "status": "401", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
+        except public_relogin.PublicWorkspaceDead as exc:
+            # 必须排在 PublicAccountDeactivated 之前：它是子类，写在后面会被
+            # 父类分支吃掉，判死原因和空间号就丢了。
+            with dead_lock:
+                dead_workspaces.add(workspace_id)
+            logger.error(
+                "公开额度查询判定空间死亡 account=%s workspace=%s error=%s",
+                normalized.get("email", ""), workspace_id, str(exc)[:300],
+            )
+            return key, {"ok": False, "status": "deactivated", "email": normalized.get("email", ""), "workspace_id": workspace_id, "error": str(exc)[:500]}
         except public_relogin.PublicAccountDeactivated as exc:
             return key, {"ok": False, "status": "deactivated", "email": normalized.get("email", ""), "workspace_id": normalized.get("chatgpt_account_id", ""), "error": str(exc)}
+        except (public_relogin.PublicQuotaForbidden, public_relogin.PublicPaymentRequired) as exc:
+            # 缓刑：落 error 而不是 deactivated。error 在前端是非终态，下一轮
+            # 巡检还会再查这个账号——这正是"缓刑"的含义。
+            logger.warning(
+                "公开额度查询缓刑 account=%s workspace=%s error=%s",
+                normalized.get("email", ""), workspace_id, str(exc)[:300],
+            )
+            return key, {"ok": False, "status": "error", "email": normalized.get("email", ""), "workspace_id": workspace_id, "error": str(exc)[:500]}
         except Exception as exc:
             logger.warning(
                 "公开额度查询失败 account=%s workspace=%s proxy=%s error=%s",

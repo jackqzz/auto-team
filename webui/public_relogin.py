@@ -13,7 +13,7 @@ from typing import Any
 
 from config import Config
 from auth_flow import AuthFlow
-from http_client import create_http_session
+from http_client import create_http_session, retry_after_seconds
 from mail_providers.base import MailProvider
 
 from . import db, exporter, proxy_usage
@@ -28,6 +28,26 @@ class PublicQuotaUnauthorized(RuntimeError):
 
 class PublicAccountDeactivated(RuntimeError):
     pass
+
+
+class PublicWorkspaceDead(PublicAccountDeactivated):
+    """所属 workspace 已因 402 判死。
+
+    继承 PublicAccountDeactivated：上层凡是按父类捕获的地方（换代理重试的
+    豁免元组、结果状态映射）都天然把它当终态处理，不用逐个补分支。
+    """
+
+
+class PublicQuotaForbidden(RuntimeError):
+    """403 但还没到连击阈值——缓刑，本轮跳过，下一轮还会再查。"""
+
+
+class PublicQuotaRateLimited(RuntimeError):
+    """429 且退避预算已耗尽。限流多半是按出口 IP 算的，交给上层换代理。"""
+
+
+class PublicPaymentRequired(RuntimeError):
+    """402 但该 workspace 命中的账号数还没到判死阈值。"""
 
 
 class PublicTaskQueueFull(RuntimeError):
@@ -347,6 +367,12 @@ def _headers(token: str, account_id: str, email: str = "") -> dict:
 
 
 def _looks_deactivated(text: str) -> bool:
+    """响应体/异常文本里是否有明确的「账号已停用」措辞。
+
+    这里只认措辞，不认状态码：曾经把裸字符串 "403" 也列为标志，结果
+    "upstream error id=44035"（502 响应体）和 '{"error":"request_id 1403 failed"}'
+    都会命中判死。403 现在走连击缓刑，见 fetch_quota。
+    """
     lower = str(text or "").lower()
     return any(
         marker in lower
@@ -356,35 +382,105 @@ def _looks_deactivated(text: str) -> bool:
             "account disabled",
             "user_deactivated",
             "user disabled",
-            "403",
             "account is not active",
         )
     )
 
 
-def fetch_quota(account: dict, *, proxy: str = "", timeout: int = 30) -> dict:
+def fetch_quota(
+    account: dict,
+    *,
+    proxy: str = "",
+    timeout: int = 30,
+    rate_retries: int = 2,
+    forbidden_streak: int | None = None,
+    dead_threshold: int | None = None,
+) -> dict:
     cred = normalized_account(account)
     token = cred["access_token"]
     workspace_id = cred["chatgpt_account_id"]
+    email = cred.get("email", "")
     if not token:
         raise ValueError("缺少 access_token")
-    session = create_http_session(proxy=proxy or None)
-    response = session.get(
-        f"{BASE}/backend-api/wham/usage",
-        headers=_headers(token, workspace_id, cred.get("email", "")),
-        timeout=max(5, int(timeout or 30)),
+    streak_threshold = (
+        db.PUBLIC_RELOGIN_403_STREAK if forbidden_streak is None else max(1, int(forbidden_streak))
     )
+    dead_at = (
+        db.PUBLIC_RELOGIN_402_DEAD_ACCOUNTS if dead_threshold is None else max(1, int(dead_threshold))
+    )
+    session = create_http_session(proxy=proxy or None)
+
+    rate_left = max(0, int(rate_retries or 0))
+    rate_attempt = 0
+    while True:
+        response = session.get(
+            f"{BASE}/backend-api/wham/usage",
+            headers=_headers(token, workspace_id, email),
+            timeout=max(5, int(timeout or 30)),
+        )
+        if response.status_code != 429 or rate_left <= 0:
+            break
+        rate_left -= 1
+        # 退避上限压到 15s：这是个同步 HTTP 端点，上层还会换代理重试 3 次，
+        # 用默认的 60s 上限单个账号能拖到 9 分钟。
+        delay = retry_after_seconds(response, rate_attempt, max_delay=15.0)
+        rate_attempt += 1
+        logger.warning(
+            "公开额度查询触发限流，退避重试 account=%s attempt=%s wait=%.1fs",
+            email, rate_attempt, delay,
+        )
+        time.sleep(delay)
+
     if response.status_code >= 300:
+        code = int(response.status_code)
         body = ""
         try:
             body = response.text[:1000]
         except Exception:
             body = ""
-        if response.status_code == 401:
+        if code == 401:
             raise PublicQuotaUnauthorized("额度查询失败 HTTP 401")
-        if response.status_code == 403 or _looks_deactivated(body):
-            raise PublicAccountDeactivated(f"账号停用/不可用 HTTP {response.status_code}")
-        raise RuntimeError(f"额度查询失败 HTTP {response.status_code}: {body[:300]}")
+        if code == 402:
+            accounts, dead = db.record_public_relogin_402(
+                workspace_id, email, dead_threshold=dead_at,
+            )
+            logger.warning(
+                "公开额度查询 402 account=%s workspace=%s hit_accounts=%s/%s body=%s",
+                email, workspace_id, accounts, dead_at, body[:300],
+            )
+            if dead:
+                raise PublicWorkspaceDead(
+                    f"workspace {workspace_id} 已有 {accounts} 个账号返回 HTTP 402，判定空间死亡"
+                )
+            raise PublicPaymentRequired(
+                f"空间计费异常 HTTP 402（{accounts}/{dead_at} 个账号命中）：{body[:200]}"
+            )
+        if code == 403:
+            # 措辞明确的停用不必缓刑，直接判死。
+            if _looks_deactivated(body):
+                raise PublicAccountDeactivated(f"账号已停用 HTTP 403：{body[:200]}")
+            streak = db.record_public_relogin_403(email, streak_threshold=streak_threshold)
+            logger.warning(
+                "公开额度查询 403 account=%s workspace=%s streak=%s/%s body=%s",
+                email, workspace_id, streak, streak_threshold, body[:300],
+            )
+            if streak >= streak_threshold:
+                raise PublicAccountDeactivated(
+                    f"连续 {streak} 次额度查询 403，判定账号停用"
+                )
+            # streak==0 表示账号没有 email，没法记账也没法重登，只能缓刑。
+            raise PublicQuotaForbidden(
+                f"额度查询 403（缓刑 {streak}/{streak_threshold}）：{body[:200]}"
+            )
+        if code == 429:
+            raise PublicQuotaRateLimited(
+                f"额度查询持续限流 HTTP 429（已退避{rate_attempt}次）"
+            )
+        if _looks_deactivated(body):
+            raise PublicAccountDeactivated(f"账号停用/不可用 HTTP {code}：{body[:200]}")
+        raise RuntimeError(f"额度查询失败 HTTP {code}: {body[:300]}")
+    # 查得通就说明上一轮的 403 是瞬时的，销案。
+    db.clear_public_relogin_403(email)
     payload = response.json()
     rate = payload.get("rate_limit") or {}
     credits = payload.get("credits") or {}
@@ -460,6 +556,17 @@ def relogin_account(
     return refreshed
 
 
+def _clamped_int(value, default: int, low: int, high: int) -> int:
+    """settings 表里存的都是字符串。空值/存不出数才退回默认值——显式的 0 必须
+    保住：rate_limit_retries=0 的意思是「完全不退避」，用 `or` 兜底会把它悄悄
+    吃成默认值。"""
+    try:
+        parsed = int(str(value if value is not None else "").strip())
+    except ValueError:
+        parsed = default
+    return max(low, min(high, parsed))
+
+
 def get_effective_config() -> dict:
     cfg = db.get_public_relogin_config()
     return {
@@ -472,4 +579,9 @@ def get_effective_config() -> dict:
         "retry_count": max(0, min(5, int(cfg.get("retry_count") or 2))),
         "quota_timeout": max(5, min(120, int(cfg.get("quota_timeout") or 30))),
         "login_timeout": max(30, min(900, int(cfg.get("login_timeout") or 180))),
+        "rate_limit_retries": _clamped_int(cfg.get("rate_limit_retries"), 2, 0, 5),
+        "forbidden_streak": _clamped_int(
+            cfg.get("forbidden_streak"), db.PUBLIC_RELOGIN_403_STREAK, 1, 10),
+        "payment_dead_accounts": _clamped_int(
+            cfg.get("payment_dead_accounts"), db.PUBLIC_RELOGIN_402_DEAD_ACCOUNTS, 1, 50),
     }
