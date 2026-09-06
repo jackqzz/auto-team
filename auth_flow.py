@@ -4792,38 +4792,130 @@ class AuthFlow:
         logger.info("账户创建成功")
         return continue_url
 
+    def _auth_session_workspace_ids(self) -> list[str]:
+        """从 oai-client-auth-session cookie 里读出账号可见的**全部**空间 ID。
+
+        兼容不同 cookie 形态：workspace_id 可能在第 1 段/第 2 段，也可能在
+        workspaces[].id。按 段内 workspace_id → 段内 workspaces → 下一段
+        的顺序返回，第一个元素即旧 `_extract_workspace_id` 的返回值。
+        """
+        ids: list[str] = []
+        try:
+            auth_session = self.session.cookies.get("oai-client-auth-session", "") or ""
+        except Exception:
+            return ids
+        for segment in auth_session.split(".")[:2]:
+            segment = (segment or "").strip()
+            if not segment:
+                continue
+            try:
+                payload_b64 = segment + "=" * (-len(segment) % 4)
+                decoded = json.loads(
+                    base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+                )
+            except Exception:
+                # 单段解不开不代表另一段也解不开（前半段常是签名/随机串）
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            wid = str(decoded.get("workspace_id", "") or "").strip()
+            if wid and wid not in ids:
+                ids.append(wid)
+            workspaces = decoded.get("workspaces", [])
+            if isinstance(workspaces, list):
+                for it in workspaces:
+                    if not isinstance(it, dict):
+                        continue
+                    wid = str(it.get("id", "") or it.get("workspace_id", "") or "").strip()
+                    if wid and wid not in ids:
+                        ids.append(wid)
+        return ids
+
     def _extract_workspace_id(self) -> str:
         """从 cookie 中提取 workspace_id"""
         if getattr(self, "_personal_only", False):
             return ""
         if getattr(self, "_target_workspace_id", ""):
             return self._target_workspace_id
+        return next(iter(self._auth_session_workspace_ids()), "")
+
+    def list_account_workspace_ids(self) -> list[str]:
+        """列出当前登录账号**自己**能看到的全部空间 ID。
+
+        用途是登录后判断"这个号到底进没进目标空间"：被邀请的成员登录时上游
+        会自动接受邀请，所以看它自己的账号列表就够了，不必再跑母号的候选人
+        校验（那是限流很严的管理 API，而且刚接受邀请时母号侧还可能没同步出来）。
+
+        两个来源合并去重，任何一个取不到都不影响另一个：
+          1. oai-client-auth-session cookie 里的 workspaces 列表；
+          2. /backend-api/accounts/check —— 登录后的权威列表，
+             ``accounts[*].account.account_id`` 就是空间 ID（个人空间也在内）。
+        """
+        ids: list[str] = list(self._auth_session_workspace_ids())
+        for wid in self._accounts_check_workspace_ids():
+            if wid not in ids:
+                ids.append(wid)
+        return ids
+
+    def account_is_in_workspace(self, workspace_id: str) -> bool:
+        """当前登录账号是否已经在指定空间里。
+
+        cookie 里能直接看到就不再发请求；看不到才打一次 accounts/check
+        （cookie 的 workspaces 字段并非每条链路都有，不能只信它得出否定结论）。
+        """
+        target = str(workspace_id or "").strip()
+        if not target:
+            return False
+        if target in self._auth_session_workspace_ids():
+            return True
+        return target in self._accounts_check_workspace_ids()
+
+    def _accounts_check_workspace_ids(self) -> list[str]:
+        """用登录后的 access_token 查 accounts/check，返回账号名下所有空间 ID。"""
+        ids: list[str] = []
+        token = str(
+            getattr(self, "_web_access_token", "")
+            or getattr(self.result, "access_token", "")
+            or ""
+        ).strip()
+        if not token:
+            return ids
+
         try:
-            auth_session = self.session.cookies.get("oai-client-auth-session", "")
-            if auth_session:
-                parts = auth_session.split(".")
-                # 兼容不同 cookie 形态：workspace_id 可能在第 1 段/第 2 段，也可能在 workspaces[0].id
-                for idx in range(min(2, len(parts))):
-                    segment = (parts[idx] or "").strip()
-                    if not segment:
-                        continue
-                    payload_b64 = segment + "=" * (-len(segment) % 4)
-                    decoded = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
-                    if not isinstance(decoded, dict):
-                        continue
-                    wid = (decoded.get("workspace_id", "") or "").strip()
-                    if wid:
-                        return wid
-                    workspaces = decoded.get("workspaces", [])
-                    if isinstance(workspaces, list):
-                        for it in workspaces:
-                            if isinstance(it, dict):
-                                wid = (it.get("id", "") or "").strip()
-                                if wid:
-                                    return wid
+            headers = self._common_headers("https://chatgpt.com/")
+            headers["Authorization"] = f"Bearer {token}"
+            resp = self.session.get(
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+                headers=headers,
+                timeout=30,
+            )
+            self._trace_http("accounts_check_workspaces", resp)
+        except Exception as e:
+            logger.warning(f"账号空间列表查询失败: {e}")
+            return ids
+
+        if resp.status_code != 200:
+            logger.info("账号空间列表查询非 200: %s", resp.status_code)
+            return ids
+        try:
+            accounts = (resp.json() or {}).get("accounts") or {}
         except Exception:
-            pass
-        return ""
+            logger.warning("账号空间列表响应解析失败")
+            return ids
+        if not isinstance(accounts, dict):
+            return ids
+        # accounts 同时用 account_id 和 "default" 两个 key 指向同一个账号，
+        # 所以只认 account.account_id，靠去重收敛。
+        for info in accounts.values():
+            if not isinstance(info, dict):
+                continue
+            account = info.get("account")
+            if not isinstance(account, dict):
+                continue
+            wid = str(account.get("account_id", "") or "").strip()
+            if wid and wid not in ids:
+                ids.append(wid)
+        return ids
 
     def _workspace_id_for_selection(self, html_text: str = "") -> str:
         """返回登录流程应选择的空间；Personal 模式优先选择个人空间。"""

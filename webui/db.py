@@ -644,9 +644,18 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "cool_down_seconds": 0,
     "quota_enabled": False,
     "quota_network_retries": 2,
+    # 额度耗尽时自动兑换一张重置券再决定要不要入箱。默认关闭：券是不可逆的
+    # 消耗品，兑掉就没了，必须由用户显式打开。
+    "quota_auto_reset_enabled": False,
     "trash_enabled": True,
     "trash_invalid_enabled": True,
     "trash_zero_delay_minutes": 60,
+    # 额度耗尽判定看哪个限流窗口：any / five_hour / weekly。
+    # 上游 wham/usage 的 primary/secondary 并不固定对应 5h/周（多数账号只有
+    # 周窗口且落在 primary），所以窗口按 window_seconds 认，不按字段名认。
+    "trash_zero_quota_window": "any",
+    # 同一轮回收里连续入箱时，两次入箱之间的等待秒数（串行限速）。
+    "trash_gap_seconds": 30,
     "seat_protect_enabled": False,
     "seat_protect_threshold": 8,
     "seat_protect_refresh_time": "00:00",
@@ -660,6 +669,8 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "auto_standard_seat_enabled": False,
     "auto_prolite_seat_enabled": False,
     "auto_seat_interval_minutes": 5,
+    # 席位补齐是串行的：每切换一个成员后等待这么多秒再切下一个。
+    "auto_seat_switch_gap_seconds": 30,
     "auto_prolite_candidate_seat_type": "default",
     "standard_fulfilled_total": 0,
     "prolite_fulfilled_total": 0,
@@ -678,6 +689,21 @@ def _normalize_hhmm(value: object, default: str = "00:00") -> str:
     hour = max(0, min(23, int(m.group(1))))
     minute = max(0, min(59, int(m.group(2))))
     return f"{hour:02d}:{minute:02d}"
+
+
+def normalize_gap_seconds(value: object, default: int, maximum: int = 600) -> int:
+    """把串行节奏类设置钳到 [0, maximum]。
+
+    不能写成 ``int(value or default)``：0 是合法取值（不等待），会被 ``or`` 吃掉
+    还原成默认值。设置默认值住在本模块，所以归一化也放这里，供 app 层复用。
+    """
+    if value is None or value == "":
+        return default
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(maximum, seconds))
 
 
 def _workspace_seat_protect_window_key(now_ts: float | None, refresh_time: object) -> str:
@@ -1236,6 +1262,8 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
             "trash_enabled": bool(settings.get("trash_enabled", True)),
             "trash_invalid_enabled": bool(settings.get("trash_invalid_enabled", True)),
             "trash_zero_delay_minutes": int(settings.get("trash_zero_delay_minutes") or 60),
+            "trash_zero_quota_window": str(settings.get("trash_zero_quota_window") or "any"),
+            "trash_gap_seconds": normalize_gap_seconds(settings.get("trash_gap_seconds"), 30),
         },
         "seat_fulfillment": {
             "standard": {
@@ -1263,6 +1291,7 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
             },
             "outbound_count": int(data.get("outbound_count") or 0),
             "auto_interval_minutes": int(settings.get("auto_seat_interval_minutes") or 5),
+            "auto_switch_gap_seconds": normalize_gap_seconds(settings.get("auto_seat_switch_gap_seconds"), 30),
             "auto_prolite_candidate_seat_type": str(settings.get("auto_prolite_candidate_seat_type") or "default"),
         }
     }

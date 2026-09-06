@@ -242,6 +242,8 @@ class WorkspaceCandidatesReq(BaseModel):
     trash_enabled: bool = True
     trash_invalid_enabled: bool = True
     trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
+    trash_zero_quota_window: str = Field("any", description="额度耗尽判定窗口：any / five_hour / weekly")
+    trash_gap_seconds: int = Field(30, ge=0, le=600, description="连续入箱之间的等待秒数（串行限速）")
 
 
 class WorkspaceExportOutboundReq(BaseModel):
@@ -261,6 +263,18 @@ class WorkspaceCandidateInviteStatusReq(BaseModel):
     join_status: str = Field(..., description="not_invited / pending_invite / joined")
 
 
+class WorkspaceResetCreditReq(BaseModel):
+    """额度重置券的查看与兑换。
+
+    刻意只接受单个 email：兑换是不可逆的消耗动作（上游 2xx 即扣券），批量入口
+    容易一次误烧掉一批券，所以手动通道一次只处理一个账号。
+    """
+    workspace_id: int
+    email: str = Field(..., description="候选人邮箱")
+    proxy_pool: str = Field("", description="留空时回退到空间的候选人代理池")
+    credit_id: str = Field("", description="指定兑换的券 id；留空取第一张可用的")
+
+
 class WorkspaceQuotaScheduleReq(BaseModel):
     workspace_id: int
     interval_minutes: int = Field(30, ge=1, le=1440)
@@ -273,9 +287,15 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     account_retry_count: int = Field(1, ge=1, le=5)
     cool_down_seconds: int = Field(0, ge=0, le=3600)
     quota_network_retries: int = Field(2, ge=0, le=5, description="额度查询网络/5xx 失败的重试次数")
+    quota_auto_reset_enabled: bool = Field(
+        False,
+        description="定时额度查到耗尽时自动兑换一张重置券；券不可逆，默认关闭",
+    )
     trash_enabled: bool = True
     trash_invalid_enabled: bool = True
     trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
+    trash_zero_quota_window: str = Field("any", description="额度耗尽判定窗口：any / five_hour / weekly")
+    trash_gap_seconds: int = Field(30, ge=0, le=600, description="连续入箱之间的等待秒数（串行限速）")
     seat_protect_enabled: bool = False
     seat_protect_threshold: int = Field(8, ge=1, le=1000)
     seat_protect_refresh_time: str = Field("00:00", description="席位保护阈值刷新时间（HH:MM，CST）")
@@ -285,6 +305,7 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     auto_standard_seat_enabled: bool = False
     auto_prolite_seat_enabled: bool = False
     auto_seat_interval_minutes: int = Field(5, ge=1, le=1440, description="自动补齐席位轮询周期（分钟）")
+    auto_seat_switch_gap_seconds: int = Field(30, ge=0, le=600, description="串行补齐时两次成员席位切换的间隔（秒）")
     auto_prolite_candidate_seat_type: str = Field("default", description="自动补齐高级席位的候选人席位类型")
 
 
@@ -1027,7 +1048,65 @@ def _lease_candidate_quota_proxy(
     )
     return proxy
 
-def _is_zero_quota_payload(payload: dict) -> bool:
+TRASH_ZERO_QUOTA_WINDOWS = ("any", "five_hour", "weekly")
+
+# 上游 wham/usage 的 limit_window_seconds：5 小时窗口 18000，周窗口 604800。
+# 允许一点误差是因为上游偶尔会给出 17999/604799 之类的边界值。
+_QUOTA_WINDOW_SECONDS = {"five_hour": 18000, "weekly": 604800}
+_QUOTA_WINDOW_TOLERANCE = 600
+
+
+def _normalize_trash_zero_quota_window(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in TRASH_ZERO_QUOTA_WINDOWS else "any"
+
+
+def _candidate_trash_zero_quota_window(workspace_id: int, settings: dict | None = None) -> str:
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    return _normalize_trash_zero_quota_window(cfg.get("trash_zero_quota_window"))
+
+
+def _quota_window_is_exhausted(window: object) -> bool:
+    if not isinstance(window, dict):
+        return False
+    used = window.get("used_percent")
+    try:
+        return used is not None and float(used) >= 100
+    except (TypeError, ValueError):
+        return False
+
+
+def _quota_windows_by_kind(payload: dict) -> dict[str, dict]:
+    """按 window_seconds 把额度窗口归类到 five_hour / weekly。
+
+    不能按 primary/secondary 认窗口：实测多数账号只返回一个周窗口，而它落在
+    primary 上；只有同时有 5h 和周限制时 primary 才是 5h。所以窗口种类只认
+    limit_window_seconds，字段名仅决定遍历顺序。
+    """
+    found: dict[str, dict] = {}
+    for key in ("primary", "secondary"):
+        window = payload.get(key)
+        if not isinstance(window, dict):
+            continue
+        try:
+            seconds = float(window.get("window_seconds"))
+        except (TypeError, ValueError):
+            continue
+        for kind, expected in _QUOTA_WINDOW_SECONDS.items():
+            if kind not in found and abs(seconds - expected) <= _QUOTA_WINDOW_TOLERANCE:
+                found[kind] = window
+                break
+    return found
+
+
+def _is_zero_quota_payload(payload: dict, window_kind: str = "any") -> bool:
+    """判断额度是否已耗尽，据此决定要不要排队入垃圾箱。
+
+    ``window_kind``：``any`` 任一窗口耗尽即算（历史行为）；``five_hour`` /
+    ``weekly`` 只看指定窗口。若上游没返回所选窗口，就回退到另一个可用窗口
+    —— 只有周窗口的账号占绝大多数，严格按窗口判会让它们永远不再被回收。
+    余额（credits_balance）耗尽与窗口无关，任何口径下都算耗尽。
+    """
     if not isinstance(payload, dict) or payload.get("error_code"):
         return False
     credits = payload.get("credits_balance")
@@ -1036,15 +1115,148 @@ def _is_zero_quota_payload(payload: dict) -> bool:
             return True
     except Exception:
         pass
-    for key in ("primary", "secondary"):
-        window = payload.get(key) or {}
-        used = window.get("used_percent")
-        try:
-            if used is not None and float(used) >= 100:
-                return True
-        except Exception:
-            pass
-    return False
+    kind = _normalize_trash_zero_quota_window(window_kind)
+    if kind != "any":
+        selected = _quota_windows_by_kind(payload).get(kind)
+        if selected is not None:
+            return _quota_window_is_exhausted(selected)
+        # 所选窗口不存在：回退到任一窗口，宁可沿用旧口径也不要静默停掉回收。
+    return any(
+        _quota_window_is_exhausted(payload.get(key)) for key in ("primary", "secondary")
+    )
+
+
+def _quota_windows_exhausted(payload: dict, window_kind: str = "any") -> bool:
+    """只看限流窗口，不看 credits 余额。
+
+    自动重置要用这个而不是 :func:`_is_zero_quota_payload`：重置券只重置速率
+    窗口，对 credits 余额耗尽无能为力，拿余额耗尽去兑券是纯浪费。
+    """
+    if not isinstance(payload, dict) or payload.get("error_code"):
+        return False
+    kind = _normalize_trash_zero_quota_window(window_kind)
+    if kind != "any":
+        selected = _quota_windows_by_kind(payload).get(kind)
+        if selected is not None:
+            return _quota_window_is_exhausted(selected)
+        # 所选窗口不存在：回退到任一窗口，与入箱判定保持同一口径。
+    return any(
+        _quota_window_is_exhausted(payload.get(key)) for key in ("primary", "secondary")
+    )
+
+
+def _candidate_quota_auto_reset_enabled(workspace_id: int, settings: dict | None = None) -> bool:
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    return bool(cfg.get("quota_auto_reset_enabled", False))
+
+
+def _quota_auto_reset_blocked_reason(payload: dict, window_kind: str = "any") -> str:
+    """这条额度记录现在兑券值不值？返回空字符串表示值得试。
+
+    券是不可逆的消耗品，所以这里宁可放过也不要错兑。三种情况一律拦下：
+
+    * ``workspace_member_credits_depleted`` —— 母号空间的池子被掏空，是空间级
+      问题，重置券只重置速率窗口，兑了照样是 0；
+    * 限流窗口没真的用尽（例如只是 credits 余额见底）—— 券用不上；
+    * ``applicable`` 不是正数 —— 上游自己标注了"这张券现在不适用"。实测存在
+      ``available=1, applicable=0`` 的账号，只看 available 就会白烧一张。
+      ``applicable`` 缺失时同样拦下：宁可不自动兑，也不要按猜测消耗。
+    """
+    if not isinstance(payload, dict) or payload.get("error_code"):
+        return "额度记录无效"
+    if str(payload.get("rate_limit_reached_type") or "").strip() == "workspace_member_credits_depleted":
+        return "空间额度耗尽，重置券只重置速率窗口，兑换无效"
+    if not _quota_windows_exhausted(payload, window_kind):
+        return "限流窗口未耗尽，重置券用不上"
+    block = payload.get("reset_credits")
+    if not isinstance(block, dict):
+        return "上游未返回重置券信息"
+    try:
+        applicable = int(block.get("applicable"))
+    except (TypeError, ValueError):
+        return "上游未返回当前可用的重置券数"
+    if applicable <= 0:
+        return "当前没有可用的重置券"
+    return ""
+
+
+def _try_candidate_quota_auto_reset(
+    workspace_id: int,
+    email: str,
+    quota: dict,
+    settings: dict,
+    *,
+    quota_leases,
+    source: str,
+) -> dict | None:
+    """额度耗尽时自动兑换一张重置券，返回兑换后重查到的额度；不兑则返回 None。
+
+    调用方拿到非 None 才可以按"额度已恢复"处理，其余情况一律沿用原额度继续
+    走入箱流程。兑换成功但重查失败时也返回 None —— 券确实花掉了，但没有证据
+    说明额度回来了，此时按原计划排队入箱是安全的：入箱有延迟，到期复查会再看
+    一次额度，真恢复了自然会被放行。
+
+    这里吞掉所有异常：自动重置是"顺手救一把"，不能因为它失败就打断整轮额度
+    任务或阻止入箱。
+    """
+    if not _candidate_quota_auto_reset_enabled(workspace_id, settings):
+        return None
+    window_kind = _candidate_trash_zero_quota_window(workspace_id, settings)
+    reason = _quota_auto_reset_blocked_reason(quota, window_kind)
+    if reason:
+        logger.info(
+            "自动重置跳过 workspace_db_id=%s email=%s source=%s reason=%s",
+            workspace_id, email, source, reason,
+        )
+        return None
+    try:
+        consume_proxy = _lease_candidate_quota_proxy(
+            quota_leases,
+            workspace_id=workspace_id,
+            email=email,
+            detail=f"quota_auto_reset_{source}",
+        )
+        consumed = workspace_membership.consume_candidate_reset_credit(
+            workspace_id, email, proxy=consume_proxy,
+        )
+    except workspace_membership.ResetCreditUnavailable as exc:
+        # 落库的券数是上一次查询的快照，上游可能已经把券收走了。
+        logger.warning(
+            "自动重置无券可兑 workspace_db_id=%s email=%s source=%s error=%s",
+            workspace_id, email, source, str(exc)[:200],
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "自动重置兑换失败 workspace_db_id=%s email=%s source=%s error=%s",
+            workspace_id, email, source, str(exc)[:200],
+        )
+        return None
+    logger.warning(
+        "自动重置已兑换重置券 workspace_db_id=%s email=%s source=%s credit_id=%s windows_reset=%s",
+        workspace_id, email, source,
+        consumed.get("credit_id"), consumed.get("windows_reset"),
+    )
+    try:
+        refresh_proxy = _lease_candidate_quota_proxy(
+            quota_leases,
+            workspace_id=workspace_id,
+            email=email,
+            detail=f"quota_auto_reset_refresh_{source}",
+        )
+        return workspace_membership.fetch_candidate_quota(
+            workspace_id,
+            email,
+            proxy=refresh_proxy,
+            network_retries=_candidate_quota_network_retries(workspace_id, settings),
+        )
+    except Exception as exc:
+        logger.warning(
+            "自动重置后额度重查失败，按原额度继续 workspace_db_id=%s email=%s error=%s",
+            workspace_id, email, str(exc)[:200],
+        )
+        return None
+
 
 def _workspace_login_options(workspace_id: int, email: str, settings: dict, *, auto_export: bool = False) -> dict:
     master = db.get_workspace_master(workspace_id)
@@ -1114,6 +1326,7 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
             return
         settings = _workspace_settings_snapshot(workspace_id)
         trash_delay = _candidate_trash_delay_seconds(workspace_id, settings)
+        trash_window = _candidate_trash_zero_quota_window(workspace_id, settings)
         network_retries = _candidate_quota_network_retries(workspace_id, settings)
         candidates = [
             row for row in db.list_workspace_candidate_options(workspace_id)
@@ -1236,7 +1449,15 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
                 return
             if stop.is_set() or not _workspace_exists(workspace_id):
                 return
-            if _is_zero_quota_payload(quota) and _candidate_trash_enabled(workspace_id, settings):
+            if _is_zero_quota_payload(quota, trash_window):
+                # 入箱前先给一次自救机会：兑券成功且额度真的回来了就不排队。
+                refreshed = _try_candidate_quota_auto_reset(
+                    workspace_id, email, quota, settings,
+                    quota_leases=quota_leases, source="quota_scheduled",
+                )
+                if refreshed is not None:
+                    quota = refreshed
+            if _is_zero_quota_payload(quota, trash_window) and _candidate_trash_enabled(workspace_id, settings):
                 _schedule_candidate_trash(
                     workspace_id,
                     email,
@@ -1856,6 +2077,15 @@ def _auto_seat_interval_seconds(settings: dict | None) -> int:
     return max(1, min(1440, minutes)) * 60
 
 
+def _auto_seat_switch_gap_seconds(settings: dict | None) -> int:
+    """串行补齐时两次成员席位切换之间的等待秒数。
+
+    补齐永远是一次切一个（每轮重新拉一次上游席位数），这个间隔决定切换节奏；
+    调大可以降低对上游席位接口的压力。0 表示不额外等待。
+    """
+    return db.normalize_gap_seconds((settings or {}).get("auto_seat_switch_gap_seconds"), 30)
+
+
 def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
     logger.info("自动标准席位任务启动 workspace_db_id=%s", workspace_id)
     try:
@@ -1966,7 +2196,8 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                     )
                 if stop.is_set():
                     break
-                stop.wait(5)
+                # 串行切换：本轮的 settings 每次循环开头都重新取，改间隔立即生效。
+                stop.wait(_auto_seat_switch_gap_seconds(settings))
 
             if switched:
                 if not _workspace_exists(workspace_id):
@@ -2092,7 +2323,8 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                     )
                 if stop.is_set():
                     break
-                stop.wait(5)
+                # 串行切换：本轮的 settings 每次循环开头都重新取，改间隔立即生效。
+                stop.wait(_auto_seat_switch_gap_seconds(settings))
 
             if switched:
                 if not _workspace_exists(workspace_id):
@@ -2126,6 +2358,9 @@ def _reconcile_invalid_candidate_trash(limit: int = 500) -> dict:
     marked = 0
     skipped = 0
     seat_pending = 0
+    # 失效补偿一样是串行的，且每条都会打上游席位切换接口；在上一条真的入过箱之后
+    # 等一个间隔再处理下一条，与到期入箱共用同一个设置。跳过的行不占用间隔。
+    last_row_trashed = False
     for row in rows:
         workspace_id = int(row.get("workspace_master_id") or 0)
         email = str(row.get("email") or "").strip().lower()
@@ -2146,6 +2381,17 @@ def _reconcile_invalid_candidate_trash(limit: int = 500) -> dict:
         if not row.get("member_id") and str(row.get("workspace_join_status") or "") != "joined":
             skipped += 1
             continue
+        gap = _candidate_trash_gap_seconds(workspace_id, settings)
+        if last_row_trashed and gap:
+            logger.info(
+                "失效候选人串行入箱等待 workspace_db_id=%s email=%s gap=%ss",
+                workspace_id,
+                email,
+                gap,
+            )
+            if _trash_sweeper_stop.wait(gap):
+                break
+        last_row_trashed = True
         try:
             # trash_workspace_candidate 内部先切换并远端复查 usage_based，只有
             # 复查成功后才会把 trash_status 写成 trashed；这里绝不提前标记。
@@ -2183,6 +2429,11 @@ def _trash_sweeper_worker():
             if reconciled["marked"]:
                 logger.info("失效候选人自动入箱补偿完成 result=%s", reconciled)
             quota_lease_pools: dict[int, public_relogin.ProxyLeasePool] = {}
+            # 到期行本来就是一条一条处理的；多条同时到期时，在上一条真的入箱之后
+            # 等一个间隔再处理下一条，给连着打上游席位切换接口限速。只在"刚入过箱"
+            # 之后等待：否则一轮里若只有开头入箱、后面几十条都是复查放行，整轮会
+            # 被白等拖垮。
+            last_row_trashed = False
             for row in db.list_workspace_candidate_trash_due():
                 if _trash_sweeper_stop.is_set():
                     break
@@ -2195,6 +2446,17 @@ def _trash_sweeper_worker():
                     # relogin, or seat-switch request for that stale row.
                     continue
                 settings = _workspace_settings_snapshot(workspace_id)
+                gap = _candidate_trash_gap_seconds(workspace_id, settings)
+                if last_row_trashed and gap:
+                    logger.info(
+                        "垃圾箱串行入箱等待 workspace_db_id=%s email=%s gap=%ss",
+                        workspace_id,
+                        row.get("email", ""),
+                        gap,
+                    )
+                    if _trash_sweeper_stop.wait(gap):
+                        break
+                last_row_trashed = False
                 try:
                     quota_leases = quota_lease_pools.get(workspace_id)
                     if quota_leases is None:
@@ -2203,10 +2465,10 @@ def _trash_sweeper_worker():
                         except ValueError:
                             # 交给单条处理函数统一记录失败并把复查时间后移，避免
                             # 到期行每 30 秒被 sweeper 反复捞起。
-                            _process_scheduled_trash_due(row, settings)
+                            last_row_trashed = _process_scheduled_trash_due(row, settings)
                             continue
                         quota_lease_pools[workspace_id] = quota_leases
-                    _process_scheduled_trash_due(row, settings, quota_leases)
+                    last_row_trashed = _process_scheduled_trash_due(row, settings, quota_leases)
                 except Exception:
                     logger.exception(
                         "垃圾箱到期处理失败 workspace_db_id=%s email=%s",
@@ -2449,6 +2711,16 @@ def _candidate_trash_delay_seconds(workspace_id: int, settings: dict | None = No
     return int(cfg.get("trash_zero_delay_minutes", 60) or 60) * 60
 
 
+def _candidate_trash_gap_seconds(workspace_id: int, settings: dict | None = None) -> int:
+    """同一轮回收里两次入箱之间的等待秒数。
+
+    到期入箱本来就是串行的（sweeper 一行一行处理），但多个候选人常常在相近时间
+    到期，入箱又要连着打上游的席位切换接口。这个间隔给连续入箱限速；0 表示不等待。
+    """
+    cfg = _workspace_settings_snapshot(workspace_id, settings)
+    return db.normalize_gap_seconds(cfg.get("trash_gap_seconds"), 30)
+
+
 def _candidate_quota_network_retries(workspace_id: int, settings: dict | None = None) -> int:
     cfg = _workspace_settings_snapshot(workspace_id, settings)
     try:
@@ -2580,16 +2852,21 @@ def _process_scheduled_trash_due(
     row: dict,
     settings: dict,
     quota_leases: public_relogin.ProxyLeasePool | None = None,
-) -> None:
+) -> bool:
+    """复查一条到期记录，返回是否真的执行了入箱（含失败的入箱尝试）。
+
+    返回值给 sweeper 用来在连续入箱之间限速：只有真正打了上游席位接口的行才
+    需要间隔，纯复查后放行的行不该拖慢整轮。
+    """
     workspace_id = int(row.get("workspace_master_id") or 0)
     email = str(row.get("email") or "").strip().lower()
     if not workspace_id or not email:
-        return
+        return False
     if not _workspace_exists(workspace_id):
-        return
+        return False
     if not _candidate_trash_enabled(workspace_id, settings):
         _clear_candidate_trash_timer(workspace_id, email)
-        return
+        return False
     quota_proxy = ""
     try:
         if not _workspace_exists(workspace_id):
@@ -2627,7 +2904,9 @@ def _process_scheduled_trash_due(
             else:
                 if not _candidate_trash_invalid_enabled(workspace_id, settings):
                     _clear_candidate_trash_timer(workspace_id, email)
-                return
+                    return False
+                # 重登录失败已在内部按失效入箱，算作一次真实入箱动作。
+                return True
         except Exception:
             logger.exception("垃圾箱到期复查 401 后重试失败 workspace_db_id=%s email=%s", workspace_id, email)
             db.update_workspace_candidate_trash(
@@ -2637,13 +2916,13 @@ def _process_scheduled_trash_due(
                 due_at=time.time() + 10 * 60,
                 reason="quota_401_retry",
             )
-            return
+            return False
     except workspace_membership.QuotaAccountDeactivated as exc:
         # 停用判定本身就是终态结论，直接走失效入箱，不再顺延复查。
         _handle_candidate_quota_deactivated(
             workspace_id, email, settings, exc, source="trash_recheck"
         )
-        return
+        return True
     except workspace_membership.QuotaPaymentRequired as exc:
         logger.error(
             "垃圾箱到期复查遇到空间计费异常 workspace_db_id=%s email=%s error=%s",
@@ -2658,7 +2937,7 @@ def _process_scheduled_trash_due(
             due_at=time.time() + 10 * 60,
             reason="quota_402_retry",
         )
-        return
+        return False
     except Exception:
         logger.exception("垃圾箱到期额度复查失败 workspace_db_id=%s email=%s", workspace_id, email)
         db.update_workspace_candidate_trash(
@@ -2668,10 +2947,20 @@ def _process_scheduled_trash_due(
             due_at=time.time() + 10 * 60,
             reason="quota_retry",
         )
-        return
+        return False
     if not _workspace_exists(workspace_id):
-        return
-    if _is_zero_quota_payload(quota):
+        return False
+    trash_window = _candidate_trash_zero_quota_window(workspace_id, settings)
+    if _is_zero_quota_payload(quota, trash_window):
+        # 真要入箱之前的最后一次自救：这时账号已经躺了一个延迟周期，上游可能
+        # 刚发了新券。兑换失败或额度没回来都照常入箱。
+        refreshed = _try_candidate_quota_auto_reset(
+            workspace_id, email, quota, settings,
+            quota_leases=quota_leases, source="trash_recheck",
+        )
+        if refreshed is not None:
+            quota = refreshed
+    if _is_zero_quota_payload(quota, trash_window):
         try:
             _apply_candidate_trash(workspace_id, email, reason="quota_zero")
         except Exception:
@@ -2683,8 +2972,9 @@ def _process_scheduled_trash_due(
                 due_at=time.time() + 10 * 60,
                 reason="trash_retry",
             )
-    else:
-        _clear_candidate_trash_timer(workspace_id, email)
+        return True
+    _clear_candidate_trash_timer(workspace_id, email)
+    return False
 
 
 @app.post("/api/workspace-candidates/trash")
@@ -2738,6 +3028,101 @@ def api_restore_workspace_candidates_from_trash(req: WorkspaceCandidatesReq):
         "ok": True,
         "restored": restored,
         "skipped": len(emails) - restored,
+    }
+
+
+def _lease_reset_credit_proxy(req: WorkspaceResetCreditReq, email: str, detail: str) -> str:
+    """重置券操作的代理：与额度查询同源，不允许回退到母号出口。"""
+    settings = _workspace_settings_snapshot(req.workspace_id)
+    try:
+        leases = _candidate_quota_proxy_pool(
+            _candidate_proxy_pool_text(settings, req.proxy_pool)
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _lease_candidate_quota_proxy(
+        leases, workspace_id=req.workspace_id, email=email, detail=detail,
+    )
+
+
+def _reset_credit_target(req: WorkspaceResetCreditReq) -> str:
+    """校验邮箱属于本空间且允许做额度类操作，返回归一化后的邮箱。"""
+    email = str(req.email or "").strip().lower()
+    if not email:
+        raise HTTPException(400, "请选择候选人")
+    row = db.get_workspace_candidate(req.workspace_id, email) or {}
+    if not row:
+        raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    # 复用额度查询那套准入判定：没凭证/已出库/已入箱的账号同样不该动券。
+    # 注意 list_workspace_candidate_options 会过滤掉已出库/已入箱的行，所以
+    # 候选人自身的字段要盖在上面——否则这两类会被误报成"不属于当前空间"。
+    options = {
+        str(item.get("email") or "").strip().lower(): item
+        for item in db.list_workspace_candidate_options(req.workspace_id)
+    }
+    reason = _candidate_quota_ineligible_reason({**(options.get(email) or {}), **row})
+    if reason:
+        raise HTTPException(400, reason)
+    return email
+
+
+@app.get("/api/workspace-candidates/reset-credits")
+def api_list_candidate_reset_credits(workspace_id: int, email: str, proxy_pool: str = ""):
+    """只读列出候选人名下的重置券，供兑换前确认。"""
+    req = WorkspaceResetCreditReq(workspace_id=workspace_id, email=email, proxy_pool=proxy_pool)
+    target = _reset_credit_target(req)
+    proxy = _lease_reset_credit_proxy(req, target, "reset_credit_list")
+    try:
+        listing = workspace_membership.list_candidate_reset_credits(
+            workspace_id, target, proxy=proxy,
+        )
+    except Exception as exc:
+        logger.exception("重置券查询失败 workspace_db_id=%s email=%s", workspace_id, target)
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "email": target, **listing}
+
+
+@app.post("/api/workspace-candidates/reset-credits/consume")
+def api_consume_candidate_reset_credit(req: WorkspaceResetCreditReq):
+    """兑换一张重置券，然后立刻重查额度把结果写回。
+
+    兑换本身不可逆，所以这里不重试。兑换成功后的额度重查是"锦上添花"：失败
+    也只报告查询错误，绝不能让它看起来像兑换失败，否则用户会再点一次、再烧
+    掉一张券。
+    """
+    target = _reset_credit_target(req)
+    proxy = _lease_reset_credit_proxy(req, target, "reset_credit_consume")
+    try:
+        consumed = workspace_membership.consume_candidate_reset_credit(
+            req.workspace_id, target, proxy=proxy, credit_id=req.credit_id,
+        )
+    except workspace_membership.ResetCreditUnavailable as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("重置券兑换失败 workspace_db_id=%s email=%s", req.workspace_id, target)
+        raise HTTPException(400, str(exc)) from exc
+
+    settings = _workspace_settings_snapshot(req.workspace_id)
+    quota = None
+    quota_error = ""
+    try:
+        refresh_proxy = _lease_reset_credit_proxy(req, target, "reset_credit_refresh")
+        quota = workspace_membership.fetch_candidate_quota(
+            req.workspace_id, target, proxy=refresh_proxy,
+            network_retries=_candidate_quota_network_retries(req.workspace_id, settings),
+        )
+    except Exception as exc:
+        quota_error = str(exc)
+        logger.warning(
+            "重置券兑换成功但额度重查失败 workspace_db_id=%s email=%s error=%s",
+            req.workspace_id, target, quota_error[:200],
+        )
+    return {
+        "ok": True,
+        "email": target,
+        "consumed": consumed,
+        "quota": quota,
+        "quota_error": quota_error,
     }
 
 
@@ -3109,6 +3494,12 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
     setting_overrides = req.model_dump()
     if not str(setting_overrides.get("proxy_pool") or "").strip():
         setting_overrides.pop("proxy_pool", None)
+    # 手动查询不带垃圾箱设置，模型默认值不能盖掉空间已保存的口径（否则关掉
+    # 自动入箱、或选了 5h/周窗口的空间，一手动查询就被打回默认行为）。
+    for key in ("trash_enabled", "trash_invalid_enabled", "trash_zero_delay_minutes",
+                "trash_zero_quota_window", "trash_gap_seconds"):
+        if key not in req.model_fields_set:
+            setting_overrides.pop(key, None)
     settings = _workspace_settings_snapshot(req.workspace_id, setting_overrides)
     try:
         quota_leases = _candidate_quota_proxy_pool(
@@ -3125,6 +3516,7 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
     results = {}
     logging.getLogger("workspace_membership").info("额度查询开始 workspace=%s count=%s relogin_on_401=%s auto_push=%s proxy_configured=%s", req.workspace_id, len(req.emails), req.relogin_on_401, req.auto_push, bool(_candidate_proxy_pool_text(settings, req.proxy_pool)))
     trash_delay = _candidate_trash_delay_seconds(req.workspace_id, settings)
+    trash_window = _candidate_trash_zero_quota_window(req.workspace_id, settings)
     for email in req.emails:
         key = email.strip().lower()
         ineligible_reason = _candidate_quota_ineligible_reason(candidate_rows.get(key))
@@ -3196,7 +3588,7 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
                     continue
             else:
                 continue
-        if quota is not None and _is_zero_quota_payload(quota) and _candidate_trash_enabled(req.workspace_id, settings):
+        if quota is not None and _is_zero_quota_payload(quota, trash_window) and _candidate_trash_enabled(req.workspace_id, settings):
             scheduled = _schedule_candidate_trash(
                 req.workspace_id,
                 key,
@@ -3226,6 +3618,8 @@ def api_start_quota_schedule(req: WorkspaceQuotaScheduleReq):
             value = getattr(req, key)
             if key == "auto_prolite_candidate_seat_type":
                 value = _normalize_auto_prolite_candidate_seat_type(value)
+            elif key == "trash_zero_quota_window":
+                value = _normalize_trash_zero_quota_window(value)
             settings[key] = value
     settings["quota_enabled"] = True
     db.update_workspace_settings(req.workspace_id, settings)
@@ -3425,6 +3819,8 @@ def api_save_workspace_candidate_settings(req: WorkspaceQuotaScheduleReq):
             value = getattr(req, key)
             if key == "auto_prolite_candidate_seat_type":
                 value = _normalize_auto_prolite_candidate_seat_type(value)
+            elif key == "trash_zero_quota_window":
+                value = _normalize_trash_zero_quota_window(value)
             settings[key] = value
     db.update_workspace_settings(req.workspace_id, settings)
     return {"ok": True}

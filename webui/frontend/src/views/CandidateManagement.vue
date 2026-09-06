@@ -36,6 +36,8 @@ import {
   saveCandidateSettings,
   trashCandidates,
   restoreCandidatesFromTrash,
+  listResetCredits,
+  consumeResetCredit,
 } from "@/api/workspaceCandidates";
 import { PAGE_SIZE_OPTIONS, SELECT_ALL_FETCH_LIMIT } from "@/utils/pagination";
 
@@ -77,6 +79,8 @@ const taskOtpTimeout = ref(180);
 const taskRetry = ref(1);
 const taskCooldown = ref(0);
 const quotaNetworkRetries = ref(2);
+// 额度耗尽时自动兑换重置券。默认关闭：券是不可逆的消耗品。
+const quotaAutoResetEnabled = ref(false);
 const quotaProxyPool = ref("");
 
 const quotaProxyPoolCount = computed(
@@ -107,6 +111,8 @@ function importGlobalProxyPool() {
 const trashEnabled = ref(true);
 const trashInvalidEnabled = ref(true);
 const trashZeroDelayMinutes = ref(60);
+const trashZeroQuotaWindow = ref("any");
+const trashGapSeconds = ref(30);
 
 const seatProtectEnabled = ref(false);
 const seatProtectThreshold = ref(8);
@@ -123,6 +129,7 @@ const autoStandardSeatNextAt = ref(0);
 const autoProliteSeatEnabled = ref(false);
 const autoProliteSeatNextAt = ref(0);
 const autoSeatIntervalMinutes = ref(5);
+const autoSeatSwitchGapSeconds = ref(30);
 const autoProliteCandidateSeatType = ref("default");
 
 const candidateStats = ref({
@@ -137,6 +144,8 @@ const candidateStats = ref({
     trash_enabled: true,
     trash_invalid_enabled: true,
     trash_zero_delay_minutes: 60,
+    trash_zero_quota_window: "any",
+    trash_gap_seconds: 30,
   },
   seat_fulfillment: {
     standard: {
@@ -164,6 +173,7 @@ const candidateStats = ref({
     },
     outbound_count: 0,
     auto_interval_minutes: 5,
+    auto_switch_gap_seconds: 30,
     auto_prolite_candidate_seat_type: "default",
   },
 });
@@ -391,6 +401,59 @@ function quotaUpdated(row) {
   }
 }
 
+// 上游的 primary/secondary 并不固定对应 5h/周：多数账号只返回一个周窗口，
+// 而它落在 primary 上。窗口种类只能按 window_seconds 认（18000=5h，604800=周），
+// 否则「5h剩余」这一栏在大部分行上显示的其实是周额度。
+const QUOTA_WINDOW_SECONDS = { fiveHour: 18000, weekly: 604800 };
+const QUOTA_WINDOW_TOLERANCE = 600;
+
+function quotaWindowsByKind(q) {
+  const found = {};
+  for (const key of ["primary", "secondary"]) {
+    const window = q?.[key];
+    const seconds = Number(window?.window_seconds);
+    if (!window || !Number.isFinite(seconds)) continue;
+    for (const [kind, expected] of Object.entries(QUOTA_WINDOW_SECONDS)) {
+      if (!found[kind] && Math.abs(seconds - expected) <= QUOTA_WINDOW_TOLERANCE) {
+        found[kind] = window;
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+function quotaWindowRemain(window) {
+  return window?.used_percent != null ? Math.max(0, 100 - Number(window.used_percent)) : null;
+}
+
+// 上游 wham/usage 返回的额度重置券。available 是账号名下的券数，applicable
+// 是"用在当前耗尽状态上真的有效"的券数——存在 available=1 但 applicable=0 的
+// 账号（额度没真正打满，兑券会白烧一张），所以"现在能不能重置"看 applicable。
+// 字段缺失（旧记录、上游没返回）与 0 必须区分开，所以这里返回 null 而不是 0。
+function parseResetCredits(q) {
+  const block = q?.reset_credits;
+  if (!block || typeof block !== "object") return null;
+  const toCount = (value) => (Number.isFinite(Number(value)) && value !== null ? Number(value) : null);
+  const available = toCount(block.available);
+  const applicable = toCount(block.applicable);
+  if (available == null && applicable == null) return null;
+  return { available, applicable };
+}
+
+// 额度耗尽归因。workspace_member_credits_depleted 是母号空间的池子被掏空，
+// 属于空间级问题，重置券只重置速率窗口，救不了这一类。
+const QUOTA_REACHED_TYPE_LABELS = {
+  workspace_member_credits_depleted: "空间额度耗尽",
+  usage_limit_reached: "用量上限",
+};
+
+function quotaReachedTypeLabel(value) {
+  const key = String(value || "").trim();
+  if (!key) return "";
+  return QUOTA_REACHED_TYPE_LABELS[key] || key;
+}
+
 function parseQuotaInfo(row) {
   try {
     if (!row?.quota_json) return null;
@@ -398,13 +461,118 @@ function parseQuotaInfo(row) {
     if (!q) return null;
     const isError = Boolean(q.error_code);
     const errorCode = q.error_code ? String(q.error_code) : "";
-    const primaryRemain = q.primary?.used_percent != null ? Math.max(0, 100 - Number(q.primary.used_percent)) : null;
-    const secondaryRemain = q.secondary?.used_percent != null ? Math.max(0, 100 - Number(q.secondary.used_percent)) : null;
+    const windows = quotaWindowsByKind(q);
+    const fiveHourRemain = quotaWindowRemain(windows.fiveHour);
+    const weeklyRemain = quotaWindowRemain(windows.weekly);
+    // 窗口时长缺失时退回按字段位置展示，标注为「剩余」而非具体窗口。
+    const unknownRemain =
+      fiveHourRemain == null && weeklyRemain == null
+        ? quotaWindowRemain(q.primary) ?? quotaWindowRemain(q.secondary)
+        : null;
     const credits = q.credits_balance || "";
     const updatedAt = q.updated_at ? new Date(q.updated_at * 1000).toLocaleString() : "";
-    return { isError, errorCode, primaryRemain, secondaryRemain, credits, updatedAt };
+    const resetCredits = parseResetCredits(q);
+    const reachedType = quotaReachedTypeLabel(q.rate_limit_reached_type);
+    return {
+      isError, errorCode, fiveHourRemain, weeklyRemain, unknownRemain, credits, updatedAt,
+      resetCredits, reachedType,
+    };
   } catch (_) {
     return null;
+  }
+}
+
+// 重置券这一栏的提示文案：有券但当前用不上是最容易误读的状态，必须说清楚。
+function resetCreditsHint(info) {
+  const reset = info?.resetCredits;
+  if (!reset) return "";
+  const available = reset.available ?? 0;
+  const applicable = reset.applicable ?? 0;
+  if (!available) return "该账号名下没有可用的额度重置券。";
+  if (!applicable) {
+    return `名下有 ${available} 张重置券，但当前额度状态用不上（额度未真正耗尽，或耗尽原因不是速率窗口打满）。点击可查看并手动兑换。`;
+  }
+  return `名下有 ${available} 张重置券，其中 ${applicable} 张可用于当前的额度耗尽状态。点击可查看并手动兑换。`;
+}
+
+// 手动兑换重置券的行内入口。券是不可逆消耗品（上游 2xx 即扣券），所以流程被
+// 刻意拆成两步：先只读拉取券列表，把 id / 有效期摆给用户看，确认后才 POST。
+const resetCreditBusyEmail = ref("");
+
+function resetCreditDate(value) {
+  if (!value) return "未知";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+}
+
+async function openResetCredit(row) {
+  const email = String(row?.email || "").trim();
+  if (!email) return;
+  if (!workspaceId.value) return ElMessage.warning("请选择母号空间");
+  if (resetCreditBusyEmail.value) return ElMessage.warning("重置券操作正在进行中");
+
+  resetCreditBusyEmail.value = email;
+  try {
+    let listing;
+    try {
+      listing = await listResetCredits(workspaceId.value, email, quotaProxyPool.value);
+    } catch (e) {
+      return ElMessage.error("重置券查询失败: " + (e.message || e));
+    }
+    const usable = (listing?.credits || []).filter((c) => c?.status === "available");
+    if (!usable.length) {
+      return ElMessage.warning(`${email} 名下没有可兑换的重置券`);
+    }
+    const target = usable[0];
+    // 上游只重置速率窗口，救不了「空间额度耗尽」这一类，兑了也是白烧。
+    const info = parseQuotaInfo(row);
+    const wastedWarning = info?.reachedType
+      ? `\n\n注意：该账号当前的耗尽原因是「${info.reachedType}」，重置券只恢复速率窗口，很可能无法解决，兑换后券直接作废。`
+      : (info?.resetCredits?.applicable === 0
+        ? "\n\n注意：上游标记这张券当前「不适用」（额度尚未真正耗尽），现在兑换会浪费掉。"
+        : "");
+    try {
+      await ElMessageBox.confirm(
+        `即将为 ${email} 兑换 1 张额度重置券。\n\n` +
+          `券 ID：${target.id}\n` +
+          `类型：${target.reset_type || "未知"}\n` +
+          `有效期至：${resetCreditDate(target.expires_at)}\n` +
+          `名下可用：${usable.length} 张\n\n` +
+          `兑换不可撤销：上游一旦返回成功，这张券就消耗掉了，即使只重置了部分窗口。` +
+          wastedWarning,
+        "兑换额度重置券",
+        {
+          type: "warning",
+          confirmButtonText: "确认兑换（不可撤销）",
+          cancelButtonText: "取消",
+          // 消耗类操作的文案里有换行和 ID，必须原样显示。
+          customClass: "reset-credit-confirm",
+        }
+      );
+    } catch (_) {
+      return;
+    }
+
+    setOneOperation(email, "兑换重置券中…");
+    try {
+      const result = await consumeResetCredit(workspaceId.value, email, target.id, quotaProxyPool.value);
+      await load();
+      if (result?.quota_error) {
+        // 券已经扣掉了，这里绝不能报成失败，否则用户会再点一次再烧一张。
+        ElMessage.warning(`重置券已兑换，但额度重查失败：${result.quota_error}`);
+      } else {
+        const windows = result?.consumed?.windows_reset;
+        ElMessage.success(
+          `重置券已兑换${windows ? `（windows_reset=${windows}）` : ""}，额度已刷新`
+        );
+      }
+    } catch (e) {
+      ElMessage.error("重置券兑换失败: " + (e.message || e));
+    } finally {
+      setOneOperation(email, "");
+    }
+  } finally {
+    resetCreditBusyEmail.value = "";
   }
 }
 
@@ -1133,10 +1301,13 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       account_retry_count: taskRetry.value,
       cool_down_seconds: taskCooldown.value,
       quota_network_retries: quotaNetworkRetries.value,
+      quota_auto_reset_enabled: quotaAutoResetEnabled.value,
       quota_proxy_pool: quotaProxyPool.value,
       trash_enabled: trashEnabled.value,
       trash_invalid_enabled: trashInvalidEnabled.value,
       trash_zero_delay_minutes: trashZeroDelayMinutes.value,
+      trash_zero_quota_window: trashZeroQuotaWindow.value,
+      trash_gap_seconds: trashGapSeconds.value,
       seat_protect_enabled: seatProtectEnabled.value,
       seat_protect_threshold: seatProtectThreshold.value,
       seat_protect_refresh_time: seatProtectRefreshTime.value,
@@ -1146,6 +1317,7 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       auto_standard_seat_enabled: autoStandardSeatEnabled.value,
       auto_prolite_seat_enabled: autoProliteSeatEnabled.value,
       auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
+      auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
       auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
     });
     // 同步更新统计数据并刷新统计
@@ -1185,10 +1357,13 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     taskRetry.value = Number(c.account_retry_count || 1);
     taskCooldown.value = Number(c.cool_down_seconds || 0);
     quotaNetworkRetries.value = Number(c.quota_network_retries ?? 2);
+    quotaAutoResetEnabled.value = Boolean(c.quota_auto_reset_enabled);
     quotaProxyPool.value = String(c.quota_proxy_pool || "");
     trashEnabled.value = c.trash_enabled !== false;
     trashInvalidEnabled.value = c.trash_invalid_enabled !== false;
     trashZeroDelayMinutes.value = Number(c.trash_zero_delay_minutes || 60);
+    trashZeroQuotaWindow.value = String(c.trash_zero_quota_window || "any");
+    trashGapSeconds.value = Math.min(600, Math.max(0, Number(c.trash_gap_seconds ?? 30)));
     seatProtectEnabled.value = Boolean(c.seat_protect_enabled);
     seatProtectThreshold.value = Number(c.seat_protect_threshold || 8);
     seatProtectRefreshTime.value = String(c.seat_protect_refresh_time || "00:00");
@@ -1200,6 +1375,7 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     autoStandardSeatEnabled.value = Boolean(c.auto_standard_seat_enabled);
     autoProliteSeatEnabled.value = Boolean(c.auto_prolite_seat_enabled);
     autoSeatIntervalMinutes.value = Math.min(1440, Math.max(1, Number(c.auto_seat_interval_minutes) || 5));
+    autoSeatSwitchGapSeconds.value = Math.min(600, Math.max(0, Number(c.auto_seat_switch_gap_seconds ?? 30)));
     autoProliteCandidateSeatType.value = ["default", "usage_based", "all"].includes(String(c.auto_prolite_candidate_seat_type || "default"))
       ? String(c.auto_prolite_candidate_seat_type || "default")
       : "default";
@@ -1227,10 +1403,13 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       taskRetry.value = 1;
       taskCooldown.value = 0;
       quotaNetworkRetries.value = 2;
+      quotaAutoResetEnabled.value = false;
       quotaProxyPool.value = "";
       trashEnabled.value = true;
       trashInvalidEnabled.value = true;
       trashZeroDelayMinutes.value = 60;
+      trashZeroQuotaWindow.value = "any";
+      trashGapSeconds.value = 30;
       seatProtectEnabled.value = false;
       seatProtectThreshold.value = 8;
       seatProtectRefreshTime.value = "00:00";
@@ -1244,6 +1423,7 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoProliteSeatEnabled.value = false;
       autoProliteSeatNextAt.value = 0;
       autoSeatIntervalMinutes.value = 5;
+      autoSeatSwitchGapSeconds.value = 30;
       autoProliteCandidateSeatType.value = "default";
     }
   } finally {
@@ -1270,10 +1450,13 @@ async function toggleQuotaSchedule() {
           account_retry_count: taskRetry.value,
           cool_down_seconds: taskCooldown.value,
           quota_network_retries: quotaNetworkRetries.value,
+          quota_auto_reset_enabled: quotaAutoResetEnabled.value,
           quota_proxy_pool: quotaProxyPool.value,
           trash_enabled: trashEnabled.value,
           trash_invalid_enabled: trashInvalidEnabled.value,
           trash_zero_delay_minutes: trashZeroDelayMinutes.value,
+          trash_zero_quota_window: trashZeroQuotaWindow.value,
+          trash_gap_seconds: trashGapSeconds.value,
           seat_protect_enabled: seatProtectEnabled.value,
           seat_protect_threshold: seatProtectThreshold.value,
           seat_protect_refresh_time: seatProtectRefreshTime.value,
@@ -1283,6 +1466,7 @@ async function toggleQuotaSchedule() {
           auto_standard_seat_enabled: autoStandardSeatEnabled.value,
           auto_prolite_seat_enabled: autoProliteSeatEnabled.value,
           auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
+          auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
           auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
         }
       );
@@ -1384,7 +1568,7 @@ async function loginOnly() {
     const skipped = result.skipped || 0;
     const eligible = result.eligible || 0;
     if (skipped) ElMessage.warning(`仅登录任务：跳过 ${skipped} 个不满足条件的候选人，已提交 ${eligible} 个`);
-    else ElMessage.success(`仅登录任务已启动：已提交 ${eligible} 个（跳过 OAuth），请在运行记录查看`);
+    else ElMessage.success(`仅登录任务已启动：已提交 ${eligible} 个（跳过 OAuth），登录完成后会自动把进入空间的成员标记为已加入，请在运行记录查看`);
   } catch (e) {
     ElMessage.error(e.message);
   } finally {
@@ -1535,10 +1719,12 @@ watch(
     taskRetry,
     taskCooldown,
     quotaNetworkRetries,
+    quotaAutoResetEnabled,
     quotaProxyPool,
     trashEnabled,
     trashInvalidEnabled,
     trashZeroDelayMinutes,
+    trashZeroQuotaWindow,
     seatProtectEnabled,
     seatProtectThreshold,
     seatProtectRefreshTime,
@@ -1549,6 +1735,21 @@ watch(
   ],
   queueSpaceSettingsSave
 );
+
+watch(autoSeatSwitchGapSeconds, (value) => {
+  // el-input-number 清空时会给 null，Number(null) 是 0，所以只能显式判 NaN 回默认值。
+  const raw = Number(value);
+  const seconds = Number.isFinite(raw) ? Math.min(600, Math.max(0, Math.round(raw))) : 30;
+  if (value !== seconds) autoSeatSwitchGapSeconds.value = seconds;
+  queueSpaceSettingsSave();
+});
+
+watch(trashGapSeconds, (value) => {
+  const raw = Number(value);
+  const seconds = Number.isFinite(raw) ? Math.min(600, Math.max(0, Math.round(raw))) : 30;
+  if (value !== seconds) trashGapSeconds.value = seconds;
+  queueSpaceSettingsSave();
+});
 
 watch(autoSeatIntervalMinutes, (value) => {
   const minutes = Math.min(1440, Math.max(1, Number(value) || 5));
@@ -2333,31 +2534,89 @@ onBeforeUnmount(() => {
                 <!-- 正常额度展示 -->
                 <div v-else class="quota-valid-wrap">
                   <div class="quota-bars-row">
-                    <!-- 5小时额度 -->
-                    <div v-if="parseQuotaInfo(row)?.primaryRemain != null" class="quota-pill-stat">
+                    <!-- 5 小时额度（仅在上游确实返回 18000 秒窗口时出现） -->
+                    <div v-if="parseQuotaInfo(row)?.fiveHourRemain != null" class="quota-pill-stat">
                       <span class="stat-label">5h剩余</span>
                       <span
                         class="stat-val"
                         :class="{
-                          'text-success': (parseQuotaInfo(row)?.primaryRemain || 0) >= 80,
-                          'text-warning': (parseQuotaInfo(row)?.primaryRemain || 0) < 80 && (parseQuotaInfo(row)?.primaryRemain || 0) >= 30,
-                          'text-danger': (parseQuotaInfo(row)?.primaryRemain || 0) < 30
+                          'text-success': (parseQuotaInfo(row)?.fiveHourRemain || 0) >= 80,
+                          'text-warning': (parseQuotaInfo(row)?.fiveHourRemain || 0) < 80 && (parseQuotaInfo(row)?.fiveHourRemain || 0) >= 30,
+                          'text-danger': (parseQuotaInfo(row)?.fiveHourRemain || 0) < 30
                         }"
                       >
-                        {{ parseQuotaInfo(row)?.primaryRemain }}%
+                        {{ parseQuotaInfo(row)?.fiveHourRemain }}%
                       </span>
                     </div>
 
                     <!-- 周额度 -->
-                    <div v-if="parseQuotaInfo(row)?.secondaryRemain != null" class="quota-pill-stat">
+                    <div v-if="parseQuotaInfo(row)?.weeklyRemain != null" class="quota-pill-stat">
                       <span class="stat-label">周剩余</span>
-                      <span class="stat-val text-primary">{{ parseQuotaInfo(row)?.secondaryRemain }}%</span>
+                      <span
+                        class="stat-val"
+                        :class="{
+                          'text-success': (parseQuotaInfo(row)?.weeklyRemain || 0) >= 80,
+                          'text-warning': (parseQuotaInfo(row)?.weeklyRemain || 0) < 80 && (parseQuotaInfo(row)?.weeklyRemain || 0) >= 30,
+                          'text-danger': (parseQuotaInfo(row)?.weeklyRemain || 0) < 30
+                        }"
+                      >
+                        {{ parseQuotaInfo(row)?.weeklyRemain }}%
+                      </span>
+                    </div>
+
+                    <!-- 窗口时长缺失：只能报剩余，不标窗口 -->
+                    <div v-if="parseQuotaInfo(row)?.unknownRemain != null" class="quota-pill-stat">
+                      <span class="stat-label">剩余</span>
+                      <span class="stat-val text-primary">{{ parseQuotaInfo(row)?.unknownRemain }}%</span>
                     </div>
 
                     <!-- 余额 -->
                     <div v-if="parseQuotaInfo(row)?.credits" class="quota-pill-stat">
                       <span class="stat-label">余额</span>
                       <span class="stat-val">{{ parseQuotaInfo(row)?.credits }}</span>
+                    </div>
+
+                    <!-- 额度重置券：available 有券但 applicable 为 0 时现在用了会白烧一张 -->
+                    <el-tooltip
+                      v-if="parseQuotaInfo(row)?.resetCredits"
+                      :content="resetCreditsHint(parseQuotaInfo(row))"
+                      placement="top"
+                    >
+                      <div
+                        class="quota-pill-stat"
+                        :class="{
+                          'reset-credit-usable': (parseQuotaInfo(row)?.resetCredits?.applicable || 0) > 0,
+                          'reset-credit-clickable': (parseQuotaInfo(row)?.resetCredits?.available || 0) > 0,
+                          'is-busy': resetCreditBusyEmail === row.email
+                        }"
+                        @click="(parseQuotaInfo(row)?.resetCredits?.available || 0) > 0 && openResetCredit(row)"
+                      >
+                        <span class="stat-label">可重置</span>
+                        <span
+                          class="stat-val"
+                          :class="{
+                            'text-success': (parseQuotaInfo(row)?.resetCredits?.applicable || 0) > 0,
+                            'text-warning': (parseQuotaInfo(row)?.resetCredits?.applicable || 0) === 0
+                              && (parseQuotaInfo(row)?.resetCredits?.available || 0) > 0
+                          }"
+                        >
+                          {{ parseQuotaInfo(row)?.resetCredits?.applicable ?? 0 }}
+                          <template v-if="(parseQuotaInfo(row)?.resetCredits?.available || 0) !== (parseQuotaInfo(row)?.resetCredits?.applicable || 0)">
+                            / {{ parseQuotaInfo(row)?.resetCredits?.available ?? 0 }}
+                          </template>
+                        </span>
+                        <Icon
+                          v-if="(parseQuotaInfo(row)?.resetCredits?.available || 0) > 0"
+                          icon="lucide:rotate-ccw"
+                          class="reset-credit-icon"
+                        />
+                      </div>
+                    </el-tooltip>
+
+                    <!-- 耗尽归因：空间池子被掏空和成员窗口打满要分得开 -->
+                    <div v-if="parseQuotaInfo(row)?.reachedType" class="quota-pill-stat">
+                      <span class="stat-label">耗尽</span>
+                      <span class="stat-val text-danger">{{ parseQuotaInfo(row)?.reachedType }}</span>
                     </div>
                   </div>
 
@@ -2510,6 +2769,20 @@ onBeforeUnmount(() => {
                   </div>
                   <el-switch v-model="autoPush" />
                 </div>
+
+                <div class="setting-switch-row sub-row">
+                  <div class="switch-meta">
+                    <span class="switch-title">额度耗尽自动兑换重置券</span>
+                    <span class="switch-desc">耗尽时先兑一张券自救，额度恢复就不入垃圾箱</span>
+                  </div>
+                  <el-switch v-model="quotaAutoResetEnabled" />
+                </div>
+                <div v-if="quotaAutoResetEnabled" class="field-hint auto-reset-hint">
+                  券是不可逆的消耗品，兑掉就没了。只有同时满足以下条件才会自动兑换：
+                  限流窗口按「额度耗尽判定窗口」的口径确实用尽、上游标记当前可用券数（applicable）大于 0、
+                  且耗尽原因不是「空间额度耗尽」（那是母号空间的池子被掏空，重置券救不了）。
+                  定时轮询查到耗尽时兑一次；延迟入箱到期复查时再兑一次，兑换后额度恢复的账号不会入箱。
+                </div>
               </el-form>
             </div>
           </el-tab-pane>
@@ -2520,7 +2793,15 @@ onBeforeUnmount(() => {
               <el-form label-position="top" class="settings-form">
                 <el-form-item label="席位补齐轮询周期 (分钟)">
                   <el-input-number v-model="autoSeatIntervalMinutes" :min="1" :max="1440" style="width: 100%" />
-                  <div class="field-hint">标准席位和高级席位任务共用此周期，每轮内部成员切换间隔 5 秒。</div>
+                  <div class="field-hint">标准席位和高级席位任务共用此周期，每轮开始时重新读取上游席位数。</div>
+                </el-form-item>
+
+                <el-form-item label="成员切换间隔 (秒)">
+                  <el-input-number v-model="autoSeatSwitchGapSeconds" :min="0" :max="600" style="width: 100%" />
+                  <div class="field-hint">
+                    补齐始终是串行的：一轮内每切换一个成员就等待这么久再切下一个，与空缺席位数无关。
+                    调大可降低对上游席位接口的压力，0 表示不等待。
+                  </div>
                 </el-form-item>
               </el-form>
 
@@ -2611,10 +2892,27 @@ onBeforeUnmount(() => {
                   </el-form>
                 </div>
               </div>
+
+              <div class="setting-group-box">
+                <div class="group-box-title">
+                  <Icon icon="lucide:pie-chart" class="box-icon text-primary" />
+                  <span>当前空间席位补齐概览</span>
+                </div>
+                <div class="stat-summary-grid">
+                  <div class="stat-summary-item">
+                    <span class="lbl">标准席位补齐</span>
+                    <span class="val text-primary">{{ candidateStats.seat_fulfillment?.standard?.count || 0 }} (累计 {{ candidateStats.seat_fulfillment?.standard?.fulfilled_total || 0 }})</span>
+                  </div>
+                  <div class="stat-summary-item">
+                    <span class="lbl">高级席位补齐</span>
+                    <span class="val text-warning">{{ candidateStats.seat_fulfillment?.prolite?.count || 0 }} (累计 {{ candidateStats.seat_fulfillment?.prolite?.fulfilled_total || 0 }})</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </el-tab-pane>
 
-          <!-- Tab 3: 代理池、运行参数与垃圾箱 -->
+          <!-- Tab 3: 代理池与运行参数 -->
           <el-tab-pane label="代理与参数" name="tasks">
             <div class="settings-tab-pane">
               <div class="setting-group-box">
@@ -2657,7 +2955,12 @@ onBeforeUnmount(() => {
                   <div class="hint">TLS 握手失败、连接超时与 5xx 共用此重试预算；429 另按 Retry-After 退避。</div>
                 </el-form-item>
               </el-form>
+            </div>
+          </el-tab-pane>
 
+          <!-- Tab 4: 垃圾箱回收 -->
+          <el-tab-pane label="垃圾箱回收" name="trash">
+            <div class="settings-tab-pane">
               <div class="setting-group-box">
                 <div class="group-box-title">
                   <Icon icon="lucide:trash-2" class="box-icon" />
@@ -2678,8 +2981,26 @@ onBeforeUnmount(() => {
                   <el-switch v-model="trashInvalidEnabled" />
                 </div>
                 <el-form label-position="top" class="settings-form sub-form">
+                  <el-form-item label="额度耗尽判定窗口">
+                    <el-select v-model="trashZeroQuotaWindow" style="width: 100%">
+                      <el-option label="任一窗口耗尽" value="any" />
+                      <el-option label="仅看 5 小时限制" value="five_hour" />
+                      <el-option label="仅看周限制" value="weekly" />
+                    </el-select>
+                    <div class="field-hint">
+                      决定候选人达到什么条件才排队入箱。上游未返回所选窗口时（多数账号只有周限制），
+                      会回退到另一个可用窗口，避免这类账号再也不被回收。
+                    </div>
+                  </el-form-item>
                   <el-form-item label="额度为 0 后延迟入箱 (分钟)">
                     <el-input-number v-model="trashZeroDelayMinutes" :min="1" :max="1440" style="width: 100%" />
+                  </el-form-item>
+                  <el-form-item label="连续入箱间隔 (秒)">
+                    <el-input-number v-model="trashGapSeconds" :min="0" :max="600" style="width: 100%" />
+                    <div class="field-hint">
+                      入箱始终是串行的：多个候选人在相近时间到期时，一个入箱完成后等待这么久再处理下一个。
+                      调大可降低对上游席位接口的压力，0 表示不等待。仅复查后放行的候选人不占用这个间隔。
+                    </div>
                   </el-form-item>
                 </el-form>
               </div>
@@ -2687,7 +3008,7 @@ onBeforeUnmount(() => {
               <div class="setting-group-box">
                 <div class="group-box-title">
                   <Icon icon="lucide:pie-chart" class="box-icon text-primary" />
-                  <span>当前空间回收与席位概览</span>
+                  <span>当前空间回收概览</span>
                 </div>
                 <div class="stat-summary-grid">
                   <div class="stat-summary-item">
@@ -2705,14 +3026,6 @@ onBeforeUnmount(() => {
                   <div class="stat-summary-item">
                     <span class="lbl">失效待入箱</span>
                     <span class="val">{{ candidateStats.trash?.invalid_pending_trash_count || 0 }}</span>
-                  </div>
-                  <div class="stat-summary-item">
-                    <span class="lbl">标准席位补齐</span>
-                    <span class="val text-primary">{{ candidateStats.seat_fulfillment?.standard?.count || 0 }} (累计 {{ candidateStats.seat_fulfillment?.standard?.fulfilled_total || 0 }})</span>
-                  </div>
-                  <div class="stat-summary-item">
-                    <span class="lbl">高级席位补齐</span>
-                    <span class="val text-warning">{{ candidateStats.seat_fulfillment?.prolite?.count || 0 }} (累计 {{ candidateStats.seat_fulfillment?.prolite?.fulfilled_total || 0 }})</span>
                   </div>
                 </div>
               </div>
@@ -3364,6 +3677,31 @@ onBeforeUnmount(() => {
   font-family: ui-monospace, SFMono-Regular, monospace;
 }
 
+/* 当前真能用的重置券：这一栏平时全是 0，有货时要一眼看见。 */
+.quota-pill-stat.reset-credit-usable {
+  background: var(--el-color-success-light-9);
+  border-color: var(--el-color-success-light-5);
+}
+
+/* 有券才可点。兑换不可逆，所以入口要有明确的可点视觉，不能是个隐藏手势。 */
+.quota-pill-stat.reset-credit-clickable {
+  cursor: pointer;
+}
+
+.quota-pill-stat.reset-credit-clickable:hover {
+  border-color: var(--el-color-primary);
+}
+
+.quota-pill-stat.is-busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.reset-credit-icon {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
 .quota-updated-time {
   font-size: 11px;
   color: var(--el-text-color-placeholder);
@@ -3513,6 +3851,12 @@ onBeforeUnmount(() => {
   padding: 0 4px;
 }
 
+/* 四个标签在 440px 抽屉里按默认 padding 会溢出成左右滚动箭头，收紧一点让它们一屏排下。 */
+.settings-tabs :deep(.el-tabs__item) {
+  padding: 0 12px;
+  font-size: 13px;
+}
+
 .settings-tab-pane {
   display: flex;
   flex-direction: column;
@@ -3597,6 +3941,11 @@ onBeforeUnmount(() => {
   line-height: 1.4;
 }
 
+/* 自动兑券的提示直接挂在开关行下面，没有 el-form-item 包裹，要自己留边距。 */
+.auto-reset-hint {
+  margin: 6px 2px 0;
+}
+
 .proxy-pool-actions {
   display: flex;
   align-items: center;
@@ -3642,5 +3991,13 @@ onBeforeUnmount(() => {
   font-size: 14px;
   font-weight: 700;
   font-family: ui-monospace, SFMono-Regular, monospace;
+}
+</style>
+
+<!-- ElMessageBox 渲染在 body 下，scoped 样式够不着，兑换确认框的换行只能写在
+     非 scoped 块里。 -->
+<style>
+.reset-credit-confirm .el-message-box__message {
+  white-space: pre-wrap;
 }
 </style>

@@ -7,10 +7,13 @@ export const assignCandidates = (workspace_id, emails) => http.post('/api/worksp
 export const removeCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/remove', { workspace_id, emails })
 export const updateCandidateTagStatus = (workspace_id, emails, tag_status) => http.post('/api/workspace-candidates/tag-status', { workspace_id, emails, tag_status })
 // 母号批量邀请会在上游邀请后逐个复查候选状态，处理时间随邀请人数增长。
-// Axios 的 timeout 单位是毫秒；保底 60 秒，并根据人数动态增加（每人 5 秒），避免大批量邀请被浏览器提前中断。
+// 后端一次邀请的时间下限 = 邀请请求 60s + 复查前等待 5s + 邀请列表复查 60s，
+// 所以前端保底必须 >125s，否则浏览器会在后端还没写回状态时就中断，
+// 用户看到"超时"但邀请其实已经发出去了。取 180s 留一轮重试的余量。
+// Axios 的 timeout 单位是毫秒。
 export const inviteCandidates = (workspace_id, emails, seat_type = 'default') => {
   const count = Array.isArray(emails) ? emails.length : 0
-  const timeout = Math.max(60000, count * 5000)
+  const timeout = Math.max(180000, count * 8000)
   return http.post('/api/workspace-candidates/invite', { workspace_id, emails, seat_type }, { timeout })
 }
 export const setCandidateInviteStatus = (workspace_id, emails, join_status) => http.post('/api/workspace-candidates/invite-status', { workspace_id, emails, join_status })
@@ -36,3 +39,7 @@ export const fetchWorkspaceCredentials = (workspace_id, emails, proxy_pool, seat
 export const loginOnlyWorkspace = (workspace_id, emails, proxy_pool, seat_type = 'default', params = {}) => http.post('/api/workspace-candidates/login-only', { workspace_id, emails, proxy_pool, seat_type, ...params })
 export const trashCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/trash', { workspace_id, emails })
 export const restoreCandidatesFromTrash = (workspace_id, emails) => http.post('/api/workspace-candidates/trash/restore', { workspace_id, emails })
+// 额度重置券。list 是只读的，consume 会不可逆地烧掉一张券，所以后端只接受单个
+// email，前端也必须先 list 让用户确认再 consume。
+export const listResetCredits = (workspace_id, email, proxy_pool = '') => http.get('/api/workspace-candidates/reset-credits', { params: { workspace_id, email, proxy_pool } })
+export const consumeResetCredit = (workspace_id, email, credit_id = '', proxy_pool = '') => http.post('/api/workspace-candidates/reset-credits/consume', { workspace_id, email, credit_id, proxy_pool })

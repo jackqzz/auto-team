@@ -803,6 +803,11 @@ def _do_register(
         else:
             # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
             db.save_registered(d)
+        # 仅登录空间任务：登录本身就会让被邀请的成员自动接受邀请进空间，
+        # 所以这里顺手按账号自己的空间列表把候选状态提升为"已加入"，
+        # 用户不用再单独跑一次候选人校验。
+        if login_only:
+            _sync_workspace_join_status(flow, options, d.get("email") or email)
         # 非池化 provider 的 email 是虚拟占位（xxx_placeholder_N@placeholder.local），
         # 号池里根本没这行，不能去 mark。判据用 provider 的 pooled，不写死 kind。
         if is_pooled and not login_only:
@@ -1020,6 +1025,70 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
         _emit_status(run_id, "phase", {"phase": "export_done", "summary": summary})
     except Exception:
         pass
+
+
+def _sync_workspace_join_status(flow, options: dict, email: str) -> str:
+    """登录成功后按账号自己的空间列表回写候选加入状态。
+
+    被邀请的成员一旦登录，上游会自动接受邀请并把号放进空间，所以"登录完还在
+    不在目标空间"这件事看账号自己就够了。这里**故意不走**候选人校验
+    (check_candidate_membership)：那是母号的管理 API，限流很严，而且成员刚
+    接受完邀请时母号侧的 users/invites 列表还可能没同步出来，反而会把已经
+    进空间的号写回 pending_invite。
+
+    只做 pending_invite → joined 这一个方向的提升：看不到目标空间的原因很多
+    （cookie 没带 workspaces、accounts/check 被限流、账号本轮走的是个人空间
+    授权），据此把 joined 降级成未加入会把正确状态改坏。
+
+    返回写入的状态；没做任何写入时返回空串。
+    """
+    log = logging.getLogger("registrar")
+    target = str(options.get("workspace_id") or "").strip()
+    try:
+        workspace_db_id = int(options.get("workspace_db_id") or 0)
+    except (TypeError, ValueError):
+        workspace_db_id = 0
+    if not target or not workspace_db_id:
+        return ""
+
+    email = str(email or "").strip().lower()
+    if not email:
+        return ""
+
+    # 先看本地：不是候选人、或者早就是 joined 的，都不值得为它多打一次上游请求。
+    try:
+        candidate = db.get_workspace_candidate(workspace_db_id, email) or {}
+    except Exception as e:
+        log.warning(f"[login] 候选记录读取失败，跳过加入状态回写: {e}")
+        return ""
+    if not candidate:
+        return ""
+    if str(candidate.get("workspace_join_status") or "").strip() == "joined":
+        return ""
+
+    try:
+        in_workspace = flow.account_is_in_workspace(target)
+    except Exception as e:
+        log.warning(f"[login] 账号空间列表读取失败，跳过加入状态回写: {e}")
+        return ""
+
+    if not in_workspace:
+        log.info(
+            "[login] %s 登录后未在自身空间列表中看到目标空间 workspace_id=%s，保持原状态",
+            email, target,
+        )
+        return ""
+
+    try:
+        db.update_workspace_candidate_join_statuses(workspace_db_id, [email], "joined")
+    except Exception as e:
+        log.warning(f"[login] 候选加入状态回写失败 email={email}: {e}")
+        return ""
+    log.info(
+        "[login] %s 登录后确认已在目标空间，候选状态更新为已加入 workspace_db_id=%s workspace_id=%s",
+        email, workspace_db_id, target,
+    )
+    return "joined"
 
 
 def _save_password_early(email: str, password: str) -> None:

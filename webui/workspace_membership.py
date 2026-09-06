@@ -17,6 +17,9 @@ from . import db
 BASE = "https://chatgpt.com"
 WORKSPACE_ADMIN_REQUEST_INTERVAL_SECONDS = 1.0
 WORKSPACE_ADMIN_MAX_429_RETRIES = 3
+# 母号管理 API 的单请求网络超时。上游在 Team 空间人数多时经常要 30s 以上才返回，
+# 30s 会在结果回来之前就把连接掐断，前端只能看到"超时"而不知道邀请其实已发出。
+WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS = 60
 # 连续多少轮 403 才判定账号停用。单次 403 常是边缘节点瞬时拒绝，直接判死
 # 会误杀仍在正常使用的账号。
 DEACTIVATION_403_STREAK = 2
@@ -59,6 +62,175 @@ class UpstreamHttpError(RuntimeError):
     def __init__(self, status_code: int, detail: object):
         self.status_code = int(status_code)
         super().__init__(f"上游 HTTP {self.status_code}: {detail}")
+
+
+def _int_or_none(value: object) -> int | None:
+    """上游数值字段一律走这里：拿不到就返回 None，而不是把缺失当成 0。
+
+    ``0`` 和"没这个字段"在重置券语义上完全不同（前者是确认没券，后者是上游
+    压根没返回），落库时必须分得开，否则前端无法区分"0 次"和"未知"。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_reset_credits(payload: dict) -> dict:
+    """解析 ``wham/usage`` 里的额度重置券信息。
+
+    上游每次查额度都会带 ``rate_limit_reset_credits``，我们以前整块丢掉了。
+    ``available``  是账号名下可用的券数；``applicable`` 是"用在当前这个耗尽
+    状态上真的有效"的券数——实测存在 available=1 但 applicable=0 的账号（额度
+    没真正打满，此时兑券会白白烧掉一张），所以判断能不能重置要看后者。
+    """
+    block = payload.get("rate_limit_reset_credits")
+    if not isinstance(block, dict):
+        return {}
+    return {
+        "available": _int_or_none(block.get("available_count")),
+        "applicable": _int_or_none(block.get("applicable_available_count")),
+    }
+
+
+def _reached_type(payload: dict) -> str:
+    """额度耗尽的归因类型，例如 ``workspace_member_credits_depleted``。
+
+    这个值区分"成员自己的滑动窗口打满"和"母号空间的池子被掏空"：后者是空间
+    级问题，重置券（``reset_type: codex_rate_limits`` 只重置速率窗口）救不了。
+    """
+    block = payload.get("rate_limit_reached_type")
+    if isinstance(block, dict):
+        return str(block.get("type") or "").strip()
+    return str(block or "").strip()
+
+
+class ResetCreditUnavailable(RuntimeError):
+    """名下没有可兑换的重置券，或券当前用不上。"""
+
+
+def _candidate_quota_session(workspace_db_id: int, email: str, proxy: str):
+    """构造一次候选人级 Codex 请求所需的 (session, headers, email)。
+
+    额度类请求带的是候选人自己的 Team Access Token，和母号管理请求是两套身份，
+    因此这里和 :func:`fetch_candidate_quota` 一样强制要求显式传入候选人代理池
+    里租来的代理，绝不回退到母号出口或直连。
+    """
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value:
+        raise ValueError("候选人代理池为空，重置券操作无法租取代理")
+    master = db.get_workspace_master(workspace_db_id)
+    if not master:
+        raise RuntimeError("母号不存在")
+    rows = db.list_workspace_credentials_by_emails(workspace_db_id, [email])
+    if not rows:
+        raise RuntimeError("候选人尚未获取当前空间凭证")
+    token = rows[0].get("access_token") or ""
+    wid = master.get("workspace_id") or ""
+    headers = {**_headers(token, wid), "ChatGPT-Account-Id": wid, "User-Agent": "codex-cli"}
+    return create_http_session(proxy=proxy_value), headers
+
+
+def _raise_for_quota_status(response, action: str) -> None:
+    """把重置券接口的 HTTP 错误翻译成额度查询那套异常，让上层分流逻辑复用。"""
+    code = int(response.status_code)
+    if code < 300:
+        return
+    body = _response_debug_body(response)[:300]
+    if code == 401:
+        raise QuotaUnauthorized(f"{action}失败 HTTP 401")
+    if code == 402:
+        raise QuotaPaymentRequired(f"{action}失败 HTTP 402：{body}")
+    if code >= 500:
+        raise QuotaNetworkError(f"{action}失败 HTTP {code}：{body}")
+    raise UpstreamHttpError(code, body)
+
+
+def list_candidate_reset_credits(workspace_db_id: int, email: str, *, proxy: str) -> dict:
+    """列出候选人名下的额度重置券（只读，不消耗）。
+
+    ``wham/usage`` 只给出数量，这个接口才给出每张券的 id / 状态 / 有效期，
+    而兑换必须按 id 指定，所以消耗前一定要先走这里。
+    """
+    session, headers = _candidate_quota_session(workspace_db_id, email, proxy)
+    response = session.get(
+        f"{BASE}/backend-api/wham/rate-limit-reset-credits", headers=headers, timeout=30,
+    )
+    _raise_for_quota_status(response, "重置券查询")
+    payload = response.json()
+    credits = payload.get("credits")
+    return {
+        "credits": credits if isinstance(credits, list) else [],
+        "available_count": _int_or_none(payload.get("available_count")),
+        "total_earned_count": _int_or_none(payload.get("total_earned_count")),
+    }
+
+
+def consume_candidate_reset_credit(
+    workspace_db_id: int,
+    email: str,
+    *,
+    proxy: str,
+    credit_id: str = "",
+) -> dict:
+    """兑换一张额度重置券，恢复该候选人的速率窗口。
+
+    **这是不可逆的消耗动作**：上游只要返回 2xx，券就没了，哪怕只重置了部分
+    窗口。所以这里不做任何"顺手重试"——失败就如实抛出，由调用方决定要不要
+    再来一次，避免一次点击烧掉两张券。
+
+    ``credit_id`` 为空时取第一张 ``status=available`` 的券。``redeem_request_id``
+    是上游的幂等键，每次兑换都用新的 uuid。
+    """
+    listing = list_candidate_reset_credits(workspace_db_id, email, proxy=proxy)
+    available = [
+        item for item in listing["credits"]
+        if isinstance(item, dict) and str(item.get("status") or "") == "available"
+    ]
+    if not available:
+        raise ResetCreditUnavailable("该账号名下没有可兑换的重置券")
+    wanted = str(credit_id or "").strip()
+    if wanted:
+        target = next((item for item in available if str(item.get("id") or "") == wanted), None)
+        if target is None:
+            raise ResetCreditUnavailable(f"指定的重置券不在可用列表中：{wanted}")
+    else:
+        target = available[0]
+
+    session, headers = _candidate_quota_session(workspace_db_id, email, proxy)
+    redeem_request_id = str(uuid.uuid4())
+    logger.warning(
+        "兑换额度重置券（不可逆）workspace_db_id=%s email=%s credit_id=%s redeem_request_id=%s",
+        workspace_db_id, email, target.get("id"), redeem_request_id,
+    )
+    response = session.post(
+        f"{BASE}/backend-api/wham/rate-limit-reset-credits/consume",
+        headers=headers,
+        json={"credit_id": target.get("id"), "redeem_request_id": redeem_request_id},
+        timeout=30,
+    )
+    _raise_for_quota_status(response, "重置券兑换")
+    try:
+        result = response.json()
+    except Exception:
+        result = {}
+    if not isinstance(result, dict):
+        result = {}
+    logger.warning(
+        "额度重置券已兑换 workspace_db_id=%s email=%s credit_id=%s windows_reset=%s code=%s",
+        workspace_db_id, email, target.get("id"),
+        result.get("windows_reset"), result.get("code"),
+    )
+    return {
+        "credit_id": target.get("id"),
+        "redeem_request_id": redeem_request_id,
+        "windows_reset": result.get("windows_reset"),
+        "code": result.get("code"),
+        "result": result,
+    }
+
 
 def fetch_candidate_quota(
     workspace_db_id: int,
@@ -187,6 +359,18 @@ def fetch_candidate_quota(
     def window(key):
         w = rate.get(key) or {}; return {"used_percent": w.get("used_percent"), "window_seconds": w.get("limit_window_seconds"), "reset_at": w.get("reset_at")}
     result = {"plan_type": payload.get("plan_type") or "", "credits_balance": credits.get("balance"), "allowed": rate.get("allowed"), "primary": window("primary_window"), "secondary": window("secondary_window"), "updated_at": time.time()}
+    # 以下三项上游一直在返回，只是历史上没解析。它们都是白拿的信息：
+    # limit_reached 是上游自己的耗尽判定，reached_type 说明耗尽归因，
+    # reset_credits 是可用的额度重置券数。
+    limit_reached = rate.get("limit_reached")
+    if limit_reached is not None:
+        result["limit_reached"] = bool(limit_reached)
+    reached_type = _reached_type(payload)
+    if reached_type:
+        result["rate_limit_reached_type"] = reached_type
+    reset_credits = _parse_reset_credits(payload)
+    if reset_credits:
+        result["reset_credits"] = reset_credits
     db.update_workspace_quota(workspace_db_id, email, result)
     return result
 logger = logging.getLogger("workspace_membership")
@@ -468,7 +652,9 @@ def invite_candidates(workspace_db_id: int, emails: list[str], seat_type: str = 
     if seat_type not in {"default", "usage_based", "prolite"}:
         raise ValueError("席位类型只能是标准席位、Usage-based 或 ProLite")
     count = len(emails)
-    req_timeout = max(30, min(300, 20 + count * 2))
+    # 下限跟随 WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS：原来卡在 30s，比上游批量邀请
+    # 的实际耗时还短，请求会在上游处理完之前就被本地掐断，邀请其实已发出却报网络超时。
+    req_timeout = max(WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS, min(300, 20 + count * 2))
     logger.info("母号批量邀请开始 workspace_db_id=%s workspace_id=%s seat_type=%s count=%s timeout=%ss emails=%s", workspace_db_id, workspace_id, seat_type, count, req_timeout, emails[:20])
     try:
         response = _workspace_admin_request(
@@ -514,7 +700,8 @@ def check_candidate_membership(
                     session,
                     "get",
                     f"{BASE}/backend-api/accounts/{workspace_id}/users",
-                    params={"offset": 0, "limit": 25, "query": email}, headers=headers, timeout=30,
+                    params={"offset": 0, "limit": 25, "query": email}, headers=headers,
+                    timeout=WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS,
                 )
                 users = _json(response)
                 items = users.get("items", []) if isinstance(users, dict) else []
@@ -598,7 +785,7 @@ def check_candidate_membership(
                     f"{BASE}/backend-api/accounts/{workspace_id}/invites",
                     params={"include_pending": "true", "include_requests": "true", "offset": offset, "limit": limit, "query": ""},
                     headers=headers,
-                    timeout=30,
+                    timeout=WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS,
                 )
                 pending = _json(response)
                 logger.info(
