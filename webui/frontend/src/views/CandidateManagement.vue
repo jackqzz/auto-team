@@ -2,7 +2,7 @@
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Icon } from "@iconify/vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { storeToRefs } from "pinia";
 import { useProxyStore } from "@/stores/proxy";
 import { listWorkspaceMasters, syncWorkspace, syncWorkspaceMembers } from "@/api/workspaces";
@@ -34,8 +34,12 @@ import {
   autoProliteSeatScheduleStatus,
   listWorkspaceTaskLogs,
   saveCandidateSettings,
+  testWorkspacePushTarget,
+  deleteCandidatesEverywhere,
   trashCandidates,
+  kickCandidates,
   restoreCandidatesFromTrash,
+  emptyWorkspaceTrash,
   listResetCredits,
   consumeResetCredit,
 } from "@/api/workspaceCandidates";
@@ -50,6 +54,17 @@ const loading = ref(false);
 const seatType = ref("default");
 const { list: proxyList } = storeToRefs(useProxyStore());
 const route = useRoute();
+const router = useRouter();
+// 垃圾箱单独路由复用本组件：route.meta.trash 时只展示已入箱成员并隐藏正常候选人的操作。
+const isTrashView = computed(() => Boolean(route.meta?.trash));
+
+function goTrashView() {
+  router.push("/workspace-candidates/trash");
+}
+
+function goCandidateView() {
+  router.push("/workspace-candidates");
+}
 
 const exportFormats = ref([]);
 const exporting = ref(false);
@@ -69,10 +84,35 @@ const taskLogAutoRefresh = ref(true);
 const taskLogBoxRef = ref(null);
 let taskLogTimer = null;
 
+const automationPaused = ref(false);
 const quotaRunning = ref(false);
 const quotaInterval = ref(30);
 const reloginOn401 = ref(false);
 const autoPush = ref(false);
+const autoPushSub2apiEnabled = ref(true);
+const autoPushCpaEnabled = ref(true);
+const autoPushSub2apiUrl = ref("");
+const autoPushSub2apiApiKey = ref("");
+const autoPushSub2apiGroupIds = ref("");
+const autoPushCpaUrl = ref("");
+const autoPushCpaMgmtKey = ref("");
+const autoPushSkipCodexSeat = ref(true);
+const pushTestRunning = ref({ sub2api: false, cpa: false });
+
+// 先落库再测：测试读的是已保存的空间覆盖 + 全局兜底，不先存会测到旧配置。
+async function testPushTarget(target) {
+  if (!workspaceId.value || pushTestRunning.value[target]) return;
+  pushTestRunning.value = { ...pushTestRunning.value, [target]: true };
+  try {
+    await saveSpaceSettings();
+    const r = await testWorkspacePushTarget(workspaceId.value, target);
+    ElMessage.success(r.result?.message || `${target} 连通正常`);
+  } catch (e) {
+    ElMessage.error(`${target} 测试失败: ` + (e.message || e));
+  } finally {
+    pushTestRunning.value = { ...pushTestRunning.value, [target]: false };
+  }
+}
 const nextQuotaAt = ref(0);
 const taskConcurrency = ref(1);
 const taskOtpTimeout = ref(180);
@@ -131,6 +171,8 @@ const autoProliteSeatNextAt = ref(0);
 const autoSeatIntervalMinutes = ref(5);
 const autoSeatSwitchGapSeconds = ref(30);
 const autoProliteCandidateSeatType = ref("default");
+const autoStandardSeatTarget = ref(0);
+const autoProliteSeatTarget = ref(0);
 
 const candidateStats = ref({
   workspace_id: null,
@@ -157,6 +199,7 @@ const candidateStats = ref({
       protect_threshold: 8,
       protect_refresh_time: "00:00",
       protect_window_key: "",
+      target: 0,
     },
     prolite: {
       count: 0,
@@ -167,6 +210,7 @@ const candidateStats = ref({
       protect_threshold: 8,
       protect_refresh_time: "00:00",
       protect_window_key: "",
+      target: 0,
     },
     codex: {
       count: 0,
@@ -190,11 +234,11 @@ const accountStatusFilter = ref("");
 const joinStatusFilter = ref("");
 const credentialStatusFilter = ref("");
 const seatTypeFilter = ref("");
-const trashStatusFilter = ref("active");
+const trashStatusFilter = ref(isTrashView.value ? "trashed" : "active");
 const tagStatusFilter = ref("");
 const groupNameFilter = ref("");
 const searchKeyword = ref("");
-const quickTab = ref("all");
+const quickTab = ref(isTrashView.value ? "trash" : "all");
 
 const candidateGroups = ref([]);
 const settingsVisible = ref(false);
@@ -758,6 +802,7 @@ async function loadSpaces() {
 }
 
 function handleQuickTabChange(tab) {
+  if (isTrashView.value) return;
   quickTab.value = tab;
   if (tab === "all") {
     trashStatusFilter.value = "active";
@@ -797,11 +842,11 @@ function resetFilters() {
   joinStatusFilter.value = "";
   credentialStatusFilter.value = "";
   seatTypeFilter.value = "";
-  trashStatusFilter.value = "active";
+  trashStatusFilter.value = isTrashView.value ? "trashed" : "active";
   tagStatusFilter.value = "";
   groupNameFilter.value = "";
   searchKeyword.value = "";
-  quickTab.value = "all";
+  quickTab.value = isTrashView.value ? "trash" : "all";
 }
 
 async function remove() {
@@ -851,6 +896,39 @@ async function moveToTrash() {
     ElMessage.error("移入垃圾箱失败: " + e.message);
   } finally {
     clearOperation(emails);
+  }
+}
+
+const emptyingTrash = ref(false);
+
+async function emptyTrash() {
+  if (!workspaceId.value) return ElMessage.warning("请先选择母号空间");
+  try {
+    await ElMessageBox.confirm(
+      `将清空当前空间的垃圾箱：\n` +
+        `垃圾箱内全部账号会从整个系统删除（所有空间的候选划分、已获取凭证、注册结果、邮箱号池）。\n\n` +
+        `清空后不可恢复，确定？`,
+      "清空垃圾箱",
+      { type: "warning", confirmButtonText: "确认清空（不可恢复）", cancelButtonText: "取消", customClass: "reset-credit-confirm" }
+    );
+  } catch {
+    return;
+  }
+  emptyingTrash.value = true;
+  try {
+    const r = await emptyWorkspaceTrash(workspaceId.value);
+    if (r.deleted) {
+      ElMessage.success(`已清空垃圾箱：删除 ${r.deleted} 个账号（候选 ${r.candidates} / 凭证 ${r.credentials} / 注册结果 ${r.registered} / 号池 ${r.pool}）`);
+    } else {
+      ElMessage.info("垃圾箱已经是空的");
+    }
+    clearSelection();
+    await load();
+    await loadStats();
+  } catch (e) {
+    ElMessage.error("清空垃圾箱失败: " + e.message);
+  } finally {
+    emptyingTrash.value = false;
   }
 }
 
@@ -1279,8 +1357,75 @@ async function runExportAction(command) {
   return doExport(command);
 }
 
+async function kick() {
+  const rows = selected.value.filter(
+    (x) => x.trash_status !== "trashed" && (x.workspace_join_status === "joined" || x.member_id)
+  );
+  if (!rows.length) return ElMessage.warning("所选候选人里没有已加入空间的成员");
+  const skipped = selected.value.length - rows.length;
+  const emails = rows.map((x) => x.email);
+  try {
+    await ElMessageBox.confirm(
+      `将把 ${emails.length} 个成员从 OpenAI 空间移除（上游真正踢出，释放席位）。` +
+        (skipped ? `\n\n另有 ${skipped} 个未加入空间的候选人被跳过。` : "") +
+        `\n\n踢出后本地会清掉成员身份和席位，账号仍保留为候选人。确定？`,
+      "踢出空间成员",
+      { type: "warning", confirmButtonText: "确认踢出", cancelButtonText: "取消", customClass: "reset-credit-confirm" }
+    );
+  } catch {
+    return;
+  }
+  setOperation(emails, "踢出空间中…");
+  try {
+    const r = await kickCandidates(workspaceId.value, emails);
+    ElMessage[r.failed ? "warning" : "success"](`已踢出 ${r.kicked || 0} 个${r.failed ? `，失败 ${r.failed}` : ""}`);
+    clearSelection();
+    await load();
+    await loadStats();
+  } catch (e) {
+    ElMessage.error("踢出失败: " + e.message);
+  } finally {
+    clearOperation(emails);
+  }
+}
+
+async function deleteEverywhere() {
+  const emails = selected.value.map((x) => x.email);
+  if (!emails.length) return ElMessage.warning("请选择候选人");
+  try {
+    await ElMessageBox.confirm(
+      `将从整个系统删除 ${emails.length} 个账号：\n` +
+        `· 所有空间的候选划分\n` +
+        `· 所有空间已获取的凭证\n` +
+        `· 注册结果\n` +
+        `· 邮箱号池\n\n` +
+        `删除后不可恢复，确定？`,
+      "删除账号",
+      { type: "warning", confirmButtonText: "确认删除（不可恢复）", cancelButtonText: "取消", customClass: "reset-credit-confirm" }
+    );
+  } catch {
+    return;
+  }
+  setOperation(emails, "删除中…");
+  try {
+    const r = await deleteCandidatesEverywhere(workspaceId.value, emails);
+    ElMessage.success(
+      `已删除 ${emails.length} 个账号（候选 ${r.candidates} / 凭证 ${r.credentials} / 注册结果 ${r.registered} / 号池 ${r.pool}）`
+    );
+    clearSelection();
+    await load();
+    await loadStats();
+  } catch (e) {
+    ElMessage.error("删除失败: " + e.message);
+  } finally {
+    clearOperation(emails);
+  }
+}
+
 async function runAssignAction(command) {
   if (command === "remove") return remove();
+  if (command === "delete_everywhere") return deleteEverywhere();
+  if (command === "kick") return kick();
   if (command === "trash") return moveToTrash();
   if (command === "restore_trash") return restoreFromTrash();
   if (command === "outbound") return setOutboundStatus("outbound", "标记出库");
@@ -1295,7 +1440,16 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       interval_minutes: quotaInterval.value,
       relogin_on_401: reloginOn401.value,
       proxy_pool: proxyList.value.join("\n"),
+      automation_paused: automationPaused.value,
       auto_push: autoPush.value,
+      auto_push_sub2api_enabled: autoPushSub2apiEnabled.value,
+      auto_push_cpa_enabled: autoPushCpaEnabled.value,
+      auto_push_sub2api_url: autoPushSub2apiUrl.value,
+      auto_push_sub2api_api_key: autoPushSub2apiApiKey.value,
+      auto_push_sub2api_group_ids: autoPushSub2apiGroupIds.value,
+      auto_push_cpa_url: autoPushCpaUrl.value,
+      auto_push_cpa_mgmt_key: autoPushCpaMgmtKey.value,
+      auto_push_skip_codex_seat: autoPushSkipCodexSeat.value,
       concurrency: taskConcurrency.value,
       otp_timeout: taskOtpTimeout.value,
       account_retry_count: taskRetry.value,
@@ -1316,6 +1470,8 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       prolite_seat_protect_refresh_time: proliteSeatProtectRefreshTime.value,
       auto_standard_seat_enabled: autoStandardSeatEnabled.value,
       auto_prolite_seat_enabled: autoProliteSeatEnabled.value,
+      auto_standard_seat_target: autoStandardSeatTarget.value,
+      auto_prolite_seat_target: autoProliteSeatTarget.value,
       auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
       auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
       auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
@@ -1351,7 +1507,16 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     nextQuotaAt.value = st.next_at || 0;
     quotaInterval.value = Number(c.interval_minutes || st.interval_minutes || 30);
     reloginOn401.value = Boolean(c.relogin_on_401);
+    automationPaused.value = Boolean(c.automation_paused);
     autoPush.value = Boolean(c.auto_push);
+    autoPushSub2apiEnabled.value = c.auto_push_sub2api_enabled !== false;
+    autoPushCpaEnabled.value = c.auto_push_cpa_enabled !== false;
+    autoPushSub2apiUrl.value = String(c.auto_push_sub2api_url || "");
+    autoPushSub2apiApiKey.value = String(c.auto_push_sub2api_api_key || "");
+    autoPushSub2apiGroupIds.value = String(c.auto_push_sub2api_group_ids || "");
+    autoPushCpaUrl.value = String(c.auto_push_cpa_url || "");
+    autoPushCpaMgmtKey.value = String(c.auto_push_cpa_mgmt_key || "");
+    autoPushSkipCodexSeat.value = c.auto_push_skip_codex_seat !== false;
     taskConcurrency.value = Number(c.concurrency || 1);
     taskOtpTimeout.value = Number(c.otp_timeout || 180);
     taskRetry.value = Number(c.account_retry_count || 1);
@@ -1374,6 +1539,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     proliteSeatProtectUsedCount.value = Number(c.prolite_seat_protect_used_count || 0);
     autoStandardSeatEnabled.value = Boolean(c.auto_standard_seat_enabled);
     autoProliteSeatEnabled.value = Boolean(c.auto_prolite_seat_enabled);
+    autoStandardSeatTarget.value = Math.max(0, Number(c.auto_standard_seat_target) || 0);
+    autoProliteSeatTarget.value = Math.max(0, Number(c.auto_prolite_seat_target) || 0);
     autoSeatIntervalMinutes.value = Math.min(1440, Math.max(1, Number(c.auto_seat_interval_minutes) || 5));
     autoSeatSwitchGapSeconds.value = Math.min(600, Math.max(0, Number(c.auto_seat_switch_gap_seconds ?? 30)));
     autoProliteCandidateSeatType.value = ["default", "usage_based", "all"].includes(String(c.auto_prolite_candidate_seat_type || "default"))
@@ -1397,7 +1564,16 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       nextQuotaAt.value = 0;
       quotaInterval.value = 30;
       reloginOn401.value = false;
+      automationPaused.value = false;
       autoPush.value = false;
+      autoPushSub2apiEnabled.value = true;
+      autoPushCpaEnabled.value = true;
+      autoPushSub2apiUrl.value = "";
+      autoPushSub2apiApiKey.value = "";
+      autoPushSub2apiGroupIds.value = "";
+      autoPushCpaUrl.value = "";
+      autoPushCpaMgmtKey.value = "";
+      autoPushSkipCodexSeat.value = true;
       taskConcurrency.value = 1;
       taskOtpTimeout.value = 180;
       taskRetry.value = 1;
@@ -1422,6 +1598,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoStandardSeatNextAt.value = 0;
       autoProliteSeatEnabled.value = false;
       autoProliteSeatNextAt.value = 0;
+      autoStandardSeatTarget.value = 0;
+      autoProliteSeatTarget.value = 0;
       autoSeatIntervalMinutes.value = 5;
       autoSeatSwitchGapSeconds.value = 30;
       autoProliteCandidateSeatType.value = "default";
@@ -1445,6 +1623,15 @@ async function toggleQuotaSchedule() {
         proxyList.value.join("\n"),
         autoPush.value,
         {
+          automation_paused: automationPaused.value,
+          auto_push_sub2api_enabled: autoPushSub2apiEnabled.value,
+          auto_push_cpa_enabled: autoPushCpaEnabled.value,
+          auto_push_sub2api_url: autoPushSub2apiUrl.value,
+          auto_push_sub2api_api_key: autoPushSub2apiApiKey.value,
+          auto_push_sub2api_group_ids: autoPushSub2apiGroupIds.value,
+          auto_push_cpa_url: autoPushCpaUrl.value,
+          auto_push_cpa_mgmt_key: autoPushCpaMgmtKey.value,
+          auto_push_skip_codex_seat: autoPushSkipCodexSeat.value,
           concurrency: taskConcurrency.value,
           otp_timeout: taskOtpTimeout.value,
           account_retry_count: taskRetry.value,
@@ -1465,6 +1652,8 @@ async function toggleQuotaSchedule() {
           prolite_seat_protect_refresh_time: proliteSeatProtectRefreshTime.value,
           auto_standard_seat_enabled: autoStandardSeatEnabled.value,
           auto_prolite_seat_enabled: autoProliteSeatEnabled.value,
+          auto_standard_seat_target: autoStandardSeatTarget.value,
+          auto_prolite_seat_target: autoProliteSeatTarget.value,
           auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
           auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
           auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
@@ -1713,7 +1902,16 @@ watch(
   [
     quotaInterval,
     reloginOn401,
+    automationPaused,
     autoPush,
+    autoPushSub2apiEnabled,
+    autoPushCpaEnabled,
+    autoPushSub2apiUrl,
+    autoPushSub2apiApiKey,
+    autoPushSub2apiGroupIds,
+    autoPushCpaUrl,
+    autoPushCpaMgmtKey,
+    autoPushSkipCodexSeat,
     taskConcurrency,
     taskOtpTimeout,
     taskRetry,
@@ -1760,6 +1958,23 @@ watch(autoSeatIntervalMinutes, (value) => {
 
 watch([autoStandardSeatEnabled, autoProliteSeatEnabled, autoProliteCandidateSeatType], queueSpaceSettingsSave);
 
+// 补齐目标：0 = 已购席位上限；填正数时不能超过已购上限（上限未同步到时由后端钳制）。
+watch(autoStandardSeatTarget, (value) => {
+  const cap = Number(currentWorkspace.value?.seats_default_entitled) || 0;
+  let target = Math.max(0, Math.round(Number(value) || 0));
+  if (cap > 0 && target > cap) target = cap;
+  if (value !== target) autoStandardSeatTarget.value = target;
+  queueSpaceSettingsSave();
+});
+
+watch(autoProliteSeatTarget, (value) => {
+  const cap = Number(currentWorkspace.value?.seats_prolite_entitled) || 0;
+  let target = Math.max(0, Math.round(Number(value) || 0));
+  if (cap > 0 && target > cap) target = cap;
+  if (value !== target) autoProliteSeatTarget.value = target;
+  queueSpaceSettingsSave();
+});
+
 watch(
   [accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter, searchKeyword],
   () => {
@@ -1768,6 +1983,14 @@ watch(
     if (workspaceId.value) load();
   }
 );
+
+// 候选管理/垃圾箱两个路由共用本组件，切换时把筛选重置到对应视图再重载。
+watch(isTrashView, () => {
+  page.value = 1;
+  clearSelection();
+  resetFilters();
+  if (workspaceId.value) load();
+});
 
 // 翻页不再清空选择：reserve-selection 会跨页保留勾选，清掉反而让跨页全选失效。
 // 每页条数变化会重排行序，此时保留选中容易与用户预期不符，故只在 pageSize 变化时清。
@@ -2090,7 +2313,7 @@ onBeforeUnmount(() => {
     <el-card shadow="never" class="main-card">
       <!-- 快捷分段视图 Tabs -->
       <div class="view-tabs-row">
-        <div class="quick-tabs">
+        <div v-if="!isTrashView" class="quick-tabs">
           <button
             class="tab-chip"
             :class="{ active: quickTab === 'all' }"
@@ -2147,6 +2370,18 @@ onBeforeUnmount(() => {
             </template>
           </el-input>
         </div>
+
+        <el-badge
+          v-if="!isTrashView"
+          :value="candidateStats.trash?.trashed_count || 0"
+          :hidden="!(candidateStats.trash?.trashed_count)"
+          class="trash-entry-badge"
+        >
+          <el-button size="small" type="danger" plain @click="goTrashView">
+            <Icon icon="lucide:trash-2" class="btn-icon" />
+            垃圾箱
+          </el-button>
+        </el-badge>
       </div>
 
       <!-- 多维精细筛选栏 -->
@@ -2191,7 +2426,7 @@ onBeforeUnmount(() => {
           </el-select>
         </div>
 
-        <div class="filter-item">
+        <div v-if="!isTrashView" class="filter-item">
           <span class="filter-label">垃圾箱</span>
           <el-select v-model="trashStatusFilter" clearable size="small" placeholder="全部" class="filter-select">
             <el-option label="正常" value="active" />
@@ -2220,8 +2455,47 @@ onBeforeUnmount(() => {
         </el-button>
       </div>
 
-      <!-- 批量工作流操作栏 (Workflow Action Bar) -->
-      <div class="action-toolbar">
+      <!-- 批量工作流操作栏 (Workflow Action Bar)：垃圾箱视图只保留恢复/删除/清空 -->
+      <div v-if="isTrashView" class="action-toolbar">
+        <div class="action-group-left">
+          <div class="workflow-btn-group">
+            <el-button size="small" @click="goCandidateView">
+              <Icon icon="lucide:arrow-left" class="btn-icon" />
+              返回候选管理
+            </el-button>
+            <el-button
+              type="primary"
+              plain
+              size="small"
+              :disabled="!selected.length"
+              @click="restoreFromTrash"
+            >
+              <Icon icon="lucide:undo-2" class="btn-icon" />
+              恢复选中成员
+            </el-button>
+            <el-button
+              type="danger"
+              plain
+              size="small"
+              :disabled="!selected.length"
+              @click="deleteEverywhere"
+            >
+              <Icon icon="lucide:trash-2" class="btn-icon" />
+              删除选中成员（全系统）
+            </el-button>
+            <el-button
+              type="danger"
+              size="small"
+              :loading="emptyingTrash"
+              @click="emptyTrash"
+            >
+              <Icon icon="lucide:trash" class="btn-icon" />
+              清空垃圾箱
+            </el-button>
+          </div>
+        </div>
+      </div>
+      <div v-else class="action-toolbar">
         <div class="action-group-left">
           <!-- 空间加入工作流 -->
           <div class="workflow-btn-group">
@@ -2375,9 +2649,11 @@ onBeforeUnmount(() => {
               <el-dropdown-menu>
                 <el-dropdown-item command="outbound">标记为已出库</el-dropdown-item>
                 <el-dropdown-item v-if="tagStatusFilter === 'outbound'" command="restore_outbound">恢复出库账号</el-dropdown-item>
-                <el-dropdown-item divided command="trash">移入垃圾箱</el-dropdown-item>
+                <el-dropdown-item divided command="kick" style="color: var(--el-color-warning)">踢出空间成员</el-dropdown-item>
+                <el-dropdown-item command="trash">移入垃圾箱</el-dropdown-item>
                 <el-dropdown-item command="restore_trash">移出垃圾箱</el-dropdown-item>
                 <el-dropdown-item divided command="remove" style="color: var(--el-color-danger)">移除当前空间划分</el-dropdown-item>
+                <el-dropdown-item command="delete_everywhere" style="color: var(--el-color-danger)">删除账号（全系统）</el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -2731,6 +3007,13 @@ onBeforeUnmount(() => {
       @close="queueSpaceSettingsSave"
     >
       <div class="settings-drawer-content">
+        <div class="setting-switch-row automation-pause-row">
+          <div class="switch-meta">
+            <span class="switch-title">暂停本空间全部自动化任务</span>
+            <span class="switch-desc">开启后定时额度、席位补齐、垃圾箱自动回收都暂停；手动操作不受影响</span>
+          </div>
+          <el-switch v-model="automationPaused" />
+        </div>
         <el-tabs v-model="settingsActiveTab" class="settings-tabs">
           <!-- Tab 1: 定时额度查询 -->
           <el-tab-pane label="定时额度" name="quota">
@@ -2768,6 +3051,81 @@ onBeforeUnmount(() => {
                     <span class="switch-desc">手动或自动获取 Team 凭证后推送到已配置的号池</span>
                   </div>
                   <el-switch v-model="autoPush" />
+                </div>
+                <div v-if="autoPush" class="setting-group-box">
+                  <div class="group-box-title">
+                    <Icon icon="lucide:send" class="box-icon" />
+                    <span>空间专属号池推送</span>
+                  </div>
+                  <el-form-item label="推送目标（可多选）">
+                    <el-checkbox v-model="autoPushSub2apiEnabled">Sub2API</el-checkbox>
+                    <el-checkbox v-model="autoPushCpaEnabled">CPA</el-checkbox>
+                  </el-form-item>
+                  <template v-if="autoPushSub2apiEnabled">
+                    <el-form-item label="Sub2API 地址">
+                      <el-input
+                        v-model="autoPushSub2apiUrl"
+                        placeholder="留空跟随全局导出配置"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item label="Sub2API API Key">
+                      <el-input
+                        v-model="autoPushSub2apiApiKey"
+                        type="password"
+                        show-password
+                        placeholder="留空跟随全局导出配置"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item label="Sub2API 推送号池（分组 ID）">
+                      <el-input
+                        v-model="autoPushSub2apiGroupIds"
+                        placeholder="留空跟随全局导出配置，如 2,5"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item>
+                      <el-button size="small" :loading="pushTestRunning.sub2api" @click="testPushTarget('sub2api')">
+                        测试 Sub2API 连通性
+                      </el-button>
+                    </el-form-item>
+                  </template>
+                  <template v-if="autoPushCpaEnabled">
+                    <el-form-item label="CPA 推送地址">
+                      <el-input
+                        v-model="autoPushCpaUrl"
+                        placeholder="留空跟随全局导出配置"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item label="CPA 管理密钥">
+                      <el-input
+                        v-model="autoPushCpaMgmtKey"
+                        type="password"
+                        show-password
+                        placeholder="留空跟随全局导出配置"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item>
+                      <el-button size="small" :loading="pushTestRunning.cpa" @click="testPushTarget('cpa')">
+                        测试 CPA 连通性
+                      </el-button>
+                    </el-form-item>
+                  </template>
+                  <div class="field-hint">
+                    仅本空间生效，每项留空都跟随「自动导出」里的全局配置；
+                    地址和密钥都配齐时，即使该目标全局未启用，本空间也会推送。
+                  </div>
+                </div>
+
+                <div class="setting-switch-row sub-row">
+                  <div class="switch-meta">
+                    <span class="switch-title">Codex 席位不进入自动推送</span>
+                    <span class="switch-desc">开启后 usage-based 成员获取凭证不自动推送；手动推送不受此限制</span>
+                  </div>
+                  <el-switch v-model="autoPushSkipCodexSeat" />
                 </div>
 
                 <div class="setting-switch-row sub-row">
@@ -2817,6 +3175,19 @@ onBeforeUnmount(() => {
                   </div>
                   <el-switch v-model="autoStandardSeatEnabled" @change="toggleAutoStandardSeat" />
                 </div>
+                <el-form label-position="top" class="settings-form sub-form">
+                  <el-form-item label="补齐目标席位数">
+                    <el-input-number
+                      v-model="autoStandardSeatTarget"
+                      :min="0"
+                      :max="Number(currentWorkspace?.seats_default_entitled) || 100000"
+                      style="width: 100%"
+                    />
+                    <div class="field-hint">
+                      0 表示补到已购席位上限（当前 {{ currentWorkspace?.seats_default_entitled ?? '未同步' }} 席）；也可填不超过上限的固定目标。
+                    </div>
+                  </el-form-item>
+                </el-form>
                 <div v-if="autoStandardSeatEnabled && autoStandardSeatNextAt" class="countdown-hint">
                   下次轮询：{{ new Date(autoStandardSeatNextAt * 1000).toLocaleString() }}
                 </div>
@@ -2836,6 +3207,17 @@ onBeforeUnmount(() => {
                 </div>
 
                 <el-form label-position="top" class="settings-form sub-form">
+                  <el-form-item label="补齐目标席位数">
+                    <el-input-number
+                      v-model="autoProliteSeatTarget"
+                      :min="0"
+                      :max="Number(currentWorkspace?.seats_prolite_entitled) || 100000"
+                      style="width: 100%"
+                    />
+                    <div class="field-hint">
+                      0 表示补到已购高级席位上限（当前 {{ currentWorkspace?.seats_prolite_entitled ?? '未同步' }} 席）；也可填不超过上限的固定目标。
+                    </div>
+                  </el-form-item>
                   <el-form-item label="目标候选人类型">
                     <el-select v-model="autoProliteCandidateSeatType" style="width: 100%">
                       <el-option label="标准席位" value="default" />
@@ -3385,6 +3767,12 @@ onBeforeUnmount(() => {
 
 .search-input-wrap {
   min-width: 240px;
+  flex: 1;
+}
+
+.trash-entry-badge {
+  flex-shrink: 0;
+  margin-left: 8px;
 }
 
 .search-icon {
@@ -3873,6 +4261,14 @@ onBeforeUnmount(() => {
 
 .setting-switch-row.sub-row {
   margin-top: 14px;
+}
+
+.automation-pause-row {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border-radius: var(--app-radius-md);
+  border: 1px solid var(--el-color-warning-light-5);
+  background: var(--el-color-warning-light-9);
 }
 
 .switch-meta {

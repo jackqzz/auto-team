@@ -281,7 +281,16 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     relogin_on_401: bool = False
     proxy_pool: str = ""
     quota_proxy_pool: str = Field("", description="候选人专属代理池；为空时回退到全局池")
+    automation_paused: bool = Field(False, description="暂停本空间全部自动化任务（定时额度/席位补齐/垃圾箱回收）")
     auto_push: bool = False
+    auto_push_sub2api_enabled: bool = Field(True, description="本空间自动推送是否启用 Sub2API 目标")
+    auto_push_cpa_enabled: bool = Field(True, description="本空间自动推送是否启用 CPA 目标")
+    auto_push_sub2api_url: str = Field("", description="空间专属 Sub2API 地址；留空跟随全局导出配置")
+    auto_push_sub2api_api_key: str = Field("", description="空间专属 Sub2API API Key；留空跟随全局导出配置")
+    auto_push_sub2api_group_ids: str = Field("", description="自动推送的 Sub2API 号池分组 ID（如 '2,5'）；留空跟随全局导出配置")
+    auto_push_cpa_url: str = Field("", description="空间专属 CPA 地址；留空跟随全局导出配置")
+    auto_push_cpa_mgmt_key: str = Field("", description="空间专属 CPA 管理密钥；留空跟随全局导出配置")
+    auto_push_skip_codex_seat: bool = Field(True, description="Codex/Usage-based 席位跳过自动推送；仅影响自动流程，手动推送不受限")
     concurrency: int = Field(1, ge=1, le=20)
     otp_timeout: int = Field(180, ge=10, le=600)
     account_retry_count: int = Field(1, ge=1, le=5)
@@ -304,6 +313,8 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     prolite_seat_protect_refresh_time: str = Field("00:00", description="高级席位保护阈值刷新时间（HH:MM，CST）")
     auto_standard_seat_enabled: bool = False
     auto_prolite_seat_enabled: bool = False
+    auto_standard_seat_target: int = Field(0, ge=0, le=100000, description="标准席位补齐目标；0 表示已购席位上限")
+    auto_prolite_seat_target: int = Field(0, ge=0, le=100000, description="高级席位补齐目标；0 表示已购席位上限")
     auto_seat_interval_minutes: int = Field(5, ge=1, le=1440, description="自动补齐席位轮询周期（分钟）")
     auto_seat_switch_gap_seconds: int = Field(30, ge=0, le=600, description="串行补齐时两次成员席位切换的间隔（秒）")
     auto_prolite_candidate_seat_type: str = Field("default", description="自动补齐高级席位的候选人席位类型")
@@ -971,6 +982,11 @@ def _workspace_settings_snapshot(workspace_id: int, overrides: dict | None = Non
     return cfg
 
 
+def _workspace_automation_paused(settings: dict | None) -> bool:
+    """空间级自动化总开关：暂停时定时额度/席位补齐/垃圾箱回收都空转。"""
+    return bool((settings or {}).get("automation_paused"))
+
+
 def _workspace_exists(workspace_id: int) -> bool:
     """Return whether a workspace has been marked for deletion.
 
@@ -1325,6 +1341,12 @@ def _quota_worker(workspace_id: int, interval: int, stop: threading.Event, relog
             )
             return
         settings = _workspace_settings_snapshot(workspace_id)
+        if _workspace_automation_paused(settings):
+            logging.getLogger("workspace_membership").info(
+                "空间自动化已暂停，定时额度查询空转 workspace=%s", workspace_id
+            )
+            stop.wait(interval * 60)
+            continue
         trash_delay = _candidate_trash_delay_seconds(workspace_id, settings)
         trash_window = _candidate_trash_zero_quota_window(workspace_id, settings)
         network_retries = _candidate_quota_network_retries(workspace_id, settings)
@@ -2086,6 +2108,25 @@ def _auto_seat_switch_gap_seconds(settings: dict | None) -> int:
     return db.normalize_gap_seconds((settings or {}).get("auto_seat_switch_gap_seconds"), 30)
 
 
+def _auto_seat_target(settings: dict | None, key: str, entitled: int) -> int:
+    """本轮补齐要补到的目标席位数。
+
+    设置值 0（或缺失）表示跟随已购席位上限；正数作为固定目标，但仍钳制到
+    不超过已购上限——上游只允许补到 entitled。
+    """
+    try:
+        entitled = int(entitled or 0)
+    except (TypeError, ValueError):
+        entitled = 0
+    try:
+        configured = int((settings or {}).get(key) or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    if configured <= 0:
+        return entitled
+    return min(entitled, configured)
+
+
 def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
     logger.info("自动标准席位任务启动 workspace_db_id=%s", workspace_id)
     try:
@@ -2094,6 +2135,10 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                 logger.info("母号已删除，停止自动标准席位任务 workspace_db_id=%s", workspace_id)
                 return
             settings = _workspace_settings_snapshot(workspace_id)
+            if _workspace_automation_paused(settings):
+                logger.info("空间自动化已暂停，自动标准席位空转 workspace_db_id=%s", workspace_id)
+                stop.wait(_auto_seat_interval_seconds(settings))
+                continue
             if not settings.get("auto_standard_seat_enabled"):
                 logger.info("自动标准席位任务已关闭 workspace_db_id=%s", workspace_id)
                 return
@@ -2120,7 +2165,8 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                 else (seat_info.get("seats_entitled") or 0)
             )
             current_default = int(seat_info.get("seats_default") or 0)
-            if entitled <= 0 or current_default >= entitled:
+            target = _auto_seat_target(settings, "auto_standard_seat_target", entitled)
+            if target <= 0 or current_default >= target:
                 stop.wait(_auto_seat_interval_seconds(settings))
                 continue
 
@@ -2131,6 +2177,9 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                     logger.info("母号已删除，停止自动标准席位任务 workspace_db_id=%s", workspace_id)
                     break
                 settings = _workspace_settings_snapshot(workspace_id)
+                if _workspace_automation_paused(settings):
+                    logger.info("空间自动化已暂停，自动标准席位停止本轮 workspace_db_id=%s", workspace_id)
+                    break
                 if _workspace_seat_protect_exhausted(settings):
                     logger.info(
                         "自动标准席位任务达到席位保护阈值，停止本轮 workspace_db_id=%s used=%s threshold=%s",
@@ -2152,7 +2201,7 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                     else (seat_info.get("seats_entitled") or 0)
                 )
                 current_default = int(seat_info.get("seats_default") or 0)
-                deficit = max(0, entitled - current_default)
+                deficit = max(0, _auto_seat_target(settings, "auto_standard_seat_target", entitled) - current_default)
                 if deficit <= 0:
                     break
                 candidates = _workspace_auto_standard_candidates(workspace_id, attempted)
@@ -2225,6 +2274,10 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 logger.info("母号已删除，停止自动高级席位任务 workspace_db_id=%s", workspace_id)
                 return
             settings = _workspace_settings_snapshot(workspace_id)
+            if _workspace_automation_paused(settings):
+                logger.info("空间自动化已暂停，自动高级席位空转 workspace_db_id=%s", workspace_id)
+                stop.wait(_auto_seat_interval_seconds(settings))
+                continue
             if not settings.get("auto_prolite_seat_enabled"):
                 logger.info("自动高级席位任务已关闭 workspace_db_id=%s", workspace_id)
                 return
@@ -2253,7 +2306,8 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 continue
             entitled = int(entitled or 0)
             current_prolite = int(current_prolite or 0)
-            if entitled <= 0 or current_prolite >= entitled:
+            target = _auto_seat_target(settings, "auto_prolite_seat_target", entitled)
+            if target <= 0 or current_prolite >= target:
                 stop.wait(_auto_seat_interval_seconds(settings))
                 continue
 
@@ -2264,6 +2318,9 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                     logger.info("母号已删除，停止自动高级席位任务 workspace_db_id=%s", workspace_id)
                     break
                 settings = _workspace_settings_snapshot(workspace_id)
+                if _workspace_automation_paused(settings):
+                    logger.info("空间自动化已暂停，自动高级席位停止本轮 workspace_db_id=%s", workspace_id)
+                    break
                 if _workspace_prolite_seat_protect_exhausted(settings):
                     logger.info(
                         "自动高级席位任务达到高级席位保护阈值，停止本轮 workspace_db_id=%s used=%s threshold=%s",
@@ -2283,7 +2340,7 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 current_prolite = seat_info.get("seats_prolite")
                 if entitled is None or current_prolite is None:
                     break
-                deficit = max(0, int(entitled or 0) - int(current_prolite or 0))
+                deficit = max(0, _auto_seat_target(settings, "auto_prolite_seat_target", entitled) - int(current_prolite or 0))
                 if deficit <= 0:
                     break
                 candidates = _workspace_auto_prolite_candidates(
@@ -2373,6 +2430,9 @@ def _reconcile_invalid_candidate_trash(limit: int = 500) -> dict:
         if settings is None:
             settings = db.get_workspace_settings(workspace_id)
             settings_by_workspace[workspace_id] = settings
+        if _workspace_automation_paused(settings):
+            skipped += 1
+            continue
         if not _candidate_trash_invalid_enabled(workspace_id, settings):
             skipped += 1
             continue
@@ -2446,6 +2506,8 @@ def _trash_sweeper_worker():
                     # relogin, or seat-switch request for that stale row.
                     continue
                 settings = _workspace_settings_snapshot(workspace_id)
+                if _workspace_automation_paused(settings):
+                    continue
                 gap = _candidate_trash_gap_seconds(workspace_id, settings)
                 if last_row_trashed and gap:
                     logger.info(
@@ -2977,6 +3039,47 @@ def _process_scheduled_trash_due(
     return False
 
 
+@app.post("/api/workspace-candidates/kick")
+def api_kick_workspace_candidates(req: WorkspaceCandidatesReq):
+    """把候选人从 OpenAI 空间移除：上游 DELETE users/{member_id}，成功后在本地清成员身份。"""
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    indexed = _workspace_candidate_index(req.workspace_id)
+    emails = list(dict.fromkeys(
+        email.strip().lower()
+        for email in req.emails
+        if email.strip() and email.strip().lower() in indexed
+    ))
+    if not emails:
+        raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    results = []
+    for email in emails:
+        row = indexed.get(email) or {}
+        member_id = str(row.get("member_id") or "").strip()
+        try:
+            result = workspace_membership.remove_member(req.workspace_id, email, member_id)
+            ok = bool(result.get("kicked") or result.get("already_gone"))
+            if ok:
+                # 人已离开空间：本地清掉成员身份和席位，加入状态回到未邀请。
+                db.update_workspace_candidate_member(req.workspace_id, email, "", "")
+                db.update_workspace_candidate_join_statuses(req.workspace_id, [email], "not_invited")
+            results.append({
+                "email": email,
+                "ok": ok,
+                "result": result,
+                "error": "" if ok else result.get("error") or "未找到空间成员记录",
+            })
+        except Exception as exc:
+            logger.exception("踢出空间成员失败 workspace_db_id=%s email=%s", req.workspace_id, email)
+            results.append({"email": email, "ok": False, "error": str(exc)})
+    return {
+        "ok": not any(not item.get("ok") for item in results),
+        "results": results,
+        "kicked": sum(1 for item in results if item.get("ok")),
+        "failed": sum(1 for item in results if not item.get("ok")),
+    }
+
+
 @app.post("/api/workspace-candidates/trash")
 def api_trash_workspace_candidates(req: WorkspaceCandidatesReq):
     if not req.emails:
@@ -3029,6 +3132,16 @@ def api_restore_workspace_candidates_from_trash(req: WorkspaceCandidatesReq):
         "restored": restored,
         "skipped": len(emails) - restored,
     }
+
+
+@app.post("/api/workspace-candidates/trash/empty")
+def api_empty_workspace_trash(req: WorkspaceCandidatesReq):
+    """清空垃圾箱：把该空间垃圾箱内全部账号从整个系统删除。"""
+    emails = db.list_trashed_workspace_candidate_emails(req.workspace_id)
+    if not emails:
+        return {"ok": True, "deleted": 0}
+    counts = db.delete_account_everywhere(emails)
+    return {"ok": True, "deleted": len(emails), **counts}
 
 
 def _lease_reset_credit_proxy(req: WorkspaceResetCreditReq, email: str, detail: str) -> str:
@@ -3206,6 +3319,15 @@ def api_assign_workspace_candidates(req: WorkspaceCandidatesReq):
 @app.post("/api/workspace-candidates/remove")
 def api_remove_workspace_candidates(req: WorkspaceCandidatesReq):
     return {"ok": True, "removed": db.remove_workspace_candidates(req.workspace_id, req.emails)}
+
+
+@app.post("/api/workspace-candidates/delete-everywhere")
+def api_delete_workspace_candidates_everywhere(req: WorkspaceCandidatesReq):
+    """删除账号：所有空间的候选划分和空间凭证、注册结果、号池行一起清掉。"""
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    counts = db.delete_account_everywhere(req.emails)
+    return {"ok": True, "deleted": len(req.emails), **counts}
 
 
 @app.post("/api/workspace-candidates/tag-status")
@@ -3824,6 +3946,45 @@ def api_save_workspace_candidate_settings(req: WorkspaceQuotaScheduleReq):
             settings[key] = value
     db.update_workspace_settings(req.workspace_id, settings)
     return {"ok": True}
+
+
+class WorkspacePushTestReq(BaseModel):
+    workspace_id: int
+    target: str = Field(..., description="推送目标：cpa / sub2api")
+
+
+@app.post("/api/workspace-candidates/push-test")
+def api_workspace_push_test(req: WorkspacePushTestReq):
+    """按「空间专属覆盖 + 全局兜底」后的生效配置，测试推送目标连通性。"""
+    from . import exporter
+
+    target = str(req.target or "").strip().lower()
+    cfg = db.get_export_internal_config()
+    settings = db.get_workspace_settings(req.workspace_id)
+
+    def _merged(base_key: str, pairs: tuple[tuple[str, str], ...]) -> dict:
+        merged = dict(cfg.get(base_key) or {})
+        for setting_key, cfg_key in pairs:
+            value = str(settings.get(setting_key) or "").strip()
+            if value:
+                merged[cfg_key] = value
+        return merged
+
+    try:
+        if target == "sub2api":
+            return {"ok": True, "result": exporter.test_sub2api(_merged("sub2api", (
+                ("auto_push_sub2api_url", "sub2api_url"),
+                ("auto_push_sub2api_api_key", "sub2api_api_key"),
+                ("auto_push_sub2api_group_ids", "sub2api_group_ids"),
+            )))}
+        if target == "cpa":
+            return {"ok": True, "result": exporter.test_cpa(_merged("cpa", (
+                ("auto_push_cpa_url", "cpa_url"),
+                ("auto_push_cpa_mgmt_key", "cpa_mgmt_key"),
+            )))}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    raise HTTPException(400, f"未知推送目标: {req.target}")
 
 
 @app.post("/api/workspace-candidates/credentials")

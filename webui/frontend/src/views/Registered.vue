@@ -759,7 +759,8 @@ onActivated(() => load())
             { label: 'Plus生效', value: 'plus_active', icon: 'lucide:sparkles' },
             { label: '可领Plus', value: 'plus_eligible', icon: 'lucide:gift' },
             { label: '永久失效', value: 'permanently_invalid', icon: 'lucide:ban' },
-            { label: '凭证失效', value: 'token_invalid', icon: 'lucide:shield-alert' }
+            { label: '凭证失效', value: 'token_invalid', icon: 'lucide:shield-alert' },
+            { label: '未划分工作空间', value: 'no_workspace', icon: 'lucide:briefcase' }
           ]"
           :key="item.value"
           class="segment-tab-btn"

@@ -78,6 +78,12 @@ const routes = [
     meta: { title: '候选管理', icon: 'User', group: '空间' },
   },
   {
+    path: '/workspace-candidates/trash',
+    name: 'workspace-candidates-trash',
+    component: () => import('@/views/CandidateManagement.vue'),
+    meta: { title: '垃圾箱', icon: 'Delete', group: '空间', trash: true, hideInMenu: true },
+  },
+  {
     path: '/settings/mail',
     name: 'mail',
     component: () => import('@/views/MailConfig.vue'),

@@ -637,7 +637,21 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     # 候选人专属代理池：为空时回退到 proxy_pool（即前端同步下来的全局池），
     # 非空时额度查询/401 重登录/凭证获取都改走它，与全局池解绑。
     "quota_proxy_pool": "",
+    # 暂停本空间全部自动化任务：定时额度、席位补齐、垃圾箱自动回收。
+    "automation_paused": False,
     "auto_push": False,
+    # 空间专属的号池推送目标开关：勾选才推送对应目标，可两个都开。
+    "auto_push_sub2api_enabled": True,
+    "auto_push_cpa_enabled": True,
+    # 空间专属的 Sub2API 号池推送配置；每项留空都跟随全局导出配置。
+    "auto_push_sub2api_url": "",
+    "auto_push_sub2api_api_key": "",
+    "auto_push_sub2api_group_ids": "",
+    # 空间专属的 CPA 推送配置；每项留空都跟随全局导出配置。
+    "auto_push_cpa_url": "",
+    "auto_push_cpa_mgmt_key": "",
+    # Codex/Usage-based 席位是否跳过自动推送。只影响自动流程，手动推送不受此限。
+    "auto_push_skip_codex_seat": True,
     "concurrency": 1,
     "otp_timeout": 180,
     "account_retry_count": 1,
@@ -668,6 +682,10 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "prolite_seat_protect_window_key": "",
     "auto_standard_seat_enabled": False,
     "auto_prolite_seat_enabled": False,
+    # 补齐目标席位数：0 表示跟随已购席位上限（entitled），正数则作为固定目标，
+    # 生效时仍会被钳制到不超过已购上限。
+    "auto_standard_seat_target": 0,
+    "auto_prolite_seat_target": 0,
     "auto_seat_interval_minutes": 5,
     # 席位补齐是串行的：每切换一个成员后等待这么多秒再切下一个。
     "auto_seat_switch_gap_seconds": 30,
@@ -1275,6 +1293,7 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
                 "protect_threshold": int(settings.get("seat_protect_threshold") or 8),
                 "protect_refresh_time": str(settings.get("seat_protect_refresh_time") or "00:00"),
                 "protect_window_key": str(settings.get("seat_protect_window_key") or ""),
+                "target": int(settings.get("auto_standard_seat_target") or 0),
             },
             "prolite": {
                 "count": int(data.get("prolite_seat_count") or 0),
@@ -1285,6 +1304,7 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
                 "protect_threshold": int(settings.get("prolite_seat_protect_threshold") or 8),
                 "protect_refresh_time": str(settings.get("prolite_seat_protect_refresh_time") or "00:00"),
                 "protect_window_key": str(settings.get("prolite_seat_protect_window_key") or ""),
+                "target": int(settings.get("auto_prolite_seat_target") or 0),
             },
             "codex": {
                 "count": int(data.get("codex_seat_count") or 0),
@@ -1433,6 +1453,16 @@ def update_workspace_candidate_trash(
         )
         con.commit()
         return rc.rowcount > 0
+
+
+def list_trashed_workspace_candidate_emails(workspace_master_id: int) -> list[str]:
+    """返回指定空间垃圾箱内全部候选人的邮箱。"""
+    rows = _conn().execute(
+        "SELECT email FROM workspace_candidates "
+        "WHERE workspace_master_id=? AND COALESCE(trash_status, 'active')='trashed'",
+        (int(workspace_master_id),),
+    ).fetchall()
+    return [str(r["email"]) for r in rows]
 
 
 def restore_workspace_candidates_from_trash(
@@ -2959,6 +2989,9 @@ def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[st
         # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
         # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
         conditions.append("extra_json LIKE '%\"token_invalid\"%'")
+    elif filt == "no_workspace":
+        # 还没划分进任何母号空间的注册结果。
+        conditions.append("email NOT IN (SELECT email FROM workspace_candidates)")
     if group_name is not None and group_name != "__all__":
         conditions.append("group_name=?")
         args.append(_normalize_group_name(group_name))
@@ -3314,6 +3347,30 @@ def delete_all_registered() -> int:
         rc = con.execute("DELETE FROM registered")
         con.commit()
         return rc.rowcount
+
+
+def delete_account_everywhere(emails: list[str]) -> dict:
+    """把账号从整个系统删掉：所有空间的候选划分、空间凭证、注册结果、号池。
+
+    一个事务里删四张表，避免「删了一半」的中间态。
+    """
+    cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
+    counts = {"candidates": 0, "credentials": 0, "registered": 0, "pool": 0}
+    if not cleaned:
+        return counts
+    marks = ",".join("?" * len(cleaned))
+    with _lock:
+        con = _conn()
+        for table, key in (
+            ("workspace_candidates", "candidates"),
+            ("workspace_credentials", "credentials"),
+            ("registered", "registered"),
+            ("outlook_accounts", "pool"),
+        ):
+            rc = con.execute(f"DELETE FROM {table} WHERE email IN ({marks})", cleaned)
+            counts[key] = rc.rowcount
+        con.commit()
+    return counts
 
 
 # ──────────────────────── 运行记录 ────────────────────────

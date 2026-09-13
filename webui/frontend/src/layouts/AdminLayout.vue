@@ -22,6 +22,7 @@ const groups = computed(() => {
   const map = {}
   for (const r of router.getRoutes()) {
     if (r.meta?.public && !r.meta?.showInMenu) continue
+    if (r.meta?.hideInMenu) continue
     if (!r.meta?.title) continue
     const g = r.meta.group || '其他'
     ;(map[g] ||= []).push(r)
@@ -34,7 +35,7 @@ const crumb = computed(() => [route.meta.group, route.meta.title].filter(Boolean
 
 const menuOptions = computed(() =>
   router.getRoutes()
-    .filter((r) => r.meta?.title && (!r.meta?.public || r.meta?.showInMenu))
+    .filter((r) => r.meta?.title && !r.meta?.hideInMenu && (!r.meta?.public || r.meta?.showInMenu))
     .map((r) => ({ value: r.path, label: `${r.meta.group} / ${r.meta.title}` })),
 )
 const search = ref('')

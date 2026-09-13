@@ -5,7 +5,9 @@ export const listCandidateGroups = (workspace_id) => http.get('/api/workspace-ca
 export const listCandidates = (workspace_id) => http.get('/api/workspace-candidates', { params: { workspace_id } })
 export const assignCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/assign', { workspace_id, emails })
 export const removeCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/remove', { workspace_id, emails })
+export const deleteCandidatesEverywhere = (workspace_id, emails) => http.post('/api/workspace-candidates/delete-everywhere', { workspace_id, emails })
 export const updateCandidateTagStatus = (workspace_id, emails, tag_status) => http.post('/api/workspace-candidates/tag-status', { workspace_id, emails, tag_status })
+export const kickCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/kick', { workspace_id, emails })
 // 母号批量邀请会在上游邀请后逐个复查候选状态，处理时间随邀请人数增长。
 // 后端一次邀请的时间下限 = 邀请请求 60s + 复查前等待 5s + 邀请列表复查 60s，
 // 所以前端保底必须 >125s，否则浏览器会在后端还没写回状态时就中断，
@@ -35,10 +37,12 @@ export const stopAutoAdvancedSeatSchedule = stopAutoProliteSeatSchedule
 export const autoAdvancedSeatScheduleStatus = autoProliteSeatScheduleStatus
 export const listWorkspaceTaskLogs = (workspace_id, limit = 120) => http.get('/api/workspace-candidates/task-logs', { params: { workspace_id, limit } })
 export const saveCandidateSettings = (payload) => http.post('/api/workspace-candidates/settings', payload)
+export const testWorkspacePushTarget = (workspace_id, target) => http.post('/api/workspace-candidates/push-test', { workspace_id, target })
 export const fetchWorkspaceCredentials = (workspace_id, emails, proxy_pool, seat_type = 'default', auto_push = false, params = {}) => http.post('/api/workspace-candidates/credentials', { workspace_id, emails, proxy_pool, seat_type, auto_push, ...params })
 export const loginOnlyWorkspace = (workspace_id, emails, proxy_pool, seat_type = 'default', params = {}) => http.post('/api/workspace-candidates/login-only', { workspace_id, emails, proxy_pool, seat_type, ...params })
 export const trashCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/trash', { workspace_id, emails })
 export const restoreCandidatesFromTrash = (workspace_id, emails) => http.post('/api/workspace-candidates/trash/restore', { workspace_id, emails })
+export const emptyWorkspaceTrash = (workspace_id) => http.post('/api/workspace-candidates/trash/empty', { workspace_id })
 // 额度重置券。list 是只读的，consume 会不可逆地烧掉一张券，所以后端只接受单个
 // email，前端也必须先 list 让用户确认再 consume。
 export const listResetCredits = (workspace_id, email, proxy_pool = '') => http.get('/api/workspace-candidates/reset-credits', { params: { workspace_id, email, proxy_pool } })

@@ -813,10 +813,19 @@ def _do_register(
         if is_pooled and not login_only:
             db.mark_done(email)
 
-        # Codex/Usage-based 成员不进入自动推送号池。Team 凭证仍然正常保存，
-        # 但自动导出只对标准席位生效；手动导出接口不受此限制。
+        # Codex/Usage-based 成员是否进入自动推送由空间设置
+        # auto_push_skip_codex_seat 控制（默认跳过）。Team 凭证仍然正常保存；
+        # 手动导出接口不走这里，天然不受此开关限制。
         skip_auto_export = False
+        skip_codex_seat = True
         if target_workspace and not _skip_workspace_credential:
+            try:
+                skip_codex_seat = bool(
+                    db.get_workspace_settings(master["id"]).get("auto_push_skip_codex_seat", True)
+                )
+            except Exception:
+                skip_codex_seat = True
+        if skip_codex_seat and target_workspace and not _skip_workspace_credential:
             from . import workspace_membership
 
             try:
@@ -941,6 +950,67 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
 
     cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
     sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled"))
+
+    # 空间级号池推送：空间可单独勾选 SUB2/CPA 目标（可都开，默认全开跟随
+    # 全局启用状态），并可用空间专属的地址/密钥/分组覆盖全局导出配置。
+    # 空间自己配齐 URL+Key 时，即使全局开关关着，本空间该目标也照常推送。
+    workspace_db_id = (options or {}).get("workspace_db_id")
+    if workspace_db_id:
+        try:
+            ws_settings = db.get_workspace_settings(int(workspace_db_id))
+            space_sub2api_on = bool(ws_settings.get("auto_push_sub2api_enabled", True))
+            space_cpa_on = bool(ws_settings.get("auto_push_cpa_enabled", True))
+            if space_sub2api_on:
+                overrides = {}
+                for setting_key, cfg_key in (
+                    ("auto_push_sub2api_url", "sub2api_url"),
+                    ("auto_push_sub2api_api_key", "sub2api_api_key"),
+                    ("auto_push_sub2api_group_ids", "sub2api_group_ids"),
+                ):
+                    value = str(ws_settings.get(setting_key) or "").strip()
+                    if value:
+                        overrides[cfg_key] = value
+                if overrides:
+                    cfg["sub2api"] = {**cfg.get("sub2api", {}), **overrides}
+                    if not sub2api_enabled and overrides.get("sub2api_url") and overrides.get("sub2api_api_key"):
+                        cfg["sub2api"]["enabled"] = True
+                    logging.getLogger("registrar").info(
+                        "[export] 使用空间专属 Sub2API 推送配置 keys=%s workspace_db_id=%s",
+                        sorted(overrides), workspace_db_id,
+                    )
+            else:
+                sub2api_enabled = False
+            if space_cpa_on:
+                overrides = {}
+                for setting_key, cfg_key in (
+                    ("auto_push_cpa_url", "cpa_url"),
+                    ("auto_push_cpa_mgmt_key", "cpa_mgmt_key"),
+                ):
+                    value = str(ws_settings.get(setting_key) or "").strip()
+                    if value:
+                        overrides[cfg_key] = value
+                if overrides:
+                    cfg["cpa"] = {**cfg.get("cpa", {}), **overrides}
+                    if not cpa_enabled and overrides.get("cpa_url") and overrides.get("cpa_mgmt_key"):
+                        cfg["cpa"]["enabled"] = True
+                    logging.getLogger("registrar").info(
+                        "[export] 使用空间专属 CPA 推送配置 keys=%s workspace_db_id=%s",
+                        sorted(overrides), workspace_db_id,
+                    )
+            else:
+                cpa_enabled = False
+            sub2api_enabled = sub2api_enabled or bool(
+                space_sub2api_on and cfg.get("sub2api", {}).get("enabled")
+            )
+            cpa_enabled = cpa_enabled or bool(
+                space_cpa_on and cfg.get("cpa", {}).get("enabled")
+            )
+        except Exception as e:
+            logging.getLogger("registrar").warning(
+                "[export] 读取空间推送配置失败，回退全局配置 workspace_db_id=%s err=%s",
+                workspace_db_id, e,
+            )
+
     if not (cpa_enabled or sub2api_enabled):
         logging.getLogger("registrar").info(
             "[export] 本次任务未配置或未启用 CPA/SUB2API，跳过自动推送"

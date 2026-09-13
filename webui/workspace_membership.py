@@ -652,9 +652,10 @@ def invite_candidates(workspace_db_id: int, emails: list[str], seat_type: str = 
     if seat_type not in {"default", "usage_based", "prolite"}:
         raise ValueError("席位类型只能是标准席位、Usage-based 或 ProLite")
     count = len(emails)
-    # 下限跟随 WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS：原来卡在 30s，比上游批量邀请
-    # 的实际耗时还短，请求会在上游处理完之前就被本地掐断，邀请其实已发出却报网络超时。
-    req_timeout = max(WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS, min(300, 20 + count * 2))
+    # 邀请是上游同步处理：回包前要逐个建邀请，小批次也经常超过 60s 才返回。
+    # 下限放到 120s（60s 实测会掐断仍在处理中的请求，curl 28 / 0 bytes），
+    # 再按批次爬坡、封顶 300s；重试靠 resend_emails 幂等，重复提交安全。
+    req_timeout = max(120, min(300, 60 + count * 4))
     logger.info("母号批量邀请开始 workspace_db_id=%s workspace_id=%s seat_type=%s count=%s timeout=%ss emails=%s", workspace_db_id, workspace_id, seat_type, count, req_timeout, emails[:20])
     try:
         response = _workspace_admin_request(
@@ -968,6 +969,39 @@ def fetch_candidate_seats_bulk(
         total or 0,
     )
     return out
+
+def remove_member(workspace_db_id: int, email: str, member_id: str = "") -> dict:
+    """把成员从空间移除（上游 DELETE users/{member_id}）。
+
+    member_id 缺省时先回查成员列表再取；查不到说明人已不在空间，视为已踢出。
+    """
+    session, master = create_workspace_http_session(workspace_db_id)
+    wid = str(master.get("workspace_id") or "").strip()
+    token = str(master.get("access_token") or "").strip()
+    if not wid or not token:
+        raise RuntimeError("母号缺少 Workspace ID 或 Access Token")
+    member_id = str(member_id or "").strip()
+    key = str(email or "").strip().lower()
+    if not member_id and key:
+        member_id = str(fetch_candidate_seats(workspace_db_id, [key]).get(key, {}).get("member_id") or "").strip()
+    if not member_id:
+        logger.info("踢出空间成员：未找到 member_id（可能已不在空间） workspace_db_id=%s email=%s", workspace_db_id, key)
+        return {"member_id": "", "kicked": False, "already_gone": True}
+    response = _workspace_admin_request(
+        workspace_db_id,
+        session,
+        "delete",
+        f"{BASE}/backend-api/accounts/{wid}/users/{member_id}",
+        headers={**_headers(token, wid), "Referer": f"{BASE}/admin/members"},
+        timeout=WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS,
+    )
+    try:
+        data = _json(response)
+    except Exception:
+        data = {}
+    logger.info("踢出空间成员 workspace_db_id=%s email=%s member_id=%s status=%s", workspace_db_id, key, member_id, response.status_code)
+    return {"member_id": member_id, "kicked": True, "result": data}
+
 
 def update_member_seat_type(workspace_db_id: int, member_id: str, seat_type: str) -> dict:
     if seat_type not in {"default", "usage_based", "prolite"}: raise ValueError("席位类型只能是 default、usage_based 或 prolite")

@@ -39,7 +39,8 @@ class InviteTimeoutTests(unittest.TestCase):
 
     def test_invite_timeout_still_scales_with_batch_size_and_is_capped(self):
         # 大批量仍然要按人数增长，但不能无上限
-        self.assertEqual(self._invite(100), 220)
+        self.assertEqual(self._invite(30), 180)
+        self.assertEqual(self._invite(60), 300)
         self.assertEqual(self._invite(500), 300)
 
     def test_membership_recheck_requests_use_the_same_floor(self):
