@@ -7,6 +7,8 @@ import { storeToRefs } from "pinia";
 import { useProxyStore } from "@/stores/proxy";
 import { listWorkspaceMasters, syncWorkspace, syncWorkspaceMembers } from "@/api/workspaces";
 import { listExportFormats, exportRegistered, pushRegisteredToCpa } from "@/api/register";
+import { generateRedeemCodes } from "@/api/redeemCodes";
+import { getCpaExportTemplate, saveCpaExportTemplate } from "@/api/settings";
 import { copyText, fmtTime } from "@/api/request";
 import { PLAIN_CREDENTIAL_MODE_STORAGE_KEY } from "@/utils/credentialCrypto";
 import {
@@ -21,6 +23,7 @@ import {
   checkCandidates,
   fetchWorkspaceCredentials,
   loginOnlyWorkspace,
+  acceptWorkspaceInvite,
   queryCandidateQuota,
   updateCandidateSeat,
   startQuotaSchedule,
@@ -40,6 +43,8 @@ import {
   kickCandidates,
   restoreCandidatesFromTrash,
   emptyWorkspaceTrash,
+  listCandidateTags,
+  setCandidateTags,
   listResetCredits,
   consumeResetCredit,
 } from "@/api/workspaceCandidates";
@@ -96,6 +101,8 @@ const autoPushSub2apiApiKey = ref("");
 const autoPushSub2apiGroupIds = ref("");
 const autoPushCpaUrl = ref("");
 const autoPushCpaMgmtKey = ref("");
+const cpaStaticProxyEnabled = ref(false);
+const cpaStaticProxyPool = ref("");
 const autoPushSkipCodexSeat = ref(true);
 const pushTestRunning = ref({ sub2api: false, cpa: false });
 
@@ -174,6 +181,10 @@ const autoProliteCandidateSeatType = ref("default");
 const autoStandardSeatTarget = ref(0);
 const autoProliteSeatTarget = ref(0);
 
+// 批量踢出成员的随机等待范围（秒）
+const kickDelayMinSeconds = ref(2);
+const kickDelayMaxSeconds = ref(5);
+
 const candidateStats = ref({
   workspace_id: null,
   total_candidates: 0,
@@ -237,10 +248,64 @@ const seatTypeFilter = ref("");
 const trashStatusFilter = ref(isTrashView.value ? "trashed" : "active");
 const tagStatusFilter = ref("");
 const groupNameFilter = ref("");
+const tagFilter = ref("");
+const redeemStatusFilter = ref("");
 const searchKeyword = ref("");
 const quickTab = ref(isTrashView.value ? "trash" : "all");
 
 const candidateGroups = ref([]);
+const candidateTags = ref([]);
+
+// ── 候选标签标记 ──
+const tagDialogVisible = ref(false);
+const tagDialogTags = ref([]);
+const tagDialogMode = ref("add");
+const tagDialogSaving = ref(false);
+
+function openTagDialog() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) return ElMessage.warning("请选择候选人");
+  tagDialogTags.value = [];
+  tagDialogMode.value = "add";
+  tagDialogVisible.value = true;
+}
+
+async function applyCandidateTags() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) {
+    tagDialogVisible.value = false;
+    return ElMessage.warning("请选择候选人");
+  }
+  const tags = tagDialogTags.value.map((t) => String(t || "").trim()).filter(Boolean);
+  if (!tags.length && tagDialogMode.value !== "set") {
+    return ElMessage.warning("请输入至少一个标签；要清空标签请选择「覆盖」并留空");
+  }
+  tagDialogSaving.value = true;
+  try {
+    const r = await setCandidateTags(workspaceId.value, emails, tags, tagDialogMode.value);
+    tagDialogVisible.value = false;
+    ElMessage.success(`标签已更新（影响 ${r.changed ?? emails.length} 个账号）`);
+    await load();
+    await loadCandidateTags();
+  } catch (e) {
+    ElMessage.error("标签更新失败: " + e.message);
+  } finally {
+    tagDialogSaving.value = false;
+  }
+}
+
+async function loadCandidateTags() {
+  if (!workspaceId.value) {
+    candidateTags.value = [];
+    return;
+  }
+  try {
+    const r = await listCandidateTags(workspaceId.value);
+    candidateTags.value = r.tags || [];
+  } catch (_) {
+    candidateTags.value = [];
+  }
+}
 const settingsVisible = ref(false);
 const settingsActiveTab = ref("quota");
 const settingsReady = ref(false);
@@ -352,8 +417,20 @@ function trashStatusLabel(value) {
 }
 
 function trashStatusHint(row) {
-  if (!row || row.trash_status !== "scheduled" || !row.trash_due_at) return "";
-  return `到期 ${new Date(row.trash_due_at * 1000).toLocaleString()}`;
+  if (!row) return "";
+  if (row.trash_status === "scheduled" && row.trash_due_at) {
+    return `到期 ${new Date(row.trash_due_at * 1000).toLocaleString()}`;
+  }
+  if (row.trash_status === "trashed" && row.trash_reason) {
+    const reason = {
+      kicked: "已踢出",
+      manual_trash: "手动移入",
+      quota_zero: "额度为0",
+      trash_retry: "自动回收",
+    }[String(row.trash_reason)];
+    return reason || String(row.trash_reason);
+  }
+  return "";
 }
 
 function tagStatusLabel(value) {
@@ -549,17 +626,28 @@ function resetCreditDate(value) {
   return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
 }
 
+// CPA 家宽代理单元格只显示 host:port，账号密码等敏感部分留在 tooltip 完整串里。
+function cpaProxyLabel(proxy) {
+  const s = String(proxy || "").trim();
+  if (!s) return "";
+  const m = s.match(/^[a-zA-Z0-9+.-]+:\/\/(?:[^@/]*@)?([^/]+)/);
+  return m ? m[1] : s;
+}
+
 async function openResetCredit(row) {
   const email = String(row?.email || "").trim();
   if (!email) return;
-  if (!workspaceId.value) return ElMessage.warning("请选择母号空间");
+  const ws = workspaceId.value;
+  if (!ws) return ElMessage.warning("请选择母号空间");
   if (resetCreditBusyEmail.value) return ElMessage.warning("重置券操作正在进行中");
+  // 兑换不可撤销：查询→确认→兑换期间用户可能切换空间，空间和代理池必须在入口快照。
+  const proxyPool = quotaProxyPool.value;
 
   resetCreditBusyEmail.value = email;
   try {
     let listing;
     try {
-      listing = await listResetCredits(workspaceId.value, email, quotaProxyPool.value);
+      listing = await listResetCredits(ws, email, proxyPool);
     } catch (e) {
       return ElMessage.error("重置券查询失败: " + (e.message || e));
     }
@@ -599,7 +687,7 @@ async function openResetCredit(row) {
 
     setOneOperation(email, "兑换重置券中…");
     try {
-      const result = await consumeResetCredit(workspaceId.value, email, target.id, quotaProxyPool.value);
+      const result = await consumeResetCredit(ws, email, target.id, proxyPool);
       await load();
       if (result?.quota_error) {
         // 券已经扣掉了，这里绝不能报成失败，否则用户会再点一次再烧一张。
@@ -759,6 +847,8 @@ async function load() {
       trash_status: trashStatusFilter.value,
       tag_status: tagStatusFilter.value,
       group_name: groupNameFilter.value,
+      tag: tagFilter.value,
+      redeem_status: redeemStatusFilter.value,
       keyword: searchKeyword.value || undefined,
     });
     options.value = a.items || [];
@@ -804,6 +894,7 @@ async function loadSpaces() {
 function handleQuickTabChange(tab) {
   if (isTrashView.value) return;
   quickTab.value = tab;
+  redeemStatusFilter.value = "";
   if (tab === "all") {
     trashStatusFilter.value = "active";
     tagStatusFilter.value = "";
@@ -829,6 +920,12 @@ function handleQuickTabChange(tab) {
     tagStatusFilter.value = "outbound";
     joinStatusFilter.value = "";
     credentialStatusFilter.value = "";
+  } else if (tab === "redeem") {
+    trashStatusFilter.value = "active";
+    tagStatusFilter.value = "";
+    joinStatusFilter.value = "";
+    credentialStatusFilter.value = "";
+    redeemStatusFilter.value = "has_code";
   } else if (tab === "trash") {
     trashStatusFilter.value = "trashed";
     tagStatusFilter.value = "";
@@ -845,6 +942,8 @@ function resetFilters() {
   trashStatusFilter.value = isTrashView.value ? "trashed" : "active";
   tagStatusFilter.value = "";
   groupNameFilter.value = "";
+  tagFilter.value = "";
+  redeemStatusFilter.value = "";
   searchKeyword.value = "";
   quickTab.value = isTrashView.value ? "trash" : "all";
 }
@@ -967,7 +1066,9 @@ async function invite() {
     if (r.recheck_error) {
       ElMessage.warning(`邀请已提交，但状态复查受上游限流影响，请稍后执行候选状态校验`);
     } else if (pending === 0) {
-      ElMessage.success(`邀请完成并已复查状态（${seatName}）${r.invite_error ? "，上游请求超时但状态已确认" : ""}`);
+      ElMessage.success(r.invite_error
+        ? `上游请求超时但状态已确认（${seatName}）`
+        : `邀请成功（${seatName}）：${emails.length} 个已标记为待接受邀请`);
     } else {
       ElMessage.warning(`邀请已复查：确认 ${confirmed}/${emails.length}${r.invite_error ? "（上游请求超时）" : ""}，仍有 ${pending} 个未确认`);
     }
@@ -1015,6 +1116,9 @@ async function check() {
   const emails = selected.value.filter((x) => x.account_status !== "permanently_invalid").map((x) => x.email);
   if (!emails.length) return ElMessage.warning("请选择候选人");
   candidateCheckRunning.value = true;
+  // 快照发起时的空间：串行循环跨多次请求，中途切空间后必须继续打在
+  // 原空间上，否则剩余成员会错误地校验/操作到新空间。
+  const ws = workspaceId.value;
   let succeeded = 0;
   let failed = 0;
   setOperation(emails, "排队中…");
@@ -1022,9 +1126,11 @@ async function check() {
     for (const email of emails) {
       setOneOperation(email, "校验中…");
       try {
-        const result = await checkCandidates(workspaceId.value, [email]);
+        const result = await checkCandidates(ws, [email]);
         const states = result.states || {};
         const seats = result.seats || {};
+        // 已切走空间时 options 里是新空间的行，不再就地补丁（避免误写同名行）。
+        if (workspaceId.value === ws) {
         options.value = options.value.map((row) => {
           const key = String(row.email || "").toLowerCase();
           if (key !== email.toLowerCase()) return row;
@@ -1045,6 +1151,7 @@ async function check() {
           if (!Object.keys(patch).length) return row;
           return { ...row, ...patch };
         });
+        }
         succeeded += 1;
       } catch (e) {
         failed += 1;
@@ -1134,6 +1241,8 @@ async function quota() {
       }
       results[email] = result;
 
+      // 已切走空间时 options 里是新空间的行，不再就地补丁（避免误写同名行）。
+      if (workspaceId.value !== workspace) return;
       const now = Date.now() / 1000;
       options.value = options.value.map((row) => {
         if (String(row.email || "").toLowerCase() !== email.toLowerCase()) return row;
@@ -1202,6 +1311,12 @@ async function changeSeat(targetSeat = seatType.value) {
   let skipped = 0;
   let failed = 0;
   seatSwitchRunning.value = true;
+  // 快照发起时的空间和行席位：切空间后 options 会换成新空间的行，循环里
+  // 不能再读 options/workspaceId，否则会把剩余成员切到新空间或误判跳过。
+  const ws = workspaceId.value;
+  const seatSnapshot = new Map(
+    candidates.map((x) => [String(x.email || "").toLowerCase(), x.seat_label || x.seat_type])
+  );
 
   const canonicalSeat = (v) => {
     const s = String(v || "").trim().toLowerCase().replace(/-/g, "_");
@@ -1215,8 +1330,7 @@ async function changeSeat(targetSeat = seatType.value) {
   try {
     let requestCount = 0;
     for (const email of emails) {
-      const localRow = options.value.find((r) => String(r.email || "").toLowerCase() === email.toLowerCase());
-      const localSeat = canonicalSeat(localRow?.seat_label || localRow?.seat_type);
+      const localSeat = canonicalSeat(seatSnapshot.get(String(email || "").toLowerCase()));
       if (["default", "usage_based", "prolite"].includes(localSeat) && localSeat === target) {
         skipped += 1;
         clearOperation([email]);
@@ -1227,16 +1341,18 @@ async function changeSeat(targetSeat = seatType.value) {
       }
       setOneOperation(email, `切换为${targetLabel}中…`);
       try {
-        const r = await updateCandidateSeat(workspaceId.value, [email], target);
+        const r = await updateCandidateSeat(ws, [email], target);
         const item = (r.results || [])[0] || {};
         if (item.skipped) {
           skipped += 1;
         } else if (item.ok) {
           succeeded += 1;
-          options.value = options.value.map((row) => {
-            if (String(row.email || "").toLowerCase() !== email.toLowerCase()) return row;
-            return { ...row, seat_label: target, seat_type: target };
-          });
+          if (workspaceId.value === ws) {
+            options.value = options.value.map((row) => {
+              if (String(row.email || "").toLowerCase() !== email.toLowerCase()) return row;
+              return { ...row, seat_label: target, seat_type: target };
+            });
+          }
         } else {
           failed += 1;
         }
@@ -1263,6 +1379,7 @@ async function runCandidateAction(command) {
   if (command === "quota") return quota();
   if (command === "credentials") return credentials();
   if (command === "login_only") return loginOnly();
+  if (command === "accept_invite") return acceptInvite();
   if (command === "select_full_quota") return selectFullQuotaCandidates();
   if (command === "select_quota_401") return selectQuota401Candidates();
   if (command === "trash") return moveToTrash();
@@ -1289,6 +1406,8 @@ async function selectAllFiltered() {
       trash_status: trashStatusFilter.value,
       tag_status: tagStatusFilter.value,
       group_name: groupNameFilter.value,
+      tag: tagFilter.value,
+      redeem_status: redeemStatusFilter.value,
       keyword: searchKeyword.value || undefined,
     });
     const items = a.items || [];
@@ -1354,6 +1473,8 @@ async function runMembershipAction(command) {
 async function runExportAction(command) {
   if (command === "push") return push();
   if (command === "export_outbound") return exportAndOutbound();
+  if (command === "invite_csv") return openInviteCsv();
+  if (command === "redeem_codes") return openRedeemCodesDialog();
   return doExport(command);
 }
 
@@ -1368,25 +1489,55 @@ async function kick() {
     await ElMessageBox.confirm(
       `将把 ${emails.length} 个成员从 OpenAI 空间移除（上游真正踢出，释放席位）。` +
         (skipped ? `\n\n另有 ${skipped} 个未加入空间的候选人被跳过。` : "") +
-        `\n\n踢出后本地会清掉成员身份和席位，账号仍保留为候选人。确定？`,
+        `\n\n踢出成功后该账号会被移入本空间垃圾箱并标记为已踢出（清空成员身份/席位、删除空间凭证；注册结果与号池保留）。之后可在垃圾箱中恢复为普通候选人或彻底删除。确定？`,
       "踢出空间成员",
       { type: "warning", confirmButtonText: "确认踢出", cancelButtonText: "取消", customClass: "reset-credit-confirm" }
     );
   } catch {
     return;
   }
-  setOperation(emails, "踢出空间中…");
-  try {
-    const r = await kickCandidates(workspaceId.value, emails);
-    ElMessage[r.failed ? "warning" : "success"](`已踢出 ${r.kicked || 0} 个${r.failed ? `，失败 ${r.failed}` : ""}`);
-    clearSelection();
-    await load();
-    await loadStats();
-  } catch (e) {
-    ElMessage.error("踢出失败: " + e.message);
-  } finally {
-    clearOperation(emails);
+  // 串行踢出队列：一次只提交一个成员，当前成员显示「踢出中」，
+  // 其余显示「排队中」；随机等待由前端在两次请求之间执行。
+  const delayMin = Math.max(0, Number(kickDelayMinSeconds.value) || 0);
+  const delayMax = Math.max(delayMin, Number(kickDelayMaxSeconds.value) || 0);
+  // 快照发起时的空间：串行队列跨多次请求，切空间后必须继续踢原空间的
+  // 成员，否则剩余成员会打到新空间（甚至误踢新空间里的同名成员）。
+  const ws = workspaceId.value;
+  setOperation(emails, "排队中");
+  let kicked = 0;
+  const failedEmails = [];
+  for (let i = 0; i < emails.length; i++) {
+    const email = emails[i];
+    setOneOperation(email, `踢出中 ${i + 1}/${emails.length}`);
+    let ok = false;
+    try {
+      const r = await kickCandidates(ws, [email]);
+      const item = (r.results || [])[0] || {};
+      ok = Boolean(item.ok ?? r.kicked);
+      if (ok) {
+        kicked++;
+        clearOperation([email]);
+      } else {
+        failedEmails.push(email);
+        setOneOperation(email, item.error || "踢出失败");
+      }
+    } catch (e) {
+      failedEmails.push(email);
+      setOneOperation(email, e.message || "踢出失败");
+    }
+    // 与后端批处理语义一致：只在成功踢出后、且后面还有人时才随机等待。
+    if (ok && i < emails.length - 1 && delayMax > 0) {
+      const wait = delayMin + Math.random() * (delayMax - delayMin);
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+    }
   }
+  const failed = failedEmails.length;
+  const detail = failed && failed <= 5 ? `：${failedEmails.join("、")}` : "";
+  ElMessage[failed ? "warning" : "success"](`已踢出 ${kicked} 个${failed ? `，失败 ${failed}${detail}` : ""}`);
+  clearOperation(emails);
+  clearSelection();
+  await load();
+  await loadStats();
 }
 
 async function deleteEverywhere() {
@@ -1430,6 +1581,7 @@ async function runAssignAction(command) {
   if (command === "restore_trash") return restoreFromTrash();
   if (command === "outbound") return setOutboundStatus("outbound", "标记出库");
   if (command === "restore_outbound") return setOutboundStatus("active", "恢复出库账号");
+  if (command === "tag_marks") return openTagDialog();
 }
 
 async function saveSpaceSettings(targetId = workspaceId.value) {
@@ -1449,6 +1601,8 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       auto_push_sub2api_group_ids: autoPushSub2apiGroupIds.value,
       auto_push_cpa_url: autoPushCpaUrl.value,
       auto_push_cpa_mgmt_key: autoPushCpaMgmtKey.value,
+      cpa_static_proxy_enabled: cpaStaticProxyEnabled.value,
+      cpa_static_proxy_pool: cpaStaticProxyPool.value,
       auto_push_skip_codex_seat: autoPushSkipCodexSeat.value,
       concurrency: taskConcurrency.value,
       otp_timeout: taskOtpTimeout.value,
@@ -1475,6 +1629,8 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
       auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
       auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
+      kick_delay_min_seconds: kickDelayMinSeconds.value,
+      kick_delay_max_seconds: kickDelayMaxSeconds.value,
     });
     // 同步更新统计数据并刷新统计
     await loadStats();
@@ -1516,6 +1672,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     autoPushSub2apiGroupIds.value = String(c.auto_push_sub2api_group_ids || "");
     autoPushCpaUrl.value = String(c.auto_push_cpa_url || "");
     autoPushCpaMgmtKey.value = String(c.auto_push_cpa_mgmt_key || "");
+    cpaStaticProxyEnabled.value = Boolean(c.cpa_static_proxy_enabled);
+    cpaStaticProxyPool.value = String(c.cpa_static_proxy_pool || "");
     autoPushSkipCodexSeat.value = c.auto_push_skip_codex_seat !== false;
     taskConcurrency.value = Number(c.concurrency || 1);
     taskOtpTimeout.value = Number(c.otp_timeout || 180);
@@ -1546,6 +1704,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     autoProliteCandidateSeatType.value = ["default", "usage_based", "all"].includes(String(c.auto_prolite_candidate_seat_type || "default"))
       ? String(c.auto_prolite_candidate_seat_type || "default")
       : "default";
+    kickDelayMinSeconds.value = Math.min(600, Math.max(0, Number(c.kick_delay_min_seconds ?? 2)));
+    kickDelayMaxSeconds.value = Math.min(600, Math.max(0, Number(c.kick_delay_max_seconds ?? 5)));
     try {
       const seatStatus = await autoStandardSeatScheduleStatus(targetId);
       autoStandardSeatNextAt.value = seatStatus.next_at || 0;
@@ -1573,6 +1733,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoPushSub2apiGroupIds.value = "";
       autoPushCpaUrl.value = "";
       autoPushCpaMgmtKey.value = "";
+      cpaStaticProxyEnabled.value = false;
+      cpaStaticProxyPool.value = "";
       autoPushSkipCodexSeat.value = true;
       taskConcurrency.value = 1;
       taskOtpTimeout.value = 180;
@@ -1603,6 +1765,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoSeatIntervalMinutes.value = 5;
       autoSeatSwitchGapSeconds.value = 30;
       autoProliteCandidateSeatType.value = "default";
+      kickDelayMinSeconds.value = 2;
+      kickDelayMaxSeconds.value = 5;
     }
   } finally {
     if (generation === settingsLoadGeneration && workspaceId.value === targetId) settingsReady.value = loaded;
@@ -1631,6 +1795,8 @@ async function toggleQuotaSchedule() {
           auto_push_sub2api_group_ids: autoPushSub2apiGroupIds.value,
           auto_push_cpa_url: autoPushCpaUrl.value,
           auto_push_cpa_mgmt_key: autoPushCpaMgmtKey.value,
+          cpa_static_proxy_enabled: cpaStaticProxyEnabled.value,
+          cpa_static_proxy_pool: cpaStaticProxyPool.value,
           auto_push_skip_codex_seat: autoPushSkipCodexSeat.value,
           concurrency: taskConcurrency.value,
           otp_timeout: taskOtpTimeout.value,
@@ -1657,6 +1823,8 @@ async function toggleQuotaSchedule() {
           auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
           auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
           auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
+          kick_delay_min_seconds: kickDelayMinSeconds.value,
+          kick_delay_max_seconds: kickDelayMaxSeconds.value,
         }
       );
       nextQuotaAt.value = r.next_at || Date.now() / 1000 + quotaInterval.value * 60;
@@ -1765,6 +1933,53 @@ async function loginOnly() {
   }
 }
 
+async function acceptInvite() {
+  // 并行接受队列（与额度查询同一模式）：并发数取空间设置的「任务并发」，
+  // 在处理中的成员显示「接受中」，其余显示「排队中」；单个失败不中断队列。
+  const rows = selected.value.filter((x) => x.workspace_join_status === "pending_invite");
+  if (!rows.length) return ElMessage.warning("所选候选人里没有待接受邀请的成员");
+  const skipped = selected.value.length - rows.length;
+  const emails = rows.map((x) => x.email);
+  if (skipped) ElMessage.info(`已跳过 ${skipped} 个非待接受状态的成员`);
+  const pool = proxyList.value.join("\n");
+  const concurrency = Math.min(Math.max(1, Number(taskConcurrency.value) || 1), 20);
+  const workspace = workspaceId.value;
+  let joined = 0;
+  let stillPending = 0;
+  const failedItems = [];
+  setOperation(emails, "排队中");
+  await runRollingPool(emails, concurrency, async (email) => {
+    setOneOperation(email, "接受中…");
+    try {
+      const r = await acceptWorkspaceInvite(workspace, [email], pool);
+      const item = (r.results || [])[0] || {};
+      if (item.status === "joined") {
+        joined++;
+        clearOperation([email]);
+      } else if (item.ok) {
+        // 请求成功但没转成成员：可能上游还没落地，或邀请已失效。
+        stillPending++;
+        setOneOperation(email, item.error || "未加入");
+      } else {
+        failedItems.push(`${email}: ${item.error || "接受失败"}`);
+        setOneOperation(email, item.error || "接受失败");
+      }
+    } catch (e) {
+      failedItems.push(`${email}: ${e.message || "接受失败"}`);
+      setOneOperation(email, e.message || "接受失败");
+    }
+  });
+  const failed = failedItems.length;
+  const detail = failed && failed <= 5 ? `（${failedItems.join("；")}）` : "";
+  const parts = [`已加入 ${joined} 个`];
+  if (stillPending) parts.push(`仍待接受 ${stillPending} 个`);
+  if (failed) parts.push(`失败 ${failed} 个${detail}`);
+  ElMessage[failed || stillPending ? "warning" : "success"](`接受邀请完成：${parts.join("，")}`);
+  clearOperation(emails);
+  await load();
+  await loadStats();
+}
+
 async function loadExportFormats() {
   if (exportFormats.value.length) return;
   try {
@@ -1799,7 +2014,7 @@ async function doExport(fmt, exportOptions = {}) {
   if (!emails.length) return ElMessage.warning("请选择候选人");
   exporting.value = true;
   try {
-    const credentialFormat = fmt.id === "cpa" || fmt.id === "sub2api";
+    const credentialFormat = fmt.id === "cpa" || fmt.id === "sub2api" || fmt.id === "sub2api_lines";
     const r = await exportRegistered({
       format: fmt.id,
       emails,
@@ -1808,6 +2023,7 @@ async function doExport(fmt, exportOptions = {}) {
       ...(credentialFormat ? { encrypt_credentials: encryptCredentials.value } : {}),
       ...(exportOptions.encryptCredentials !== undefined ? { encrypt_credentials: Boolean(exportOptions.encryptCredentials) } : {}),
       ...(exportOptions.markOutbound ? { mark_outbound: true } : {}),
+      ...(fmt.id === "cpa" && cpaUseTemplate.value ? { cpa_template: true } : {}),
     });
     if (r.mode === "download") {
       saveBlob(b64ToBytes(r.b64), r.filename, r.mime);
@@ -1825,6 +2041,32 @@ async function doExport(fmt, exportOptions = {}) {
   } finally {
     exporting.value = false;
   }
+}
+
+// ── 导出邀请 CSV ──
+// 模板：电子邮件,角色,席位 / 每行 email,成员,<席位>（见 docs/第二车邀请.csv）
+const inviteCsvVisible = ref(false);
+const inviteCsvSeat = ref("Premium");
+const INVITE_CSV_SEATS = ["Premium", "Standard", "Codex"];
+
+function openInviteCsv() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) return ElMessage.warning("请选择候选人");
+  inviteCsvVisible.value = true;
+}
+
+function downloadInviteCsv() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) {
+    inviteCsvVisible.value = false;
+    return ElMessage.warning("请选择候选人");
+  }
+  const seat = inviteCsvSeat.value;
+  // 不加 BOM：上游批量邀请接口按表头解析，BOM 会污染首列名。
+  const csv = ["电子邮件,角色,席位", ...emails.map((e) => `${e},成员,${seat}`)].join("\r\n") + "\r\n";
+  saveBlob(csv, `邀请_${seat}_${emails.length}人.csv`, "text/csv;charset=utf-8");
+  inviteCsvVisible.value = false;
+  ElMessage.success(`已导出邀请 CSV：${emails.length} 个账号，席位 ${seat}`);
 }
 
 async function exportAndOutbound() {
@@ -1861,6 +2103,89 @@ async function exportAndOutbound() {
   }
 }
 
+// ── 生成并导出兑换码 ──
+// 只有已持有当前空间凭证的账号能拿到码；每个账号固定一个码，重复导出幂等。
+// 「允许兑换账号密码+2FA」默认关闭，勾选后该批码可在兑换页取明文凭证，
+// 重复导出会按本次勾选覆盖旧码的能力位。
+const redeemDialogVisible = ref(false);
+const redeemAllowSecret = ref(false);
+
+function openRedeemCodesDialog() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) return ElMessage.warning("请选择候选人");
+  if (!workspaceId.value) return ElMessage.warning("请选择母号空间");
+  redeemAllowSecret.value = false;
+  redeemDialogVisible.value = true;
+}
+
+async function exportRedeemCodes() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) return ElMessage.warning("请选择候选人");
+  if (!workspaceId.value) return ElMessage.warning("请选择母号空间");
+  redeemDialogVisible.value = false;
+  exporting.value = true;
+  try {
+    const r = await generateRedeemCodes(workspaceId.value, emails, redeemAllowSecret.value);
+    exportText.value = r.text || "";
+    exportFilename.value = r.filename || "redeem-codes.txt";
+    exportLabel.value = r.label || "兑换码";
+    exportCount.value = r.count || 0;
+    exportVisible.value = true;
+    if (r.skipped?.length) {
+      ElMessage.warning(`已跳过 ${r.skipped.length} 个无空间凭证的账号：${r.skipped.join("、")}`);
+    }
+  } catch (e) {
+    ElMessage.error("生成兑换码失败: " + e.message);
+  } finally {
+    exporting.value = false;
+  }
+}
+
+// ── CPA 导出模版配置 ──
+// 勾选导出栏「CPA 按模版」时，后端把模版里的凭证级代理 proxy_url 和
+// 「启用凭证文件」（JSON disabled 取反）写进每个 CPA 凭证文件；
+// 不勾选则按原样导出。勾选状态存 localStorage，模版存后端 settings。
+const CPA_USE_TEMPLATE_KEY = "cpa_use_template";
+const cpaUseTemplate = ref(false);
+const cpaTplVisible = ref(false);
+const cpaTplSaving = ref(false);
+const cpaTpl = ref({ proxy_url: "", file_enabled: true });
+
+async function openCpaTplDialog() {
+  cpaTplVisible.value = true;
+  try {
+    const r = await getCpaExportTemplate();
+    const t = r.template || {};
+    cpaTpl.value = {
+      proxy_url: String(t.proxy_url || ""),
+      file_enabled: t.file_enabled !== false,
+    };
+  } catch (e) {
+    ElMessage.error("加载 CPA 模版配置失败: " + e.message);
+  }
+}
+
+async function saveCpaTpl() {
+  cpaTplSaving.value = true;
+  try {
+    const r = await saveCpaExportTemplate({
+      proxy_url: cpaTpl.value.proxy_url,
+      file_enabled: cpaTpl.value.file_enabled,
+    });
+    const t = r.template || {};
+    cpaTpl.value = {
+      proxy_url: String(t.proxy_url || ""),
+      file_enabled: t.file_enabled !== false,
+    };
+    ElMessage.success("CPA 导出模版已保存");
+    cpaTplVisible.value = false;
+  } catch (e) {
+    ElMessage.error("保存模版失败: " + e.message);
+  } finally {
+    cpaTplSaving.value = false;
+  }
+}
+
 async function push() {
   const emails = selected.value.map((x) => x.email).filter(Boolean);
   if (!emails.length) return ElMessage.warning("请选择候选人");
@@ -1893,6 +2218,7 @@ watch(workspaceId, async (id) => {
   if (!id) return;
   await load();
   await loadCandidateGroups();
+  await loadCandidateTags();
   await loadSpaceSettings(id);
   await loadTaskLogs(true);
   await startTaskLogPolling();
@@ -1911,6 +2237,8 @@ watch(
     autoPushSub2apiGroupIds,
     autoPushCpaUrl,
     autoPushCpaMgmtKey,
+    cpaStaticProxyEnabled,
+    cpaStaticProxyPool,
     autoPushSkipCodexSeat,
     taskConcurrency,
     taskOtpTimeout,
@@ -1949,6 +2277,16 @@ watch(trashGapSeconds, (value) => {
   queueSpaceSettingsSave();
 });
 
+for (const delayRef of [kickDelayMinSeconds, kickDelayMaxSeconds]) {
+  watch(delayRef, (value) => {
+    const raw = Number(value);
+    const fallback = delayRef === kickDelayMinSeconds ? 2 : 5;
+    const seconds = Number.isFinite(raw) ? Math.min(600, Math.max(0, Math.round(raw))) : fallback;
+    if (value !== seconds) delayRef.value = seconds;
+    queueSpaceSettingsSave();
+  });
+}
+
 watch(autoSeatIntervalMinutes, (value) => {
   const minutes = Math.min(1440, Math.max(1, Number(value) || 5));
   if (value !== minutes) autoSeatIntervalMinutes.value = minutes;
@@ -1976,13 +2314,23 @@ watch(autoProliteSeatTarget, (value) => {
 });
 
 watch(
-  [accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter, searchKeyword],
+  [accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter, tagFilter, redeemStatusFilter],
   () => {
     page.value = 1;
     clearSelection();
     if (workspaceId.value) load();
   }
 );
+
+// 搜索走服务端过滤：每个键击都发请求太浪费，300ms 防抖后再加载。
+let searchDebounceTimer = 0;
+watch(searchKeyword, () => {
+  page.value = 1;
+  clearSelection();
+  clearTimeout(searchDebounceTimer);
+  if (!workspaceId.value) return;
+  searchDebounceTimer = setTimeout(() => load(), 300);
+});
 
 // 候选管理/垃圾箱两个路由共用本组件，切换时把筛选重置到对应视图再重载。
 watch(isTrashView, () => {
@@ -2010,6 +2358,12 @@ watch(plainCredentialMode, (value) => {
   } catch (_) {}
 });
 
+watch(cpaUseTemplate, (value) => {
+  try {
+    localStorage.setItem(CPA_USE_TEMPLATE_KEY, value ? "1" : "0");
+  } catch (_) {}
+});
+
 watch(taskLogAutoRefresh, async () => {
   if (!workspaceId.value) return;
   await loadTaskLogs(true);
@@ -2020,6 +2374,7 @@ onActivated(async () => {
   if (!credentialModeLoaded) {
     try {
       plainCredentialMode.value = localStorage.getItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY) === "1";
+      cpaUseTemplate.value = localStorage.getItem(CPA_USE_TEMPLATE_KEY) === "1";
     } catch (_) {}
     credentialModeLoaded = true;
   }
@@ -2351,6 +2706,13 @@ onBeforeUnmount(() => {
           </button>
           <button
             class="tab-chip"
+            :class="{ active: quickTab === 'redeem' }"
+            @click="handleQuickTabChange('redeem')"
+          >
+            已生成兑换码
+          </button>
+          <button
+            class="tab-chip"
             :class="{ active: quickTab === 'trash' }"
             @click="handleQuickTabChange('trash')"
           >
@@ -2444,9 +2806,31 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="filter-item">
+          <span class="filter-label">兑换码</span>
+          <el-select v-model="redeemStatusFilter" clearable size="small" placeholder="全部" class="filter-select">
+            <el-option label="已生成兑换码" value="has_code" />
+            <el-option label="未生成兑换码" value="no_code" />
+          </el-select>
+        </div>
+
+        <div class="filter-item">
           <span class="filter-label">分组</span>
           <el-select v-model="groupNameFilter" clearable size="small" placeholder="全部分组" class="filter-select">
             <el-option v-for="g in candidateGroups" :key="g" :label="g" :value="g" />
+          </el-select>
+        </div>
+
+        <div class="filter-item">
+          <span class="filter-label">标签</span>
+          <el-select
+            v-model="tagFilter"
+            clearable
+            filterable
+            size="small"
+            placeholder="全部标签"
+            class="filter-select"
+          >
+            <el-option v-for="t in candidateTags" :key="t" :label="t" :value="t" />
           </el-select>
         </div>
 
@@ -2597,6 +2981,7 @@ onBeforeUnmount(() => {
                 <el-dropdown-menu>
                   <el-dropdown-item command="credentials">获取空间凭证 (OAuth/Password)</el-dropdown-item>
                   <el-dropdown-item command="login_only">仅登录空间</el-dropdown-item>
+                  <el-dropdown-item command="accept_invite">接受邀请</el-dropdown-item>
                   <el-dropdown-item divided command="select_full_quota">选取额度 100%</el-dropdown-item>
                   <el-dropdown-item command="select_quota_401">选取额度 401</el-dropdown-item>
                 </el-dropdown-menu>
@@ -2621,8 +3006,10 @@ onBeforeUnmount(() => {
                   >
                     {{ fmt.label }}
                   </el-dropdown-item>
-                  <el-dropdown-item divided command="push">推送到 CPA 号池</el-dropdown-item>
+                  <el-dropdown-item divided command="invite_csv">导出邀请 CSV</el-dropdown-item>
+                  <el-dropdown-item command="push">推送到 CPA 号池</el-dropdown-item>
                   <el-dropdown-item command="export_outbound">出库并导出加密 Sub2 (自动标记出库)</el-dropdown-item>
+                  <el-dropdown-item divided command="redeem_codes">生成并导出兑换码</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
@@ -2639,6 +3026,29 @@ onBeforeUnmount(() => {
             明文凭证导出
           </el-checkbox>
 
+          <el-checkbox
+            v-model="cpaUseTemplate"
+            :disabled="exporting || pushing"
+            title="勾选后 CPA 导出按模版写入凭证级代理 proxy_url 和启停 disabled"
+            class="plain-mode-check"
+          >
+            CPA 按模版
+          </el-checkbox>
+          <el-button
+            size="small"
+            text
+            class="cpa-tpl-btn"
+            title="CPA 导出模版配置"
+            @click="openCpaTplDialog"
+          >
+            <Icon icon="lucide:settings-2" />
+          </el-button>
+
+          <el-button size="small" plain :disabled="!selected.length" @click="openTagDialog">
+            <Icon icon="lucide:tag" class="btn-icon" />
+            标签
+          </el-button>
+
           <el-dropdown @command="runAssignAction">
             <el-button size="small" type="danger" plain>
               <Icon icon="lucide:more-horizontal" class="btn-icon" />
@@ -2647,7 +3057,8 @@ onBeforeUnmount(() => {
             </el-button>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item command="outbound">标记为已出库</el-dropdown-item>
+                <el-dropdown-item command="tag_marks">标签标记</el-dropdown-item>
+                <el-dropdown-item divided command="outbound">标记为已出库</el-dropdown-item>
                 <el-dropdown-item v-if="tagStatusFilter === 'outbound'" command="restore_outbound">恢复出库账号</el-dropdown-item>
                 <el-dropdown-item divided command="kick" style="color: var(--el-color-warning)">踢出空间成员</el-dropdown-item>
                 <el-dropdown-item command="trash">移入垃圾箱</el-dropdown-item>
@@ -2733,6 +3144,17 @@ onBeforeUnmount(() => {
                 <el-tag v-if="row.tag_status === 'outbound'" size="small" type="warning" effect="dark" class="meta-tag">
                   已出库
                 </el-tag>
+                <el-tooltip v-if="row.has_redeem_code" content="点击复制兑换码" placement="top">
+                  <el-tag
+                    size="small"
+                    type="success"
+                    effect="plain"
+                    class="meta-tag code-tag"
+                    @click.stop="copyText(row.redeem_code)"
+                  >
+                    {{ row.redeem_code }}
+                  </el-tag>
+                </el-tooltip>
                 <el-tag v-if="row.account_status === 'permanently_invalid'" size="small" type="danger" effect="dark" class="meta-tag">
                   已永久失效
                 </el-tag>
@@ -2789,6 +3211,12 @@ onBeforeUnmount(() => {
 
               <div class="personal-token-hint">
                 <span>Personal: {{ row.has_access_token ? '已具备' : '缺失' }}</span>
+              </div>
+
+              <div v-if="row.cpa_proxy" class="personal-token-hint cpa-proxy-hint">
+                <el-tooltip :content="row.cpa_proxy" placement="top" :show-after="200">
+                  <span>CPA家宽 {{ cpaProxyLabel(row.cpa_proxy) }}</span>
+                </el-tooltip>
               </div>
             </div>
           </template>
@@ -2924,6 +3352,27 @@ onBeforeUnmount(() => {
                 {{ trashStatusHint(row) }}
               </div>
             </div>
+          </template>
+        </el-table-column>
+
+        <!-- 自定义标签 -->
+        <el-table-column label="标签" min-width="120">
+          <template #default="{ row }">
+            <div v-if="row.tags && row.tags.length" class="tag-cell">
+              <el-tag
+                v-for="t in row.tags.slice(0, 3)"
+                :key="t"
+                size="small"
+                effect="plain"
+                class="tag-chip"
+              >
+                {{ t }}
+              </el-tag>
+              <el-tooltip v-if="row.tags.length > 3" :content="row.tags.join('、')" placement="top">
+                <span class="tag-more">+{{ row.tags.length - 3 }}</span>
+              </el-tooltip>
+            </div>
+            <span v-else class="tag-empty">—</span>
           </template>
         </el-table-column>
 
@@ -3108,6 +3557,26 @@ onBeforeUnmount(() => {
                         style="width: 100%"
                       />
                     </el-form-item>
+                    <el-form-item label="CPA 静态家宽代理池">
+                      <div class="setting-switch-row" style="width: 100%">
+                        <div class="switch-meta">
+                          <span class="switch-desc">启用后推送的 CPA 凭证会绑定家宽代理（proxy_url），默认关闭</span>
+                        </div>
+                        <el-switch v-model="cpaStaticProxyEnabled" />
+                      </div>
+                      <el-input
+                        v-if="cpaStaticProxyEnabled"
+                        v-model="cpaStaticProxyPool"
+                        type="textarea"
+                        :rows="4"
+                        placeholder="每行一个代理，如 socks5://user:pass@host:port；&#10;留空则不写凭证 proxy_url"
+                        style="width: 100%; margin-top: 8px"
+                      />
+                      <div v-if="cpaStaticProxyEnabled" class="field-hint">
+                        自动推送 CPA 时给每个凭证绑定池里租用计数最少的一条代理，写进凭证的
+                        proxy_url；账号因额度耗尽/凭证失效入垃圾箱时，自动删除 CPA 里的凭证并回收计数。
+                      </div>
+                    </el-form-item>
                     <el-form-item>
                       <el-button size="small" :loading="pushTestRunning.cpa" @click="testPushTarget('cpa')">
                         测试 CPA 连通性
@@ -3159,6 +3628,18 @@ onBeforeUnmount(() => {
                   <div class="field-hint">
                     补齐始终是串行的：一轮内每切换一个成员就等待这么久再切下一个，与空缺席位数无关。
                     调大可降低对上游席位接口的压力，0 表示不等待。
+                  </div>
+                </el-form-item>
+
+                <el-form-item label="踢出成员随机等待 (秒)">
+                  <div style="display: flex; gap: 8px; align-items: center; width: 100%">
+                    <el-input-number v-model="kickDelayMinSeconds" :min="0" :max="600" style="flex: 1" />
+                    <span class="field-hint" style="margin: 0">至</span>
+                    <el-input-number v-model="kickDelayMaxSeconds" :min="0" :max="600" style="flex: 1" />
+                  </div>
+                  <div class="field-hint">
+                    批量踢出空间成员时，每踢完一个在该范围内随机等待再踢下一个（最后一个不等）。
+                    两个都填 0 表示不等待；下限大于上限时自动交换。
                   </div>
                 </el-form-item>
               </el-form>
@@ -3433,6 +3914,135 @@ onBeforeUnmount(() => {
         >
           下载文件
         </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 生成兑换码弹窗 -->
+    <el-dialog
+      v-model="redeemDialogVisible"
+      title="生成并导出兑换码"
+      width="440px"
+    >
+      <div class="redeem-dialog-body">
+        <div class="hint">
+          为勾选的 {{ selected.length }} 个候选人生成兑换码（每码固定绑定一个账号，重复导出不变）。只有已持有空间凭证的账号会出码，其余跳过。
+        </div>
+        <el-checkbox v-model="redeemAllowSecret" class="redeem-secret-check">
+          允许兑换「账号密码 + 2FA」明文凭证
+        </el-checkbox>
+        <div class="hint warn">
+          默认关闭。开启后持码人在兑换页可直接取到该账号的明文密码和 2FA，请只对需要的码开启。
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="redeemDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="exporting" @click="exportRedeemCodes">
+          生成并导出
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- CPA 导出模版配置弹窗 -->
+    <el-dialog
+      v-model="cpaTplVisible"
+      title="CPA 导出模版配置"
+      width="480px"
+    >
+      <el-form label-width="110px">
+        <el-form-item label="凭证级代理">
+          <el-input
+            v-model="cpaTpl.proxy_url"
+            placeholder="http://user:pass@host:port 或 socks5://host:port"
+            clearable
+          />
+          <div class="hint">
+            写进每个 CPA 凭证 JSON 的 proxy_url 字段；留空表示不配置代理
+          </div>
+        </el-form-item>
+        <el-form-item label="启用凭证文件">
+          <el-switch v-model="cpaTpl.file_enabled" />
+          <span class="hint" style="margin-left: 10px">
+            关闭 → 导出文件中 disabled=true（CPA 端停用该凭证）
+          </span>
+        </el-form-item>
+      </el-form>
+      <div class="hint">
+        勾选导出栏「CPA 按模版」后生效：以上配置写入每个导出的 CPA 凭证文件；不勾选则按原样导出。
+      </div>
+      <template #footer>
+        <el-button @click="cpaTplVisible = false">关闭</el-button>
+        <el-button type="primary" :loading="cpaTplSaving" @click="saveCpaTpl">
+          保存模版
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 导出邀请 CSV 弹窗 -->
+    <el-dialog
+      v-model="inviteCsvVisible"
+      title="导出邀请 CSV"
+      width="420px"
+    >
+      <el-form label-width="80px">
+        <el-form-item label="席位">
+          <el-radio-group v-model="inviteCsvSeat">
+            <el-radio-button
+              v-for="seat in INVITE_CSV_SEATS"
+              :key="seat"
+              :value="seat"
+            >
+              {{ seat }}
+            </el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="格式">
+          <div class="hint">
+            电子邮件,角色,席位<br />
+            <code>a@example.com,成员,{{ inviteCsvSeat }}</code>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="inviteCsvVisible = false">取消</el-button>
+        <el-button type="primary" @click="downloadInviteCsv">下载 CSV</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 标签标记弹窗 -->
+    <el-dialog
+      v-model="tagDialogVisible"
+      :title="`标签标记（已选 ${selected.length} 个账号）`"
+      width="460px"
+    >
+      <el-form label-width="80px">
+        <el-form-item label="操作方式">
+          <el-radio-group v-model="tagDialogMode">
+            <el-radio-button value="add">追加</el-radio-button>
+            <el-radio-button value="remove">移除</el-radio-button>
+            <el-radio-button value="set">覆盖</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="标签">
+          <el-select
+            v-model="tagDialogTags"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            :reserve-keyword="false"
+            placeholder="输入新标签回车创建，或选择已有标签"
+            style="width: 100%"
+          >
+            <el-option v-for="t in candidateTags" :key="t" :label="t" :value="t" />
+          </el-select>
+        </el-form-item>
+        <div class="hint" style="margin-left: 80px">
+          追加：在现有标签上叠加；移除：去掉所选标签；覆盖：用所选标签整体替换（留空则清空标签）。
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="tagDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="tagDialogSaving" @click="applyCandidateTags">应用</el-button>
       </template>
     </el-dialog>
   </div>
@@ -3869,6 +4479,15 @@ onBeforeUnmount(() => {
   margin-right: 0;
 }
 
+.cpa-tpl-btn {
+  margin-left: 2px;
+  padding: 2px 4px;
+  color: var(--el-text-color-secondary);
+}
+.cpa-tpl-btn:hover {
+  color: var(--el-color-primary);
+}
+
 .btn-icon {
   margin-right: 4px;
   font-size: 14px;
@@ -3997,6 +4616,25 @@ onBeforeUnmount(() => {
   font-size: 11px;
 }
 
+.code-tag {
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.5px;
+}
+
+.redeem-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.redeem-secret-check {
+  height: auto;
+  white-space: normal;
+}
+.redeem-dialog-body .hint.warn {
+  color: var(--el-color-warning);
+}
+
 .join-seat-cell {
   display: flex;
   flex-direction: column;
@@ -4030,6 +4668,11 @@ onBeforeUnmount(() => {
 .personal-token-hint {
   font-size: 11px;
   color: var(--el-text-color-placeholder);
+}
+
+.cpa-proxy-hint {
+  color: var(--el-color-primary);
+  cursor: help;
 }
 
 .quota-cell {
@@ -4115,6 +4758,27 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.tag-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tag-chip {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag-more {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.tag-empty {
+  color: var(--el-text-color-placeholder);
 }
 
 .trash-hint-text {

@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import queue
+import random
 import secrets
 import sys
 import time
@@ -40,8 +41,10 @@ from .auto_loop import (  # noqa: E402
     CONTROLLER as AUTO_LOOP,
     LOGIN_CONTROLLER,
     all_login_controllers,
+    all_task_controllers,
     login_controller_for,
     stop_login_controllers_for_workspace,
+    task_controller_for,
 )
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
 from mail_providers import (  # noqa: E402
@@ -167,7 +170,12 @@ def _current_admin_token(request: Request) -> str:
 
 
 def _is_public_api_path(path: str) -> bool:
-    return path.startswith("/api/auth") or path.startswith("/api/public-relogin")
+    # /api/redeem 只能精确匹配：/api/redeem-codes 是管理端接口，不能被公开放行。
+    return (
+        path.startswith("/api/auth")
+        or path.startswith("/api/public-relogin")
+        or path == "/api/redeem"
+    )
 
 
 @app.middleware("http")
@@ -196,6 +204,11 @@ class ImportReq(BaseModel):
         None,
         description="导入到指定分组；空字符串=未分组，未提供=保留已有账号原分组",
         max_length=64,
+    )
+    relay_suffix: str = Field(
+        "",
+        description="追加到每行 OTP 中转链接尾部的自定义串，如 ?json=1；仅对有中转链接的行生效",
+        max_length=256,
     )
 
 
@@ -233,6 +246,8 @@ class WorkspaceCandidatesReq(BaseModel):
     )
     seat_type: str = "default"
     tag_status: str = ""
+    tags: list[str] = Field(default_factory=list)
+    tag_mode: str = "add"
     auto_push: bool = False
     relogin_on_401: bool = False
     concurrency: int = Field(1, ge=1, le=20)
@@ -290,6 +305,8 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     auto_push_sub2api_group_ids: str = Field("", description="自动推送的 Sub2API 号池分组 ID（如 '2,5'）；留空跟随全局导出配置")
     auto_push_cpa_url: str = Field("", description="空间专属 CPA 地址；留空跟随全局导出配置")
     auto_push_cpa_mgmt_key: str = Field("", description="空间专属 CPA 管理密钥；留空跟随全局导出配置")
+    cpa_static_proxy_enabled: bool = Field(False, description="启用后自动推送 CPA 时从静态家宽池分配凭证级代理")
+    cpa_static_proxy_pool: str = Field("", description="CPA 静态家宽代理池（每行一个）；自动推送 CPA 时按租用计数最少分配并写入凭证 proxy_url")
     auto_push_skip_codex_seat: bool = Field(True, description="Codex/Usage-based 席位跳过自动推送；仅影响自动流程，手动推送不受限")
     concurrency: int = Field(1, ge=1, le=20)
     otp_timeout: int = Field(180, ge=10, le=600)
@@ -318,6 +335,8 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     auto_seat_interval_minutes: int = Field(5, ge=1, le=1440, description="自动补齐席位轮询周期（分钟）")
     auto_seat_switch_gap_seconds: int = Field(30, ge=0, le=600, description="串行补齐时两次成员席位切换的间隔（秒）")
     auto_prolite_candidate_seat_type: str = Field("default", description="自动补齐高级席位的候选人席位类型")
+    kick_delay_min_seconds: int = Field(2, ge=0, le=600, description="批量踢出成员的随机等待下限（秒）")
+    kick_delay_max_seconds: int = Field(5, ge=0, le=600, description="批量踢出成员的随机等待上限（秒）")
 
 
 class WorkspaceAutoSeatReq(BaseModel):
@@ -493,6 +512,17 @@ def _run_public_relogin_account(
         result["attempt"] = 0
         return result
     account_proxy = str(account.get("proxy") or "").strip()
+    if not account_proxy:
+        # 已推送 CPA 的账号绑定了家宽代理，重登固定走同一出口保持 IP 粘性；
+        # 语义与账号自带 proxy 一致（粘性优先，不轮换）。
+        bound = db.get_cpa_proxy_lease_for_email(normalized.get("email", ""))
+        if bound:
+            account_proxy = bound
+            proxy_usage.record_lease(bound, "login", "public_401_relogin_cpa_bound")
+            logger.info(
+                "公开401重登使用 CPA 绑定家宽代理 account=%s proxy=%s",
+                normalized.get("email", ""), db._mask_proxy(bound),
+            )
     previous_proxy = initial_exclude_proxy
     last_error = ""
     for attempt in range(1, cfg["retry_count"] + 2):
@@ -676,6 +706,12 @@ async def api_public_relogin_check(req: PublicReloginCheckReq):
         if already_dead:
             return key, _public_relogin_dead_workspace_result(normalized)
         proxy = str(account.get("proxy") or "").strip()
+        if not proxy:
+            # 已推送 CPA 的账号固定走绑定的家宽代理，保持出口 IP 一致。
+            bound = db.get_cpa_proxy_lease_for_email(normalized.get("email", ""))
+            if bound:
+                proxy = bound
+                proxy_usage.record_lease(bound, "quota", "public_quota_cpa_bound")
         if not proxy:
             proxy, _, _ = proxy_leases.lease(
                 task_type="quota",
@@ -1046,6 +1082,20 @@ def _lease_candidate_quota_proxy(
     detail: str,
     exclude_proxy: str = "",
 ) -> str:
+    # 已推送 CPA 且绑定了家宽代理的账号固定走同一出口，与 CPA 凭证的
+    # proxy_url 保持 IP 一致；仅当调用方明确要求排除（通常是该代理刚失败
+    # 的重试）才回退到候选人代理池。
+    bound = db.get_cpa_proxy_lease(workspace_id, email)
+    if bound and bound != exclude_proxy:
+        proxy_usage.record_lease(bound, "quota", detail)
+        logging.getLogger("workspace_membership").info(
+            "候选额度查询使用 CPA 绑定家宽代理 workspace=%s email=%s proxy=%s detail=%s",
+            workspace_id,
+            email,
+            db._mask_proxy(bound),
+            detail,
+        )
+        return bound
     proxy, index, leased_count = leases.lease(
         exclude_proxy,
         task_type="quota",
@@ -2650,7 +2700,10 @@ def api_import(req: ImportReq):
         {"ok": false, "message": "...", "errors": [{"line": 3, "error": "..."}]}
     """
     try:
-        result = db.import_accounts(req.text, kind=req.kind, group_name=req.group_name)
+        result = db.import_accounts(
+            req.text, kind=req.kind, group_name=req.group_name,
+            relay_suffix=req.relay_suffix,
+        )
     except ImportValidationError as e:
         return JSONResponse(
             status_code=422,
@@ -3052,17 +3105,35 @@ def api_kick_workspace_candidates(req: WorkspaceCandidatesReq):
     ))
     if not emails:
         raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    # 踢人节奏：每踢完一个在 [min, max] 范围内随机 sleep，降低对上游
+    # 管理接口的突发压力；两个值都为 0 时不等待。
+    kick_settings = db.get_workspace_settings(req.workspace_id)
+    kick_delay_min = db.normalize_gap_seconds(
+        kick_settings.get("kick_delay_min_seconds"), 2,
+    )
+    kick_delay_max = db.normalize_gap_seconds(
+        kick_settings.get("kick_delay_max_seconds"), 5,
+    )
+    if kick_delay_max < kick_delay_min:
+        kick_delay_min, kick_delay_max = kick_delay_max, kick_delay_min
     results = []
-    for email in emails:
+    for index, email in enumerate(emails):
         row = indexed.get(email) or {}
         member_id = str(row.get("member_id") or "").strip()
         try:
             result = workspace_membership.remove_member(req.workspace_id, email, member_id)
             ok = bool(result.get("kicked") or result.get("already_gone"))
             if ok:
-                # 人已离开空间：本地清掉成员身份和席位，加入状态回到未邀请。
-                db.update_workspace_candidate_member(req.workspace_id, email, "", "")
-                db.update_workspace_candidate_join_statuses(req.workspace_id, [email], "not_invited")
+                # 人已离开空间：移入本空间垃圾箱并标记已踢出（清空成员身份/席位、
+                # 删除空间凭证），注册结果/号池保留，可从垃圾箱恢复或彻底删除。
+                db.mark_workspace_candidates_kicked(req.workspace_id, [email])
+                if index < len(emails) - 1 and kick_delay_max > 0:
+                    delay = random.uniform(kick_delay_min, kick_delay_max)
+                    logger.info(
+                        "踢出空间成员节流 workspace_db_id=%s email=%s sleep=%.1fs",
+                        req.workspace_id, email, delay,
+                    )
+                    time.sleep(delay)
             results.append({
                 "email": email,
                 "ok": ok,
@@ -3251,6 +3322,9 @@ def api_workspace_candidate_options(
     trash_status: str = "",
     tag_status: str = "",
     group_name: str = "",
+    tag: str = "",
+    redeem_status: str = "",
+    keyword: str = "",
 ):
     limit = max(1, min(1000, int(limit or 100)))
     offset = max(0, int(offset or 0))
@@ -3259,7 +3333,8 @@ def api_workspace_candidate_options(
         account_status=account_status, join_status=join_status,
         credential_status=credential_status, seat_type=seat_type,
         trash_status=trash_status, tag_status=tag_status,
-        group_name=group_name,
+        group_name=group_name, tag=tag, redeem_status=redeem_status,
+        keyword=keyword,
     )
     for item in items:
         reason = _candidate_quota_ineligible_reason(item)
@@ -3269,7 +3344,8 @@ def api_workspace_candidate_options(
         workspace_id, account_status=account_status, join_status=join_status,
         credential_status=credential_status, seat_type=seat_type,
         trash_status=trash_status, tag_status=tag_status,
-        group_name=group_name,
+        group_name=group_name, tag=tag, redeem_status=redeem_status,
+        keyword=keyword,
     )
     stats = db.get_workspace_candidate_stats(workspace_id)
     return {"ok": True, "items": items, "total": total, "limit": limit, "offset": offset, "stats": stats}
@@ -3283,6 +3359,24 @@ def api_workspace_candidate_stats(workspace_id: int):
 @app.get("/api/workspace-candidates/groups")
 def api_workspace_candidate_groups(workspace_id: int):
     return {"ok": True, "groups": db.list_workspace_candidate_groups(workspace_id)}
+
+
+@app.get("/api/workspace-candidates/tags")
+def api_workspace_candidate_tags(workspace_id: int):
+    return {"ok": True, "tags": db.list_workspace_candidate_tags(workspace_id)}
+
+
+@app.post("/api/workspace-candidates/tags")
+def api_set_workspace_candidate_tags(req: WorkspaceCandidatesReq):
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    try:
+        changed = db.set_workspace_candidate_tags(
+            req.workspace_id, req.emails, req.tags, mode=req.tag_mode,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "changed": changed}
 
 
 @app.get("/api/workspace-candidates")
@@ -3355,6 +3449,21 @@ def api_invite_workspace_candidates(req: WorkspaceCandidatesReq):
     except Exception as e:
         invite_error = str(e)
         logger.exception("候选管理母号邀请失败 workspace_db_id=%s count=%s，将继续校验邀请状态", req.workspace_id, len(req.emails))
+    if not invite_error:
+        # 邀请请求成功即代表上游已受理整批邀请：直接标记待接受邀请，
+        # 跳过 invites/users 逐个复查（目标席位以本次请求为准回填）。
+        states = {email.lower(): "pending_invite" for email in req.emails}
+        for email in req.emails:
+            db.update_workspace_candidate_status(req.workspace_id, email, "pending_invite")
+            db.update_workspace_candidate_seat_type(req.workspace_id, email, req.seat_type)
+        return {
+            "ok": True,
+            "result": result,
+            "states": states,
+            "seats": {},
+            "invite_error": "",
+            "recheck_error": "",
+        }
     if _INVITE_STATUS_RECHECK_DELAY_SECONDS > 0:
         logger.info(
             "候选管理母号邀请结束后等待复查 workspace_db_id=%s delay_seconds=%s count=%s",
@@ -3478,6 +3587,92 @@ def api_check_workspace_candidates(req: WorkspaceCandidatesReq):
         db.update_workspace_candidate_seats(req.workspace_id, email, info.get("codex_seat", ""), info.get("gpt_seat", ""))
         db.update_workspace_candidate_member(req.workspace_id, email, info.get("member_id", ""), info.get("raw_seat_type", ""))
     return {"ok": True, "states": states, "seats": seats}
+
+
+@app.post("/api/workspace-candidates/accept-invite")
+def api_accept_workspace_invite(req: WorkspaceCandidatesReq):
+    """用候选人个人凭证请求 accounts/check，把待接受邀请落地为已加入。
+
+    成员侧只需一发 GET accounts/check 即可触发邀请接受（实测验证；
+    wham/usage 与 auth/session 不触发），无需走 OAuth/浏览器登录。
+    全部请求发完后统一用母号成员接口复核并落库 member_id/席位快照。
+    """
+    if not req.emails:
+        raise HTTPException(400, "请选择候选人")
+    indexed = _workspace_candidate_index(req.workspace_id)
+    emails = list(dict.fromkeys(
+        email.strip().lower()
+        for email in req.emails
+        if email.strip() and email.strip().lower() in indexed
+    ))
+    if not emails:
+        raise HTTPException(400, "所选账号不是当前母号空间的候选人")
+    settings = db.get_workspace_settings(req.workspace_id)
+    try:
+        leases = _candidate_quota_proxy_pool(
+            _candidate_proxy_pool_text(settings, req.proxy_pool)
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    results = []
+    responded_emails = []
+    for email in emails:
+        try:
+            proxy = _lease_candidate_quota_proxy(
+                leases,
+                workspace_id=req.workspace_id,
+                email=email,
+                detail="accept-invite",
+            )
+            accepted = workspace_membership.accept_candidate_invite(
+                req.workspace_id, email, proxy=proxy
+            )
+            responded_emails.append(email)
+            results.append({
+                "email": email,
+                "ok": True,
+                "accepted": bool(accepted),
+                "error": "" if accepted else "请求成功但空间未出现（邀请可能已过期或被撤回）",
+            })
+        except Exception as exc:
+            logger.warning(
+                "接受邀请失败 workspace_db_id=%s email=%s error=%s",
+                req.workspace_id, email, str(exc)[:300],
+            )
+            results.append({"email": email, "ok": False, "accepted": False, "error": str(exc)})
+
+    # 母号复核：把真实成员状态/席位/member_id 落库。accounts/check 里出现
+    # 空间已经能说明接受了邀请，但 member_id 和席位快照要靠母号侧补齐。
+    states: dict[str, str] = {}
+    if responded_emails:
+        try:
+            states, seats = workspace_membership.check_candidate_membership(
+                req.workspace_id,
+                responded_emails,
+                include_seats=True,
+            )
+            for email, status in states.items():
+                db.update_workspace_candidate_status(req.workspace_id, email, status)
+            for email, info in seats.items():
+                db.update_workspace_candidate_seats(
+                    req.workspace_id, email, info.get("codex_seat", ""), info.get("gpt_seat", "")
+                )
+                db.update_workspace_candidate_member(
+                    req.workspace_id, email, info.get("member_id", ""), info.get("raw_seat_type", "")
+                )
+        except Exception:
+            logger.exception(
+                "接受邀请后母号复核失败 workspace_db_id=%s", req.workspace_id
+            )
+    for item in results:
+        item["status"] = states.get(item["email"], "")
+    return {
+        "ok": not any(not item.get("ok") for item in results),
+        "results": results,
+        "joined": sum(1 for s in states.values() if s == "joined"),
+        "failed": sum(1 for item in results if not item.get("ok")),
+    }
 
 
 @app.post("/api/workspace-candidates/invite-status")
@@ -4680,6 +4875,10 @@ class ExportRegisteredReq(BaseModel):
         False,
         description="导出成功后将候选人标记为 outbound（仅 Workspace Sub2 导出）",
     )
+    cpa_template: Optional[bool] = Field(
+        None,
+        description="CPA 导出时是否按「导出模版配置」写入凭证级代理 proxy_url 和启停 disabled",
+    )
 
 
 @app.post("/api/registered/export")
@@ -4801,8 +5000,15 @@ def api_export_registered(req: ExportRegisteredReq):
 
     if fmt.mode == "download":
         # 二进制（zip / json 文件）走 base64，前端解出来直接存盘，不弹预览
+        # CPA「按模版导出」：勾选时把模版里的凭证级代理 proxy_url 和启停
+        # disabled 写进每个凭证 JSON；不勾选则与旧导出完全一致。
+        cpa_template = (
+            db.get_cpa_export_template()
+            if fmt.id == "cpa" and req.cpa_template
+            else None
+        )
         try:
-            if fmt.id in {"cpa", "sub2api"} and req.workspace_id:
+            if fmt.id in {"cpa", "sub2api", "sub2api_lines"} and req.workspace_id:
                 # CPA and Sub2 use the exact same switch and Workspace key;
                 # this prevents one format from accidentally leaking a
                 # password/TOTP pair while the other protects it.
@@ -4816,6 +5022,7 @@ def api_export_registered(req: ExportRegisteredReq):
                     fmt,
                     workspace_id=_workspace_export_key(req.workspace_id, rows),
                     encrypt_credentials=encrypt_credentials,
+                    cpa_template=cpa_template,
                 )
             else:
                 if req.encrypt_credentials:
@@ -4826,7 +5033,8 @@ def api_export_registered(req: ExportRegisteredReq):
                 blob = export_formats.render_bytes(
                     rows,
                     fmt,
-                    encrypt_credentials=False if fmt.id in {"cpa", "sub2api"} else None,
+                    encrypt_credentials=False if fmt.id in {"cpa", "sub2api", "sub2api_lines"} else None,
+                    cpa_template=cpa_template,
                 )
         except Exception as exc:
             prefix = "Sub2 导出凭证一致性校验失败" if fmt.id == "sub2api" else "导出文件生成失败"
@@ -4883,6 +5091,196 @@ def api_workspace_candidates_export_outbound(req: WorkspaceExportOutboundReq):
             mark_outbound=True,
         )
     )
+
+
+# ──────────────────────── 兑换码 ────────────────────────
+#
+# 兑换码把「一个空间凭证」变成「一串可分发出去的 12 位码」。生成幂等：
+# 同一 (空间, 账号) 永远对应同一个码，重复导出只是再拿一次。持码人走
+# 公开的 /api/redeem 反复下载绑定账号的加密 Sub2/CPA 凭证，凭证内容跟随
+# workspace_credentials 里的最新值。作废即删行，下次导出会生成新码。
+
+REDEEM_FORMATS = {"sub2api", "cpa", "email_pw_2fa"}
+
+
+class RedeemCodesGenerateReq(BaseModel):
+    workspace_id: int = Field(..., description="母号记录 ID")
+    emails: list[str] = Field(..., min_length=1, description="候选账号邮箱")
+    allow_secret: bool = Field(
+        False, description="允许持码人兑换明文 账号----密码----2FA（默认关闭）"
+    )
+
+
+@app.post("/api/workspace-candidates/redeem-codes")
+def api_workspace_candidates_redeem_codes(req: RedeemCodesGenerateReq):
+    """为已持有当前 Workspace 空间凭证的候选人生成/取出兑换码，按行导出。"""
+    emails = list(dict.fromkeys(str(e).strip().lower() for e in req.emails if str(e).strip()))
+    if not emails:
+        raise HTTPException(400, "请选择候选人")
+    cred_rows = db.list_workspace_credentials_by_emails(req.workspace_id, emails)
+    credentialed = {
+        str(r.get("email") or "").strip().lower()
+        for r in cred_rows
+        if str(r.get("access_token") or "").strip()
+    }
+    eligible = [e for e in emails if e in credentialed]
+    skipped = [e for e in emails if e not in credentialed]
+    if not eligible:
+        raise HTTPException(400, "所选账号都没有当前 Workspace 的空间凭证，无法生成兑换码")
+    code_map = db.get_or_create_redeem_codes(
+        req.workspace_id, eligible, allow_secret=req.allow_secret
+    )
+    lines = [code_map[e] for e in eligible if e in code_map]
+    return {
+        "ok": True,
+        "count": len(lines),
+        "label": "兑换码",
+        "filename": f"redeem-codes-{len(lines)}.txt",
+        "text": "\n".join(lines),
+        "emails": [e for e in eligible if e in code_map],
+        "skipped": skipped,
+    }
+
+
+class RedeemReq(BaseModel):
+    code: str = Field("", description="单个 12 位兑换码")
+    codes: Optional[list[str]] = Field(
+        None, description="批量兑换码（每行一个）；提供时忽略 code"
+    )
+    format: str = Field(
+        "sub2api", description="导出格式：sub2api / cpa / email_pw_2fa"
+    )
+
+
+REDEEM_BATCH_LIMIT = 500
+
+
+@app.post("/api/redeem")
+def api_redeem(req: RedeemReq):
+    """公开兑换：凭码导出绑定账号的空间凭证（始终用各自的 Workspace ID 加密）。
+
+    可重复兑换，但每个码永远只出它绑定的那个账号。codes 批量兑换时逐码
+    校验：无效/失效码计入 failed，其余照常合并导出。管理端路径在
+    /api/redeem-codes，公开白名单里对本路径是精确匹配，别改成前缀匹配。
+    """
+    fmt = export_formats.get_format(req.format)
+    if fmt is None or fmt.id not in REDEEM_FORMATS:
+        raise HTTPException(400, "兑换只支持 sub2api / cpa / email_pw_2fa 格式")
+    # 明文 账号----密码----2FA 是码级权限（redeem_codes.allow_secret），
+    # 与 Sub2/CPA 的 Workspace ID 加密走两条完全不同的渲染路径。
+    is_secret_text = fmt.id == "email_pw_2fa"
+
+    raw = list(req.codes) if req.codes else [req.code]
+    codes = list(
+        dict.fromkeys(
+            key for key in (db.normalize_redeem_code(c) for c in raw) if key
+        )
+    )
+    if not codes:
+        raise HTTPException(400, "请输入兑换码")
+    if len(codes) > REDEEM_BATCH_LIMIT:
+        raise HTTPException(400, f"一次最多兑换 {REDEEM_BATCH_LIMIT} 个码")
+
+    rows: list[dict] = []
+    keys: list[str] = []
+    emails: list[str] = []
+    used_codes: list[str] = []
+    failed: list[dict] = []
+    for code in codes:
+        entry = db.get_redeem_code(code)
+        if not entry:
+            failed.append({"code": code, "error": "兑换码不存在或已作废", "status": 404})
+            continue
+        cred = [
+            r
+            for r in db.list_workspace_credentials_by_emails(
+                entry["workspace_master_id"], [entry["email"]]
+            )
+            if str(r.get("access_token") or "").strip()
+        ]
+        if not cred:
+            failed.append(
+                {"code": code, "error": "绑定账号的空间凭证已不存在", "status": 410}
+            )
+            continue
+        if is_secret_text:
+            if not entry.get("allow_secret"):
+                failed.append(
+                    {
+                        "code": code,
+                        "error": "该兑换码未开启「账号密码+2FA」兑换",
+                        "status": 403,
+                    }
+                )
+                continue
+        else:
+            try:
+                key = _workspace_export_key(entry["workspace_master_id"], cred)
+            except Exception as exc:
+                failed.append({"code": code, "error": f"加密密钥缺失：{exc}", "status": 502})
+                continue
+            keys.append(key)
+        rows.append(cred[0])
+        emails.append(entry["email"])
+        used_codes.append(code)
+
+    if not rows:
+        first = failed[0] if failed else {"error": "没有可兑换的有效兑换码", "status": 404}
+        if len(failed) == 1:
+            raise HTTPException(first["status"], first["error"])
+        raise HTTPException(
+            first["status"],
+            "；".join(f"{f['code']}: {f['error']}" for f in failed[:5]),
+        )
+
+    common = {
+        "ok": True,
+        "email": emails[0] if len(emails) == 1 else "",
+        "emails": emails,
+        "count": len(rows),
+        "failed": [{"code": f["code"], "error": f["error"]} for f in failed],
+        "label": fmt.label,
+    }
+    if is_secret_text:
+        text = export_formats.render_text(rows, fmt)
+        for code in used_codes:
+            db.mark_redeem_code_used(code)
+        return {
+            **common,
+            "text": text,
+            "filename": f"账号密码2FA-{len(rows)}.txt",
+            "mime": "text/plain; charset=utf-8",
+        }
+
+    try:
+        blob = export_formats.render_bytes_keyed(rows, keys, fmt)
+    except Exception as exc:
+        raise HTTPException(502, f"凭证文件生成失败：{exc}") from exc
+    for code in used_codes:
+        db.mark_redeem_code_used(code)
+    return {
+        **common,
+        "filename": fmt.filename_for(rows) if fmt.filename_for else fmt.filename,
+        "mime": fmt.mime_for(rows) if fmt.mime_for else fmt.mime,
+        "b64": base64.b64encode(blob).decode("ascii"),
+        "size": len(blob),
+    }
+
+
+@app.get("/api/redeem-codes")
+def api_list_redeem_codes(workspace_id: int = 0):
+    """兑换管理页：全部兑换码 + 所属空间 + 绑定账号 + 兑换统计。"""
+    return {"ok": True, "codes": db.list_redeem_codes(workspace_id)}
+
+
+class RedeemCodeDeleteReq(BaseModel):
+    codes: list[str] = Field(..., min_length=1, description="要作废的兑换码")
+
+
+@app.post("/api/redeem-codes/delete")
+def api_delete_redeem_codes(req: RedeemCodeDeleteReq):
+    deleted = db.delete_redeem_codes(req.codes)
+    return {"ok": True, "deleted": deleted, "codes": db.list_redeem_codes()}
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────
@@ -5126,6 +5524,22 @@ def api_save_export_config(req: SaveExportConfigReq):
 
 class TestExportReq(BaseModel):
     target: str = Field(..., description="cpa 或 sub2api")
+
+
+class CpaExportTemplateReq(BaseModel):
+    proxy_url: Optional[str] = Field(None, description="写进凭证 JSON 的 proxy_url")
+    file_enabled: Optional[bool] = Field(None, description="启用凭证文件 → disabled 取反")
+
+
+@app.get("/api/settings/cpa-export-template")
+def api_get_cpa_export_template():
+    return {"ok": True, "template": db.get_cpa_export_template()}
+
+
+@app.post("/api/settings/cpa-export-template")
+def api_save_cpa_export_template(req: CpaExportTemplateReq):
+    db.save_cpa_export_template(req.model_dump(exclude_none=True))
+    return {"ok": True, "template": db.get_cpa_export_template()}
 
 
 @app.post("/api/settings/export/test")
@@ -5562,24 +5976,24 @@ def api_auto_start(req: AutoLoopStartReq):
 
 
 @app.post("/api/auto/pause")
-def api_auto_pause():
-    res = _active_auto_controller().pause()
+def api_auto_pause(task_id: str = ""):
+    res = (task_controller_for(task_id) or _active_auto_controller()).pause()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "暂停失败"))
     return res
 
 
 @app.post("/api/auto/resume")
-def api_auto_resume():
-    res = _active_auto_controller().resume()
+def api_auto_resume(task_id: str = ""):
+    res = (task_controller_for(task_id) or _active_auto_controller()).resume()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "恢复失败"))
     return res
 
 
 @app.post("/api/auto/stop")
-def api_auto_stop():
-    res = _active_auto_controller().stop()
+def api_auto_stop(task_id: str = ""):
+    res = (task_controller_for(task_id) or _active_auto_controller()).stop()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "停止失败"))
     return res
@@ -5593,6 +6007,7 @@ def api_auto_status():
         **active.status(),
         "register_status": AUTO_LOOP.status(),
         "login_status": LOGIN_CONTROLLER.status(),
+        "tasks": [c.status() for c in all_task_controllers()],
     }
 
 

@@ -48,7 +48,7 @@ export const pushRegisteredToCpa = (emails, proxy = '', workspace_id = null) =>
 
 // ──────────────── 自动跑号 auto-loop ────────────────
 export const autoStart = (payload) => http.post('/api/auto/start', payload)
-export const autoPause = () => http.post('/api/auto/pause')
-export const autoResume = () => http.post('/api/auto/resume')
-export const autoStop = () => http.post('/api/auto/stop')
+export const autoPause = (taskId = '') => http.post('/api/auto/pause', null, { params: { task_id: taskId } })
+export const autoResume = (taskId = '') => http.post('/api/auto/resume', null, { params: { task_id: taskId } })
+export const autoStop = (taskId = '') => http.post('/api/auto/stop', null, { params: { task_id: taskId } })
 export const autoStatus = () => http.get('/api/auto/status')

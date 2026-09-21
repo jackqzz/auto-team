@@ -63,6 +63,36 @@ def _login_context_key(options: dict) -> str:
     return f"{base}:{suffix}"
 
 
+def _login_context_label(key: str) -> str:
+    """给登录任务起一个人类可读名，用于多任务进度标签页。
+
+    key 形如 ``workspace:42:ensure[:no_rt]`` / ``personal:refresh``。
+    """
+    parts = str(key or "").split(":")
+    base = parts[0]
+    # workspace:{db_id}:{policy}[:no_rt] / personal:{policy}[:no_rt]
+    policy_index = 2 if base in {"workspace", "workspace_external"} else 1
+    policy = parts[policy_index] if len(parts) > policy_index else ""
+    extra = "no_rt" in parts[policy_index + 1:]
+    if base == "workspace" and len(parts) > 1:
+        name = ""
+        try:
+            master = db.get_workspace_master(int(parts[1])) or {}
+            name = str(master.get("email") or master.get("account") or "").strip()
+        except Exception:
+            name = ""
+        label = f"空间凭证 · {name or '#' + parts[1]}"
+    elif base == "workspace_external":
+        label = f"空间凭证 · {key.split(':', 2)[1][:8]}"
+    else:
+        label = "批量仅登录"
+    if policy == "refresh":
+        label += "（仅刷新）"
+    if extra:
+        label += "（无RT）"
+    return label
+
+
 class AutoLoopController:
     """多 worker auto-loop 控制器。
 
@@ -75,11 +105,16 @@ class AutoLoopController:
       其余参数透传给 registrar.start_registration
     """
 
-    def __init__(self):
+    def __init__(self, task_id: str = "", task_label: str = ""):
+        # 任务身份：SSE 合并多个控制器的事件时靠它区分来源，
+        # 前端按 task_id 把状态快照路由到对应的进度标签页。
+        self.task_id = str(task_id or "")
+        self.task_label = str(task_label or "") or self.task_id
         self._lock = threading.RLock()
         self._state = AutoLoopState.STOPPED
         self._manage_thread: Optional[threading.Thread] = None
         self._workers: list[threading.Thread] = []
+        self._next_worker_id: int = 0
         self._options: dict = {}
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()  # set = 暂停
@@ -338,6 +373,9 @@ class AutoLoopController:
                     "attempts": 0,
                     "retry_count": 0,
                 })
+        # 队列见底期间退出的 worker 不会自己回来；追加候选后按存活
+        # 缺口补拉，否则新批次只能由幸存的少数 worker 处理。
+        self._respawn_workers_locked()
         # 首个请求的空间任务参数定义 worker 数和代理快照；后续请求只
         # 追加候选人，绝不重置代理计数器或替换代理池。
         self._last_message = (
@@ -352,6 +390,40 @@ class AutoLoopController:
             "pending": len(self._login_queue),
             "concurrency": self._concurrency,
         }
+
+    def _respawn_workers_locked(self) -> int:
+        """按存活缺口补拉 worker 线程，返回新拉起数量。调用方须持锁。
+
+        worker 在队列见底时会自行退出且不会复活；之后重试回来的账号
+        或新追加的候选人只能由幸存 worker 处理，实际并发会持续塌缩。
+        队列补充新候选时按 ``self._concurrency`` 把存活数补回去。
+        """
+        if self._state not in (AutoLoopState.RUNNING, AutoLoopState.PAUSED):
+            return 0
+        if not self._workers:
+            # manage_loop 的初始 spawn 还没收尾（_workers 最后才赋值），
+            # 这个阶段由初始 worker 全权负责，不重复补拉。
+            return 0
+        alive = sum(1 for t in self._workers if t.is_alive())
+        deficit = self._concurrency - alive
+        if deficit <= 0:
+            return 0
+        for _ in range(deficit):
+            wid = self._next_worker_id
+            self._next_worker_id += 1
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(wid,),
+                daemon=True,
+                name=f"auto-loop-worker-{wid}",
+            )
+            self._workers.append(t)
+            t.start()
+        logger.info(
+            f"[auto-loop] 队列补充后补拉 {deficit} 个 worker"
+            f"（存活 {alive + deficit}/{self._concurrency}）"
+        )
+        return deficit
 
     def pause(self) -> dict:
         with self._lock:
@@ -467,6 +539,8 @@ class AutoLoopController:
             else:
                 progress_percent = None
             return {
+                "task_id": self.task_id,
+                "task_label": self.task_label,
                 "state": self._state,
                 "started_at": self._started_at,
                 "elapsed": (time.time() - self._started_at) if self._started_at else 0,
@@ -511,6 +585,10 @@ class AutoLoopController:
             }
 
     def _broadcast(self, kind: str, data):
+        # run_started / run_finished / circuit_break 等非 state 事件也带上
+        # 任务身份，前端日志才能标出来自哪个任务。
+        if isinstance(data, dict):
+            data = {**data, "task_id": self.task_id, "task_label": self.task_label}
         with self._lock:
             subs = list(self._subscribers)
         for q in subs:
@@ -894,10 +972,18 @@ class AutoLoopController:
                 workers.append(t)
                 # 每个 worker 之间错开 1s 启动，避免同时打 OpenAI
                 time.sleep(1.0)
-            self._workers = workers
-            # 等所有 worker 退出
-            for t in workers:
-                t.join()
+            with self._lock:
+                self._workers = workers
+                self._next_worker_id = self._concurrency
+            # 等所有 worker 退出。执行中因队列补充而补拉的 worker 会追加进
+            # _workers，必须按动态列表 join，不能只 join 启动时的快照。
+            while True:
+                with self._lock:
+                    alive = [t for t in self._workers if t.is_alive()]
+                if not alive:
+                    break
+                for t in alive:
+                    t.join(timeout=0.5)
         except Exception as e:
             logger.exception(f"manage_loop 异常: {e}")
         finally:
@@ -965,10 +1051,8 @@ class AutoLoopController:
             if self._options.get("login_only"):
                 with self._lock:
                     account = self._login_queue.pop(0) if self._login_queue else None
-                if not account:
-                    logger.info(f"[worker-{worker_id}] 仅登录队列已完成")
-                    return
-                account.setdefault("_auto_task_key", self._account_key(account))
+                if account:
+                    account.setdefault("_auto_task_key", self._account_key(account))
                 pooled = False
             else:
                 account = None
@@ -1019,13 +1103,16 @@ class AutoLoopController:
                         }
             if not account:
                 idle_round += 1
+                queue_name = (
+                    "登录队列" if self._options.get("login_only") else "号池"
+                )
                 if idle_round == 1:
                     self._set_message(
-                        f"worker-{worker_id} 号池空，等待新号..."
+                        f"worker-{worker_id} {queue_name}空，等待新任务..."
                     )
                 # 空 10 轮（约 30s）就停掉这个 worker
                 if idle_round >= 10:
-                    logger.info(f"[worker-{worker_id}] 号池空 30s，停止")
+                    logger.info(f"[worker-{worker_id}] {queue_name}空 30s，停止")
                     return
                 # 等 3s 再试
                 for _ in range(30):
@@ -1089,8 +1176,27 @@ class AutoLoopController:
                 or self._options.get("proxy_usage_detail")
                 or ("auto_login" if self._options.get("login_only") else "auto_register")
             ).strip().lower()
-            proxy = self._proxy_for_worker(worker_id, task_detail=lease_detail)
-            logger.info(f"[worker-{worker_id}] 领取代理 (proxy={proxy or '直连'})")
+            # 已推送 CPA 且绑定家宽代理的账号，空间内登录（凭证获取/401 重登）
+            # 固定走同一出口，与 CPA 凭证的 proxy_url 保持 IP 一致。绑定代理
+            # 失败时 _proxy_switch_callback 仍会从任务池换一条兜底。
+            proxy = ""
+            ws_db_id = self._options.get("workspace_db_id")
+            acct_email = str(account.get("email") or "").strip()
+            if ws_db_id and acct_email:
+                proxy = db.get_cpa_proxy_lease(int(ws_db_id), acct_email)
+            if proxy:
+                if self._state in (AutoLoopState.RUNNING, AutoLoopState.PAUSED):
+                    proxy_usage.record_lease(
+                        proxy,
+                        "login" if self._options.get("login_only") else "register",
+                        lease_detail,
+                    )
+                logger.info(
+                    f"[worker-{worker_id}] 使用 CPA 绑定家宽代理 (proxy={db._mask_proxy(proxy)})"
+                )
+            else:
+                proxy = self._proxy_for_worker(worker_id, task_detail=lease_detail)
+                logger.info(f"[worker-{worker_id}] 领取代理 (proxy={proxy or '直连'})")
 
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
@@ -1262,29 +1368,37 @@ class AutoLoopController:
     def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
         """轮询 runs 表，等 run 跑完。"""
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            # stop 只禁止领取新任务；已经启动的注册/登录 run 必须等到
-            # registrar 写入终态后再统计。否则用户点击“停止”时，底层线程
-            # 仍会继续跑，但这里会提前把它记成失败，最终出现“日志成功、
-            # 页面失败”的矛盾状态。
-            con = db._conn()
-            cur = con.execute(
-                "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
-            )
-            row = cur.fetchone()
-            if row:
-                st = row["status"]
-                if st == "done":
-                    return True, ""
-                if st == "failed":
-                    return False, (row["error_category"] or "")
-            time.sleep(1)
+        # 一个 run 要轮询几十到几百秒，复用同一条连接；WAL 下每次
+        # SELECT 都是新事务，照样能看到 registrar 新提交的终态。
+        con = db._conn()
+        try:
+            while time.time() < deadline:
+                # stop 只禁止领取新任务；已经启动的注册/登录 run 必须等到
+                # registrar 写入终态后再统计。否则用户点击“停止”时，底层线程
+                # 仍会继续跑，但这里会提前把它记成失败，最终出现“日志成功、
+                # 页面失败”的矛盾状态。
+                cur = con.execute(
+                    "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
+                )
+                row = cur.fetchone()
+                if row:
+                    st = row["status"]
+                    if st == "done":
+                        return True, ""
+                    if st == "failed":
+                        return False, (row["error_category"] or "")
+                time.sleep(1)
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
         logger.warning(f"run {run_id} 等了 {timeout}s 没结束，超时放弃")
         return False, ""
 
 
 # 全局单例
-CONTROLLER = AutoLoopController()
+CONTROLLER = AutoLoopController(task_id="register", task_label="批量注册")
 
 # 注册和登录是两种不同的任务类型。登录控制器按空间建立：同一空间的
 # 后续登录请求会进入同一个共享队列，不同空间可以各自并行。
@@ -1308,7 +1422,10 @@ def login_controller_for(
     with _LOGIN_CONTROLLERS_LOCK:
         controller = _LOGIN_CONTROLLERS.get(key)
         if controller is None:
-            controller = AutoLoopController()
+            controller = AutoLoopController(
+                task_id=key,
+                task_label=_login_context_label(key),
+            )
             _LOGIN_CONTROLLERS[key] = controller
         return controller
 
@@ -1316,6 +1433,19 @@ def login_controller_for(
 def all_login_controllers() -> list[AutoLoopController]:
     with _LOGIN_CONTROLLERS_LOCK:
         return list(_LOGIN_CONTROLLERS.values())
+
+
+def all_task_controllers() -> list[AutoLoopController]:
+    """注册控制器 + 全部登录控制器，供多任务状态列表/按 task_id 查找。"""
+    return [CONTROLLER, *all_login_controllers()]
+
+
+def task_controller_for(task_id: str) -> Optional[AutoLoopController]:
+    key = str(task_id or "").strip()
+    for controller in all_task_controllers():
+        if controller.task_id == key:
+            return controller
+    return None
 
 
 def stop_login_controllers_for_workspace(workspace_db_id) -> int:

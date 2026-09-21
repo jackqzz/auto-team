@@ -127,12 +127,17 @@ def _cpa_data(
     workspace_id: str = "",
     *,
     encrypt_credentials: bool = False,
+    template: Optional[dict] = None,
 ) -> dict:
     """生成与 codex-<hash>-<email>-<plan>.json 示例一致的 CPA 内容。
 
     ``password`` 和 ``totp_secret`` 仍放在现有的 CPA 顶层字段中。调用方只
     提供一个开关，两个字段始终一起加密或一起保持明文，避免 CPA/Sub2 的
     凭证模式不一致。
+
+    ``template``（CPA 导出模版配置）提供时把凭证级代理写进 proxy_url，
+    并按「启用凭证文件」开关覆盖 disabled；缺省保持 disabled=False 且不
+    写 proxy_url，与旧导出完全一致。
     """
     data = exporter.build_cpa_token_json(row)
     # CPA 自身导出的文件包含 disabled；上传构造器为了兼容旧 API 没有该字段。
@@ -151,7 +156,7 @@ def _cpa_data(
         # recover the exact Workspace ID even when a token carries a different
         # child/account claim.
         account_id = str(workspace_id or "").strip()
-    return {
+    out = {
         "access_token": data.get("access_token", ""),
         "account_id": account_id,
         "disabled": False,
@@ -164,6 +169,10 @@ def _cpa_data(
         "password": password,
         "totp_secret": totp_secret,
     }
+    if template:
+        out["proxy_url"] = str(template.get("proxy_url") or "").strip()
+        out["disabled"] = not bool(template.get("file_enabled", True))
+    return out
 
 
 def _cpa_entry_name(row: dict, data: Optional[dict] = None) -> str:
@@ -199,6 +208,7 @@ def _render_cpa(
     workspace_id: str = "",
     *,
     encrypt_credentials: bool = False,
+    cpa_template: Optional[dict] = None,
 ) -> bytes:
     entries = [
         (
@@ -207,6 +217,7 @@ def _render_cpa(
                 row,
                 workspace_id=workspace_id,
                 encrypt_credentials=encrypt_credentials,
+                template=cpa_template,
             ),
         )
         for row in rows
@@ -442,6 +453,32 @@ def _sub2_filename(rows: list) -> str:
     return f"sub2api-accounts-remaining-{len(rows)}.json"
 
 
+def _render_sub2_lines(
+    rows: list,
+    workspace_id: str = "",
+    *,
+    encrypt_credentials: bool = False,
+) -> bytes:
+    """行分割版：每个账号一段紧凑 JSON，一行一个，导出 .txt。"""
+    lines = [
+        json.dumps(
+            _sub2_account(
+                row,
+                workspace_id=workspace_id,
+                encrypt_credentials=encrypt_credentials,
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for row in rows
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _sub2_lines_filename(rows: list) -> str:
+    return f"sub2api-accounts-lines-{len(rows)}.txt"
+
+
 # ──────────────────────── 注册表 ────────────────────────
 
 
@@ -506,6 +543,16 @@ FORMATS: list[ExportFormat] = [
         filename_for=_sub2_filename,
         note="兼容 Sub2API 批量导入",
     ),
+    ExportFormat(
+        id="sub2api_lines",
+        label="Sub2API 行分割版 TXT",
+        filename="sub2api-accounts-lines.txt",
+        mode="download",
+        mime="text/plain; charset=utf-8",
+        render_all=_render_sub2_lines,
+        filename_for=_sub2_lines_filename,
+        note="每行一个账号 JSON 凭证",
+    ),
 ]
 
 _BY_ID = {f.id: f for f in FORMATS}
@@ -556,6 +603,7 @@ def render_bytes(
     workspace_id: str = "",
     *,
     encrypt_credentials: bool | None = None,
+    cpa_template: Optional[dict] = None,
 ) -> bytes:
     """mode=download：整份文件字节。
 
@@ -570,7 +618,7 @@ def render_bytes(
     if not f.render_all:
         raise RuntimeError(f"格式 {f.id} 不是下载格式")
     key = str(workspace_id or "").strip()
-    if f.id in {"cpa", "sub2api"}:
+    if f.id in {"cpa", "sub2api", "sub2api_lines"}:
         # A workspace key historically implied protected Team exports.  Keep
         # that default for old API callers, while an explicit bool (the UI
         # switch) always wins and is shared by CPA and Sub2.
@@ -584,6 +632,13 @@ def render_bytes(
                 rows or [],
                 workspace_id=key,
                 encrypt_credentials=should_encrypt,
+                cpa_template=cpa_template,
+            )
+        if f.id == "sub2api_lines":
+            return _render_sub2_lines(
+                rows or [],
+                workspace_id=key,
+                encrypt_credentials=should_encrypt,
             )
         return _render_sub2(
             rows or [],
@@ -593,6 +648,57 @@ def render_bytes(
     if encrypt_credentials:
         raise ValueError(f"格式 {f.id} 不支持凭证加密")
     return f.render_all(rows or [])
+
+
+def render_bytes_keyed(rows: list, keys: list[str], fmt: "ExportFormat | str") -> bytes:
+    """逐行用各自的 Workspace ID 加密渲染 CPA/Sub2 凭证。
+
+    批量兑换时一码绑一空间，行可能来自不同 Workspace；整文件单 key 的
+    render_bytes 覆盖不了，这里逐行加密后再合并成单份文件。CPA 合并为
+    ZIP（单账号时仍是 JSON，与 render_bytes 行为一致），Sub2 合并
+    accounts 数组。
+    """
+    f = get_format(fmt) if isinstance(fmt, str) else fmt
+    if f is None:
+        raise KeyError(f"未知导出格式: {fmt}")
+    if f.id not in {"cpa", "sub2api"}:
+        raise ValueError(f"格式 {f.id} 不支持逐行加密导出")
+    rows = list(rows or [])
+    keys = [str(k or "").strip() for k in (keys or [])]
+    if len(rows) != len(keys):
+        raise ValueError("rows 与 keys 长度不一致")
+    if f.id == "cpa":
+        entries = [
+            (
+                row,
+                _cpa_data(row, workspace_id=key, encrypt_credentials=True),
+            )
+            for row, key in zip(rows, keys)
+        ]
+        if len(entries) == 1:
+            return json.dumps(
+                entries[0][1], ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for row, data in entries:
+                archive.writestr(
+                    _cpa_entry_name(row, data),
+                    json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                )
+        return output.getvalue()
+    accounts = [
+        _sub2_account(row, workspace_id=key, encrypt_credentials=True)
+        for row, key in zip(rows, keys)
+    ]
+    document = {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "proxies": [],
+        "accounts": accounts,
+    }
+    return json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 # 兼容旧调用名

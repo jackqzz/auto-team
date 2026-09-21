@@ -1,8 +1,10 @@
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from webui.auto_loop import (
     AutoLoopController,
+    AutoLoopState,
     _login_context_key,
     login_controller_for,
 )
@@ -164,6 +166,81 @@ class AutoLoopTests(unittest.TestCase):
         controller._concurrency = 1
         controller._circuit_break_threshold = max(3, 3 * controller._concurrency)
         self.assertEqual(controller._circuit_break_threshold, 3)
+
+    def test_login_worker_waits_before_exiting_on_empty_queue(self):
+        """登录队列瞬时不空时 worker 不能立即退出——重试/追加的账号
+        可能还在别的 worker 手里跑，立即退出会让并发永久塌缩。"""
+        controller = AutoLoopController()
+        controller._state = AutoLoopState.RUNNING
+        controller._options = {"login_only": True}
+        controller._login_queue = []
+        controller._target_count = 0
+
+        with patch("webui.auto_loop.time.sleep") as sleep_mock:
+            controller._worker_loop(0)
+
+        # 宽限期约 30s（10 轮 × 30 次 0.1s 轮询），瞬间退出时 sleep 一次都不会调
+        self.assertGreaterEqual(sleep_mock.call_count, 30)
+
+    def test_respawn_workers_fills_alive_deficit(self):
+        """队列补充新候选后，已退出的 worker 按 concurrency 缺口补拉。"""
+        controller = AutoLoopController()
+        controller._state = AutoLoopState.RUNNING
+        controller._concurrency = 3
+        controller._next_worker_id = 3
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+        stop = threading.Event()
+        alive = threading.Thread(target=stop.wait, daemon=True)
+        alive.start()
+        controller._workers = [dead, alive]
+        controller._worker_loop = Mock()
+        try:
+            spawned = controller._respawn_workers_locked()
+        finally:
+            stop.set()
+            alive.join(timeout=1)
+
+        self.assertEqual(spawned, 2)
+        self.assertEqual(len(controller._workers), 4)
+        for _ in range(50):
+            if controller._worker_loop.call_count >= 2:
+                break
+            threading.Event().wait(0.01)
+        self.assertEqual(
+            sorted(c.args[0] for c in controller._worker_loop.call_args_list),
+            [3, 4],
+        )
+
+    def test_respawn_skips_when_workers_at_capacity(self):
+        """存活 worker 已达并发上限时不重复补拉。"""
+        controller = AutoLoopController()
+        controller._state = AutoLoopState.RUNNING
+        controller._concurrency = 1
+        controller._next_worker_id = 1
+        stop = threading.Event()
+        alive = threading.Thread(target=stop.wait, daemon=True)
+        alive.start()
+        controller._workers = [alive]
+        controller._worker_loop = Mock()
+        try:
+            self.assertEqual(controller._respawn_workers_locked(), 0)
+            self.assertEqual(len(controller._workers), 1)
+        finally:
+            stop.set()
+            alive.join(timeout=1)
+
+    def test_respawn_skips_before_initial_spawn(self):
+        """manage_loop 初始 spawn 未收尾（_workers 为空）时不补拉。"""
+        controller = AutoLoopController()
+        controller._state = AutoLoopState.RUNNING
+        controller._concurrency = 5
+        controller._workers = []
+        controller._worker_loop = Mock()
+
+        self.assertEqual(controller._respawn_workers_locked(), 0)
+        controller._worker_loop.assert_not_called()
 
 
 if __name__ == "__main__":

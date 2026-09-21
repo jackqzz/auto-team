@@ -31,6 +31,17 @@ class _Session:
         return _Response(self.status_code)
 
 
+class _FailingSession:
+    def __init__(self, exc):
+        self.exc = exc
+        self.cookies = _Cookies()
+        self.calls = 0
+
+    def get(self, *_args, **_kwargs):
+        self.calls += 1
+        raise self.exc
+
+
 class WarmupProxySwitchTests(unittest.TestCase):
     def test_warmup_403_switches_proxy_and_continues_same_flow(self):
         first = _Session(403, {"__cf_bm": "blocked"})
@@ -56,6 +67,62 @@ class WarmupProxySwitchTests(unittest.TestCase):
         self.assertEqual(callback_calls[0][0], "http://proxy-one")
         self.assertIn("HTTP 403", callback_calls[0][1])
         self.assertEqual(flow.config.proxy, "http://proxy-two")
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 1)
+        create.assert_called_once()
+
+    def test_warmup_timeout_switches_proxy_immediately(self):
+        """超时/断连（status=None）与 403 一样是死出口信号：
+        第一次失败就换代理，不在同一出口上白等剩余 3×40s。"""
+        first = _FailingSession(RuntimeError("curl: (28) Operation timed out"))
+        second = _Session(200, {"oai-did": "device"})
+        callback_calls = []
+
+        flow = AuthFlow.__new__(AuthFlow)
+        flow.config = SimpleNamespace(proxy="http://proxy-one")
+        flow.session = first
+        flow._on_proxy_switch = lambda current, reason: (
+            callback_calls.append((current, reason)) or "http://proxy-two"
+        )
+        flow._country_code = "US"
+        flow._impersonate_candidates = ["chrome"]
+        flow._impersonate_idx = 0
+        flow._ua = "test-agent"
+        flow._navigation_headers = lambda: {}
+        flow.check_proxy = lambda: True
+
+        with patch.object(auth_flow, "create_http_session", return_value=second) as create:
+            self.assertTrue(flow.warmup())
+
+        self.assertEqual(len(callback_calls), 1)
+        self.assertEqual(callback_calls[0][0], "http://proxy-one")
+        self.assertEqual(flow.config.proxy, "http://proxy-two")
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 1)
+        create.assert_called_once()
+
+    def test_warmup_failure_without_callback_retries_same_proxy(self):
+        """没有代理池回调（手动任务/单代理）时保持旧行为：
+        重建会话重试，动态代理可借此轮换出口 IP。"""
+        first = _FailingSession(RuntimeError("curl: (28) Operation timed out"))
+        second = _Session(200, {"oai-did": "device"})
+
+        flow = AuthFlow.__new__(AuthFlow)
+        flow.config = SimpleNamespace(proxy="http://proxy-one")
+        flow.session = first
+        flow._on_proxy_switch = None
+        flow._country_code = "US"
+        flow._impersonate_candidates = ["chrome"]
+        flow._impersonate_idx = 0
+        flow._ua = "test-agent"
+        flow._navigation_headers = lambda: {}
+        flow.check_proxy = lambda: True
+
+        with patch.object(auth_flow, "create_http_session", return_value=second) as create, \
+             patch.object(auth_flow.time, "sleep"):
+            self.assertTrue(flow.warmup())
+
+        self.assertEqual(flow.config.proxy, "http://proxy-one")
         self.assertEqual(first.calls, 1)
         self.assertEqual(second.calls, 1)
         create.assert_called_once()

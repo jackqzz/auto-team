@@ -40,9 +40,18 @@ export const saveCandidateSettings = (payload) => http.post('/api/workspace-cand
 export const testWorkspacePushTarget = (workspace_id, target) => http.post('/api/workspace-candidates/push-test', { workspace_id, target })
 export const fetchWorkspaceCredentials = (workspace_id, emails, proxy_pool, seat_type = 'default', auto_push = false, params = {}) => http.post('/api/workspace-candidates/credentials', { workspace_id, emails, proxy_pool, seat_type, auto_push, ...params })
 export const loginOnlyWorkspace = (workspace_id, emails, proxy_pool, seat_type = 'default', params = {}) => http.post('/api/workspace-candidates/login-only', { workspace_id, emails, proxy_pool, seat_type, ...params })
+// 接受邀请 = 每个候选人一发 accounts/check + 收尾一次母号复核。成员侧请求
+// 走代理可能重试，单个按 ~20s 预算，保底 120s。
+export const acceptWorkspaceInvite = (workspace_id, emails, proxy_pool = '') => {
+  const count = Array.isArray(emails) ? emails.length : 0
+  const timeout = Math.max(120000, count * 20000)
+  return http.post('/api/workspace-candidates/accept-invite', { workspace_id, emails, proxy_pool }, { timeout })
+}
 export const trashCandidates = (workspace_id, emails) => http.post('/api/workspace-candidates/trash', { workspace_id, emails })
 export const restoreCandidatesFromTrash = (workspace_id, emails) => http.post('/api/workspace-candidates/trash/restore', { workspace_id, emails })
 export const emptyWorkspaceTrash = (workspace_id) => http.post('/api/workspace-candidates/trash/empty', { workspace_id })
+export const listCandidateTags = (workspace_id) => http.get('/api/workspace-candidates/tags', { params: { workspace_id } })
+export const setCandidateTags = (workspace_id, emails, tags, mode = 'add') => http.post('/api/workspace-candidates/tags', { workspace_id, emails, tags, tag_mode: mode })
 // 额度重置券。list 是只读的，consume 会不可逆地烧掉一张券，所以后端只接受单个
 // email，前端也必须先 list 让用户确认再 consume。
 export const listResetCredits = (workspace_id, email, proxy_pool = '') => http.get('/api/workspace-candidates/reset-credits', { params: { workspace_id, email, proxy_pool } })

@@ -529,6 +529,14 @@ def _do_register(
             else:
                 raise
 
+        # 记录注册方式到结果表：camoufox 浏览器流程 / 协议流程。
+        d["register_mode"] = (
+            "camoufox"
+            if not login_only
+            and str(options.get("register_mode") or "").strip().lower() == "camoufox"
+            else "protocol"
+        )
+
         # ─ 已有账号“补齐2FA” ─
         # 这条路径只补绑 TOTP：账号必须先有可用的 OpenAI 密码，登录时再
         # 由绑定链路通过邮箱 OTP 完成最近认证。这里绝不调用 user/register
@@ -676,7 +684,15 @@ def _do_register(
             "email": full.get("email", ""),
             "password": full.get("password", ""),
             "mail_kind": mail_source,
+            # register_mode 在前面已写进 full，重建 d 时必须带过来，
+            # 否则 save_registered 永远收到空值，registered.register_mode 一直是 ''。
+            "register_mode": full.get("register_mode", ""),
         }
+        # Camoufox geoip 指纹：浏览器实际生效的时区/语言；协议注册为空。
+        if full.get("register_timezone"):
+            d["register_timezone"] = full["register_timezone"]
+        if full.get("register_language"):
+            d["register_language"] = full["register_language"]
         # 2FA secret 只在当前流程的 enroll 响应中出现一次；登录补齐分支在这里
         # 之前已经拿到 secret，不能因凭证过滤把它丢掉。正常重登没有新 secret
         # 时 save_registered 会按旧值合并，不会覆盖已有记录。
@@ -833,6 +849,9 @@ def _do_register(
                     master["id"],
                     d.get("email", ""),
                     payload=d,
+                    # 成员 session 自证席位（/api/auth/session planType）走
+                    # 本账号登录时用的代理，不直连、不用母号出口。
+                    proxy=str((options or {}).get("proxy") or ""),
                 )
                 if resolved_seat == "usage_based":
                     skip_auto_export = True
@@ -1028,6 +1047,32 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
             cfg["cpa"] = {**cfg.get("cpa", {}), "proxy": task_proxy}
         if sub2api_enabled:
             cfg["sub2api"] = {**cfg.get("sub2api", {}), "proxy": task_proxy}
+
+    # CPA 静态家宽代理：空间显式开启且配置了专属池时，为本次推送的凭证
+    # 租用一个按计数最少分配的代理，写进凭证 JSON 的 proxy_url。绑定持久
+    # 化在 cpa_proxy_leases；额度耗尽/凭证失效入箱时会删 CPA 凭证并释放计数。
+    if cpa_enabled and workspace_db_id:
+        try:
+            cpa_ws_settings = db.get_workspace_settings(int(workspace_db_id))
+            cpa_pool = str(cpa_ws_settings.get("cpa_static_proxy_pool") or "").strip()
+            if cpa_ws_settings.get("cpa_static_proxy_enabled") and cpa_pool:
+                leased_proxy = db.lease_cpa_proxy(
+                    int(workspace_db_id), cred.get("email", ""), cpa_pool
+                )
+                if leased_proxy:
+                    cfg["cpa"] = {
+                        **cfg.get("cpa", {}),
+                        "credential_proxy_url": leased_proxy,
+                    }
+                    logging.getLogger("registrar").info(
+                        "[export] CPA 凭证绑定家宽代理 workspace_db_id=%s email=%s proxy=%s",
+                        workspace_db_id, cred.get("email", ""), db._mask_proxy(leased_proxy),
+                    )
+        except Exception as e:
+            logging.getLogger("registrar").warning(
+                "[export] CPA 家宽代理租用失败，本次推送不带凭证代理 workspace_db_id=%s err=%s",
+                workspace_db_id, e,
+            )
 
     from . import exporter  # 懒 import,避免未启用时强依赖
 

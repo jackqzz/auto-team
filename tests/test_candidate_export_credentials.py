@@ -1,6 +1,8 @@
 import unittest
 import base64
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 try:
@@ -174,6 +176,7 @@ class CandidateExportCredentialTests(unittest.TestCase):
                 self.assertEqual(render.call_args.kwargs, {
                     "workspace_id": "external-workspace-2",
                     "encrypt_credentials": False,
+                    "cpa_template": None,
                 })
 
     def test_workspace_sub2_export_can_mark_candidates_outbound_after_render(self):
@@ -209,6 +212,7 @@ class CandidateExportCredentialTests(unittest.TestCase):
         self.assertEqual(render.call_args.kwargs, {
             "workspace_id": "external-workspace-2",
             "encrypt_credentials": True,
+            "cpa_template": None,
         })
 
     def test_workspace_export_outbound_endpoint_encrypts_then_marks(self):
@@ -311,6 +315,103 @@ class CandidateExportCredentialTests(unittest.TestCase):
         self.assertEqual(response["text"], "candidate@example.com----OpenAI-password----JBSWY3DPEHPK3PXP")
         registered_query.assert_called_once_with(["candidate@example.com"])
         workspace_query.assert_not_called()
+
+    def test_cpa_template_flag_writes_proxy_url_and_disabled(self):
+        from webui import exporter
+
+        access = self._jwt({
+            "exp": 1788085162,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "ws-tpl"},
+            "https://api.openai.com/profile": {"email": "candidate@example.com"},
+        })
+        identity = self._jwt({"at_hash": exporter._oidc_at_hash(access)})
+        workspace = [{
+            "email": "candidate@example.com",
+            "access_token": access,
+            "refresh_token": "refresh-token",
+            "id_token": identity,
+            "password": "OpenAI-password",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+        }]
+        template = {"proxy_url": "socks5://user:pw@10.0.0.1:1080", "file_enabled": False}
+        request = app.ExportRegisteredReq(
+            format="cpa",
+            emails=["candidate@example.com"],
+            workspace_id=2,
+            refresh_oauth=False,
+            encrypt_credentials=False,
+            cpa_template=True,
+        )
+        with (
+            patch.object(app.db, "list_workspace_credentials_by_emails", return_value=workspace),
+            patch.object(app.db, "get_workspace_master", return_value={"workspace_id": "ws-tpl"}),
+            patch.object(app.db, "get_cpa_export_template", return_value=template) as tpl_getter,
+        ):
+            response = app.api_export_registered(request)
+
+        tpl_getter.assert_called_once()
+        data = json.loads(base64.b64decode(response["b64"]))
+        self.assertEqual(data["proxy_url"], "socks5://user:pw@10.0.0.1:1080")
+        self.assertTrue(data["disabled"])
+        self.assertEqual(data["password"], "OpenAI-password")
+
+    def test_cpa_export_without_template_keeps_legacy_shape(self):
+        from webui import exporter
+
+        access = self._jwt({
+            "exp": 1788085162,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "ws-plain"},
+            "https://api.openai.com/profile": {"email": "candidate@example.com"},
+        })
+        identity = self._jwt({"at_hash": exporter._oidc_at_hash(access)})
+        workspace = [{
+            "email": "candidate@example.com",
+            "access_token": access,
+            "refresh_token": "refresh-token",
+            "id_token": identity,
+        }]
+        request = app.ExportRegisteredReq(
+            format="cpa",
+            emails=["candidate@example.com"],
+            workspace_id=2,
+            refresh_oauth=False,
+            encrypt_credentials=False,
+            # cpa_template 未传 → 不读模版、不写 proxy_url
+        )
+        with (
+            patch.object(app.db, "list_workspace_credentials_by_emails", return_value=workspace),
+            patch.object(app.db, "get_workspace_master", return_value={"workspace_id": "ws-plain"}),
+            patch.object(app.db, "get_cpa_export_template") as tpl_getter,
+        ):
+            response = app.api_export_registered(request)
+
+        tpl_getter.assert_not_called()
+        data = json.loads(base64.b64decode(response["b64"]))
+        self.assertNotIn("proxy_url", data)
+        self.assertFalse(data["disabled"])
+
+    def test_cpa_export_template_settings_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(app.db, "DB_PATH", Path(tmp) / "t.db"):
+                app.db.init_db()
+                # 默认模版：启用凭证文件、无代理
+                self.assertEqual(
+                    app.db.get_cpa_export_template(),
+                    {"proxy_url": "", "file_enabled": True},
+                )
+                app.db.save_cpa_export_template(
+                    {"proxy_url": "http://u:p@h:3128", "file_enabled": False}
+                )
+                self.assertEqual(
+                    app.db.get_cpa_export_template(),
+                    {"proxy_url": "http://u:p@h:3128", "file_enabled": False},
+                )
+                # 部分更新只动指定字段
+                app.db.save_cpa_export_template({"file_enabled": True})
+                self.assertEqual(
+                    app.db.get_cpa_export_template(),
+                    {"proxy_url": "http://u:p@h:3128", "file_enabled": True},
+                )
 
 
 if __name__ == "__main__":

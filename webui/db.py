@@ -172,6 +172,17 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_proxy_cooldown_until
             ON proxy_cooldown(cooldown_until DESC);
 
+        -- CPA 静态家宽代理的租用绑定：一行 = 一个候选人在本空间占着一个
+        -- 家宽代理。池子的「计数」就是同一 proxy 值的行数，取最少计数的
+        -- 代理分配；凭证从 CPA 删除（或视作删除）后删行即计数-1。
+        CREATE TABLE IF NOT EXISTS cpa_proxy_leases (
+            workspace_master_id INTEGER NOT NULL,
+            email           TEXT NOT NULL,
+            proxy           TEXT NOT NULL DEFAULT '',
+            created_at      REAL NOT NULL,
+            PRIMARY KEY (workspace_master_id, email)
+        );
+
         -- 公开重登录页的惩罚记录。那边的账号只存在用户浏览器里，后端没有任何
         -- 按账号的持久行（不像候选人有 workspace_credentials），403 连击和 402
         -- 判死都得自己找地方落库。
@@ -255,6 +266,7 @@ def init_db():
         ("trash_due_at", "REAL"),
         ("trash_reason", "TEXT NOT NULL DEFAULT ''"),
         ("tag_status", "TEXT NOT NULL DEFAULT 'active'"),
+        ("tags", "TEXT NOT NULL DEFAULT '[]'"),
     ):
         if col not in cand_cols:
             con.execute(f"ALTER TABLE workspace_candidates ADD COLUMN {col} {definition}")
@@ -282,6 +294,27 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS idx_workspace_credentials_email ON workspace_credentials(email)")
     if "quota_json" not in {r[1] for r in con.execute("PRAGMA table_info(workspace_credentials)").fetchall()}:
         con.execute("ALTER TABLE workspace_credentials ADD COLUMN quota_json TEXT")
+    # 兑换码：一个 (空间, 账号) 固定对应一个码，持码人可在公开兑换页
+    # 反复导出该账号的加密 Sub2/CPA 凭证。空间删除时码随之失效。
+    con.execute("""CREATE TABLE IF NOT EXISTS redeem_codes (
+        code TEXT PRIMARY KEY,
+        workspace_master_id INTEGER NOT NULL,
+        email TEXT NOT NULL COLLATE NOCASE,
+        created_at REAL NOT NULL,
+        redeem_count INTEGER NOT NULL DEFAULT 0,
+        last_redeemed_at REAL,
+        UNIQUE (workspace_master_id, email),
+        FOREIGN KEY (workspace_master_id) REFERENCES workspace_masters(id) ON DELETE CASCADE
+    )""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_redeem_codes_email ON redeem_codes(email)")
+    # allow_secret=1 时该码可在公开兑换页兑换明文 账号----密码----2FA；
+    # 默认关闭，由「生成并导出兑换码」时的勾选控制。
+    if "allow_secret" not in {
+        r[1] for r in con.execute("PRAGMA table_info(redeem_codes)").fetchall()
+    }:
+        con.execute(
+            "ALTER TABLE redeem_codes ADD COLUMN allow_secret INTEGER NOT NULL DEFAULT 0"
+        )
     # 兼容早期版本：空间登录曾暂时写入 registered。根据 AT 中的 workspace id
     # 回填到独立表，避免历史上已获取的 Team 凭证无法导出。
     import base64 as _b64
@@ -308,6 +341,9 @@ def init_db():
     )
     con.execute(
         "DELETE FROM workspace_candidates WHERE workspace_master_id NOT IN (SELECT id FROM workspace_masters)"
+    )
+    con.execute(
+        "DELETE FROM redeem_codes WHERE workspace_master_id NOT IN (SELECT id FROM workspace_masters)"
     )
     # Plus 检测较早版本只把封号写进 extra_json.plus_check，未同步账号主状态。
     # 启动时补齐为统一的“已永久失效”类型，保证历史数据和新检测结果一致。
@@ -409,6 +445,18 @@ def init_db():
     con.commit()
     if "mail_kind" not in reg_cols:
         con.execute("ALTER TABLE registered ADD COLUMN mail_kind TEXT NOT NULL DEFAULT ''")
+        con.commit()
+    if "register_mode" not in reg_cols:
+        # 注册方式：protocol / camoufox / import；历史数据为空，前端显示「-」。
+        con.execute("ALTER TABLE registered ADD COLUMN register_mode TEXT NOT NULL DEFAULT ''")
+        con.commit()
+    if "register_timezone" not in reg_cols:
+        # Camoufox geoip 注册时浏览器实际生效的时区（IANA 名，如 America/New_York）。
+        con.execute("ALTER TABLE registered ADD COLUMN register_timezone TEXT NOT NULL DEFAULT ''")
+        con.commit()
+    if "register_language" not in reg_cols:
+        # Camoufox geoip 注册时浏览器实际生效的语言（navigator.language）。
+        con.execute("ALTER TABLE registered ADD COLUMN register_language TEXT NOT NULL DEFAULT ''")
         con.commit()
     con.execute(
         "UPDATE registered SET mail_kind=COALESCE(("
@@ -650,6 +698,10 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     # 空间专属的 CPA 推送配置；每项留空都跟随全局导出配置。
     "auto_push_cpa_url": "",
     "auto_push_cpa_mgmt_key": "",
+    # CPA 静态家宽代理池：默认关闭；启用后自动推送 CPA 时给凭证 JSON 写
+    # proxy_url，按租用计数最少取用；与全局/空间候选人代理池完全独立。
+    "cpa_static_proxy_enabled": False,
+    "cpa_static_proxy_pool": "",
     # Codex/Usage-based 席位是否跳过自动推送。只影响自动流程，手动推送不受此限。
     "auto_push_skip_codex_seat": True,
     "concurrency": 1,
@@ -690,6 +742,10 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     # 席位补齐是串行的：每切换一个成员后等待这么多秒再切下一个。
     "auto_seat_switch_gap_seconds": 30,
     "auto_prolite_candidate_seat_type": "default",
+    # 批量踢出空间成员：每踢完一个在 [min, max] 秒内随机 sleep，再踢下一个；
+    # 两个都填 0 表示不等待。
+    "kick_delay_min_seconds": 2,
+    "kick_delay_max_seconds": 5,
     "standard_fulfilled_total": 0,
     "prolite_fulfilled_total": 0,
 }
@@ -1103,6 +1159,9 @@ def _workspace_candidate_option_filters(
     trash_status: str = "",
     tag_status: str = "",
     group_name: str = "",
+    tag: str = "",
+    redeem_status: str = "",
+    keyword: str = "",
 ):
     join_status_expr = _workspace_candidate_join_status_expr()
     clauses = ["c.workspace_master_id=?"]
@@ -1160,6 +1219,28 @@ def _workspace_candidate_option_filters(
     if group_name:
         clauses.append("r.group_name=?")
         args.append(str(group_name))
+    tag_label = str(tag or "").strip()
+    if tag_label:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM json_each(COALESCE(c.tags,'[]')) WHERE value=?)"
+        )
+        args.append(tag_label)
+    normalized_redeem = str(redeem_status or "").strip().lower()
+    if normalized_redeem:
+        if normalized_redeem not in {"has_code", "no_code"}:
+            raise ValueError("redeem_status 只能是 has_code / no_code")
+        clauses.append(
+            ("EXISTS" if normalized_redeem == "has_code" else "NOT EXISTS")
+            + " (SELECT 1 FROM redeem_codes rc"
+              " WHERE rc.workspace_master_id=c.workspace_master_id AND rc.email=c.email)"
+        )
+    kw = str(keyword or "").strip()
+    if kw:
+        like = "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        clauses.append(
+            "(r.email LIKE ? ESCAPE '\\' OR r.group_name LIKE ? ESCAPE '\\')"
+        )
+        args.extend([like, like])
     return " AND ".join(clauses), args
 
 
@@ -1174,9 +1255,12 @@ def list_workspace_candidate_options(
     trash_status: str = "",
     tag_status: str = "",
     group_name: str = "",
+    tag: str = "",
+    redeem_status: str = "",
+    keyword: str = "",
 ) -> list[dict]:
     where, args = _workspace_candidate_option_filters(
-        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name,
+        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name, tag, redeem_status, keyword,
     )
     join_status_expr = _workspace_candidate_join_status_expr()
     sql = """SELECT r.email, r.group_name, c.seat_type, c.member_id,
@@ -1190,6 +1274,7 @@ def list_workspace_candidate_options(
         COALESCE(c.trash_due_at, 0) AS trash_due_at,
         COALESCE(c.trash_reason, '') AS trash_reason,
         COALESCE(c.tag_status, 'active') AS tag_status,
+        COALESCE(c.tags, '[]') AS tags,
         """ + join_status_expr + """ AS workspace_join_status,
         wc.quota_json,
         r.account_status,
@@ -1207,10 +1292,15 @@ def list_workspace_candidate_options(
              WHEN c.status LIKE 'quota_error_%' THEN c.status
              WHEN length(COALESCE(wc.access_token,''))>0 THEN 'workspace_credential'
              ELSE CASE WHEN """ + join_status_expr + """ = 'joined' THEN 'joined' ELSE c.workspace_join_status END END AS display_status,
+        rc.code AS redeem_code,
+        CASE WHEN rc.code IS NULL THEN 0 ELSE 1 END AS has_redeem_code,
+        COALESCE(pl.proxy, '') AS cpa_proxy,
         1 AS assigned
         FROM registered r JOIN workspace_candidates c
           ON c.email=r.email
         LEFT JOIN workspace_credentials wc ON wc.email=r.email AND wc.workspace_master_id=?
+        LEFT JOIN redeem_codes rc ON rc.workspace_master_id=c.workspace_master_id AND rc.email=c.email
+        LEFT JOIN cpa_proxy_leases pl ON pl.workspace_master_id=c.workspace_master_id AND pl.email=c.email
         WHERE """ + where.replace("c.workspace_master_id=?", "c.workspace_master_id=?") + " ORDER BY r.created_at DESC"
     # workspace id 同时用于 JOIN 左表和过滤条件。
     query_args = [int(workspace_master_id), *args]
@@ -1218,7 +1308,12 @@ def list_workspace_candidate_options(
         sql += " LIMIT ? OFFSET ?"
         query_args.extend([max(1, int(limit)), max(0, int(offset))])
     rows = _conn().execute(sql, query_args).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["tags"] = _parse_candidate_tags(d.get("tags"))
+        out.append(d)
+    return out
 
 
 def count_workspace_candidate_options(
@@ -1230,14 +1325,96 @@ def count_workspace_candidate_options(
     trash_status: str = "",
     tag_status: str = "",
     group_name: str = "",
+    tag: str = "",
+    redeem_status: str = "",
+    keyword: str = "",
 ) -> int:
     where, args = _workspace_candidate_option_filters(
-        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name,
+        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name, tag, redeem_status, keyword,
     )
     return int(_conn().execute("""SELECT COUNT(*) FROM registered r
         JOIN workspace_candidates c ON c.email=r.email
         LEFT JOIN workspace_credentials wc ON wc.email=r.email AND wc.workspace_master_id=?
         WHERE """ + where, [int(workspace_master_id), *args]).fetchone()[0])
+
+
+def _parse_candidate_tags(raw) -> list[str]:
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(t) for t in value if str(t).strip()]
+
+
+def _normalize_candidate_tags(tags) -> list[str]:
+    seen: dict[str, None] = {}
+    for t in tags or []:
+        label = str(t or "").strip()[:32]
+        if label and label not in seen:
+            seen[label] = None
+        if len(seen) >= 20:
+            break
+    return list(seen)
+
+
+def list_workspace_candidate_tags(workspace_master_id: int) -> list[str]:
+    """该空间全部候选人上不重复的标签列表（供筛选下拉）。"""
+    rows = _conn().execute(
+        "SELECT tags FROM workspace_candidates WHERE workspace_master_id=?",
+        (int(workspace_master_id),),
+    ).fetchall()
+    seen: dict[str, None] = {}
+    for r in rows:
+        for label in _parse_candidate_tags(r[0]):
+            seen.setdefault(label, None)
+    return sorted(seen)
+
+
+def set_workspace_candidate_tags(
+    workspace_master_id: int,
+    emails: list[str],
+    tags,
+    mode: str = "add",
+) -> int:
+    """对所选候选人批量打标。mode: add 追加 / remove 移除 / set 覆盖。"""
+    if mode not in {"add", "remove", "set"}:
+        raise ValueError("mode 只能是 add / remove / set")
+    new_tags = _normalize_candidate_tags(tags)
+    cleaned = [str(e or "").strip().lower() for e in emails if str(e or "").strip()]
+    if not cleaned:
+        return 0
+    marks = ",".join("?" * len(cleaned))
+    now = time.time()
+    changed = 0
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            f"SELECT email, tags FROM workspace_candidates "
+            f"WHERE workspace_master_id=? AND email IN ({marks})",
+            [int(workspace_master_id), *cleaned],
+        )
+        for row in cur.fetchall():
+            current = _parse_candidate_tags(row["tags"])
+            if mode == "set":
+                merged = new_tags
+            elif mode == "add":
+                merged = current + [t for t in new_tags if t not in current]
+            else:
+                drop = set(new_tags)
+                merged = [t for t in current if t not in drop]
+            if merged == current:
+                continue
+            rc = con.execute(
+                "UPDATE workspace_candidates SET tags=?, updated_at=? "
+                "WHERE workspace_master_id=? AND email=?",
+                (json.dumps(merged, ensure_ascii=False), now,
+                 int(workspace_master_id), row["email"]),
+            )
+            changed += rc.rowcount
+        con.commit()
+    return changed
 
 
 def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
@@ -1612,6 +1789,123 @@ def update_workspace_quota(workspace_master_id: int, email: str, quota: dict) ->
         con.commit()
 
 
+REDEEM_CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+REDEEM_CODE_LENGTH = 12
+
+
+def _generate_redeem_code() -> str:
+    return "".join(secrets.choice(REDEEM_CODE_ALPHABET) for _ in range(REDEEM_CODE_LENGTH))
+
+
+def normalize_redeem_code(code: object) -> str:
+    return str(code or "").strip().upper()
+
+
+def get_or_create_redeem_codes(
+    workspace_master_id: int, emails: list[str], allow_secret: bool = False
+) -> dict[str, str]:
+    """返回 {email: code}。同一 (空间, 账号) 永远复用同一个码，重复导出幂等。
+
+    ``allow_secret`` 是生成时的权威勾选：重复导出同一批账号会把这些码的
+    密码/2FA 兑换权限同步为本次勾选值（勾选开启、不勾关闭）。
+    """
+    wid = int(workspace_master_id or 0)
+    cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
+    if not wid or not cleaned:
+        return {}
+    marks = ",".join("?" * len(cleaned))
+    with _lock:
+        con = _conn()
+        rows = con.execute(
+            f"SELECT email, code FROM redeem_codes WHERE workspace_master_id=? AND email IN ({marks})",
+            [wid, *cleaned],
+        ).fetchall()
+        out = {str(r["email"]).lower(): str(r["code"]) for r in rows}
+        now = time.time()
+        for email in cleaned:
+            if email in out:
+                continue
+            for _ in range(20):
+                code = _generate_redeem_code()
+                try:
+                    con.execute(
+                        "INSERT INTO redeem_codes(code,workspace_master_id,email,created_at) VALUES (?,?,?,?)",
+                        (code, wid, email, now),
+                    )
+                    out[email] = code
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+        con.execute(
+            f"UPDATE redeem_codes SET allow_secret=? WHERE workspace_master_id=? AND email IN ({marks})",
+            (1 if allow_secret else 0, wid, *cleaned),
+        )
+        con.commit()
+    return out
+
+
+def get_redeem_code(code: object) -> Optional[dict]:
+    key = normalize_redeem_code(code)
+    if not key:
+        return None
+    row = _conn().execute(
+        """SELECT rc.code, rc.workspace_master_id, rc.email, rc.created_at,
+                  rc.redeem_count, rc.last_redeemed_at, rc.allow_secret,
+                  m.account AS master_account, m.workspace_id AS workspace_id
+           FROM redeem_codes rc
+           LEFT JOIN workspace_masters m ON m.id=rc.workspace_master_id
+           WHERE rc.code=?""",
+        (key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_redeem_codes(workspace_master_id: int = 0) -> list[dict]:
+    where = ""
+    args: list = []
+    if workspace_master_id:
+        where = "WHERE rc.workspace_master_id=?"
+        args.append(int(workspace_master_id))
+    rows = _conn().execute(
+        """SELECT rc.code, rc.workspace_master_id, rc.email, rc.created_at,
+                  rc.redeem_count, rc.last_redeemed_at, rc.allow_secret,
+                  m.account AS master_account, m.workspace_id AS workspace_id,
+                  CASE WHEN length(COALESCE(wc.access_token,''))>0 THEN 1 ELSE 0 END AS has_credential
+           FROM redeem_codes rc
+           LEFT JOIN workspace_masters m ON m.id=rc.workspace_master_id
+           LEFT JOIN workspace_credentials wc
+             ON wc.workspace_master_id=rc.workspace_master_id AND wc.email=rc.email
+           """ + where + " ORDER BY rc.created_at DESC",
+        args,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_redeem_codes(codes: list[str]) -> int:
+    cleaned = sorted({normalize_redeem_code(c) for c in (codes or []) if normalize_redeem_code(c)})
+    if not cleaned:
+        return 0
+    marks = ",".join("?" * len(cleaned))
+    with _lock:
+        con = _conn()
+        cur = con.execute(f"DELETE FROM redeem_codes WHERE code IN ({marks})", cleaned)
+        con.commit()
+        return int(cur.rowcount or 0)
+
+
+def mark_redeem_code_used(code: object) -> None:
+    key = normalize_redeem_code(code)
+    if not key:
+        return
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE redeem_codes SET redeem_count=redeem_count+1, last_redeemed_at=? WHERE code=?",
+            (time.time(), key),
+        )
+        con.commit()
+
+
 def assign_workspace_candidates(workspace_master_id: int, emails: list[str]) -> int:
     wid = int(workspace_master_id)
     if not get_workspace_master(wid):
@@ -1639,6 +1933,69 @@ def remove_workspace_candidates(workspace_master_id: int, emails: list[str]) -> 
     with _lock:
         con = _conn(); marks = ','.join('?' * len(cleaned))
         rc = con.execute(f"DELETE FROM workspace_candidates WHERE workspace_master_id=? AND email IN ({marks})", [int(workspace_master_id), *cleaned]); con.commit(); return rc.rowcount
+
+
+def remove_workspace_assignment(workspace_master_id: int, emails: list[str]) -> dict:
+    """彻底解除空间划分：候选行 + 该空间已获取凭证一起删（一个事务）。
+
+    踢出空间成员后使用 —— 人已经不在空间里，留着空间凭证只会变成孤儿数据。
+    注册结果和号池不受影响，账号还能重新划分到其他空间。
+    """
+    cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
+    counts = {"candidates": 0, "credentials": 0}
+    if not cleaned:
+        return counts
+    marks = ",".join("?" * len(cleaned))
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            f"DELETE FROM workspace_candidates WHERE workspace_master_id=? AND email IN ({marks})",
+            [int(workspace_master_id), *cleaned],
+        )
+        counts["candidates"] = rc.rowcount
+        rc = con.execute(
+            f"DELETE FROM workspace_credentials WHERE workspace_master_id=? AND email IN ({marks})",
+            [int(workspace_master_id), *cleaned],
+        )
+        counts["credentials"] = rc.rowcount
+        con.commit()
+    return counts
+
+
+def mark_workspace_candidates_kicked(workspace_master_id: int, emails: list[str]) -> dict:
+    """踢出空间成员后的本地落库：候选行保留但移入本空间垃圾箱（trash_reason='kicked'）。
+
+    一个事务里完成：清空 member_id/席位快照、加入状态回到 not_invited、
+    trash_status='trashed'，并删掉该空间凭证（人已不在空间，凭证即失效）。
+    注册结果/号池不受影响；从垃圾箱恢复后仍是普通候选人，可再次邀请。
+    """
+    cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
+    counts = {"candidates": 0, "credentials": 0}
+    if not cleaned:
+        return counts
+    marks = ",".join("?" * len(cleaned))
+    now = time.time()
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            f"""
+            UPDATE workspace_candidates
+               SET member_id='', seat_type='', codex_seat='', gpt_seat='',
+                   workspace_join_status='not_invited',
+                   trash_status='trashed', trash_due_at=0, trash_reason='kicked',
+                   updated_at=?
+             WHERE workspace_master_id=? AND email IN ({marks})
+            """,
+            [now, int(workspace_master_id), *cleaned],
+        )
+        counts["candidates"] = rc.rowcount
+        rc = con.execute(
+            f"DELETE FROM workspace_credentials WHERE workspace_master_id=? AND email IN ({marks})",
+            [int(workspace_master_id), *cleaned],
+        )
+        counts["credentials"] = rc.rowcount
+        con.commit()
+    return counts
 
 
 def update_workspace_candidate_tag_status(workspace_master_id: int, emails: list[str], tag_status: str) -> int:
@@ -1729,12 +2086,17 @@ def parse_lines(text: str, kind: str = "") -> list[dict]:
 
 def import_accounts(
     text: str, kind: str = "", group_name: str | None = None,
+    relay_suffix: str = "",
 ) -> dict:
     """批量入库。已存在的 email 仅在凭证变化时更新。
 
     解析阶段全对才写：有一行非法就整批拒绝（抛 ImportValidationError），
     不会出现"写进去一半"对不上账的情况。
+
+    ``relay_suffix``：自定义追加串（如 ``?json=1``），逐行拼到 OTP 中转
+    链接尾部，让中转服务按 JSON 等格式返回。
     """
+    relay_suffix = str(relay_suffix or "")
     rows = parse_lines(text, kind)
     # None 表示旧调用方没有指定分组，此时重复导入不能意外移动已有账号。
     # 空字符串则是前端明确选择了“未分组”。
@@ -1755,6 +2117,8 @@ def import_accounts(
             client_id = r.get("client_id", "") or ""
             refresh = r.get("refresh_token", "") or ""
             relay = r.get("relay_url", "") or ""
+            if relay and relay_suffix:
+                relay += relay_suffix
 
             cur = con.execute(
                 "SELECT password, refresh_token, relay_url, kind, group_name "
@@ -2278,6 +2642,7 @@ def save_registered(d: dict) -> None:
         "email", "password", "access_token", "session_token", "refresh_token",
         "id_token", "device_id", "csrf_token", "cookie_header",
         "totp_secret", "totp_factor_id", "group_name", "mail_kind",
+        "register_mode", "register_timezone", "register_language",
     }}
     with _lock:
         con = _conn()
@@ -2285,7 +2650,8 @@ def save_registered(d: dict) -> None:
             "SELECT group_name, kind, password FROM outlook_accounts WHERE email=?", (email,)
         ).fetchone()
         existing_row = con.execute(
-            "SELECT password, totp_secret, totp_factor_id, group_name, mail_kind, account_status "
+            "SELECT password, totp_secret, totp_factor_id, group_name, mail_kind, account_status, "
+            "register_mode, register_timezone, register_language "
             "FROM registered WHERE email=?", (email,)
         ).fetchone()
         group_name = (
@@ -2316,6 +2682,11 @@ def save_registered(d: dict) -> None:
         #    与密码合成一次 SELECT，顺带把两列旧值一起兜住。
         totp_secret = (d.get("totp_secret") or "").strip()
         totp_factor_id = (d.get("totp_factor_id") or "").strip()
+        register_mode = str(d.get("register_mode") or "").strip().lower()
+        if register_mode not in {"protocol", "camoufox", "import"}:
+            register_mode = ""
+        register_timezone = str(d.get("register_timezone") or "").strip()
+        register_language = str(d.get("register_language") or "").strip()
         if existing_row:
             if not password and (existing_row["password"] or "").strip():
                 password = existing_row["password"]
@@ -2323,6 +2694,16 @@ def save_registered(d: dict) -> None:
                 totp_secret = existing_row["totp_secret"]
                 # factor_id 跟着 secret 走：本轮没绑就沿用旧的
                 totp_factor_id = totp_factor_id or (existing_row["totp_factor_id"] or "")
+            # 注册方式是账号的既定事实：本轮没带值不清空，带了就更新
+            # （同一邮箱换模式重跑时应如实刷新）。
+            if not register_mode:
+                register_mode = (existing_row["register_mode"] or "")
+            # 注册时区/语言同理：协议注册/仅登录本轮没有浏览器指纹，
+            # 不能用空值把上一轮 Camoufox 记录的值清掉。
+            if not register_timezone:
+                register_timezone = (existing_row["register_timezone"] or "")
+            if not register_language:
+                register_language = (existing_row["register_language"] or "")
         # 通用 OTP 旧两段导入没有 OpenAI 密码列。账号后续通过正常注册/登录
         # 已经拿到密码时，把它回写到池行，之后“补齐2FA”即可判断该账号具备
         # 密码前置条件；不会覆盖用户重新导入的非空密码。
@@ -2335,8 +2716,9 @@ def save_registered(d: dict) -> None:
             "INSERT OR REPLACE INTO registered "
             "(email, group_name, mail_kind, password, access_token, session_token, refresh_token, "
             "id_token, device_id, csrf_token, cookie_header, "
-            "totp_secret, totp_factor_id, account_status, extra_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "totp_secret, totp_factor_id, account_status, extra_json, register_mode, "
+            "register_timezone, register_language, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 email,
                 group_name,
@@ -2353,6 +2735,9 @@ def save_registered(d: dict) -> None:
                 totp_factor_id,
                 account_status,
                 json.dumps(extra, ensure_ascii=False) if extra else None,
+                register_mode,
+                register_timezone,
+                register_language,
                 time.time(),
             ),
         )
@@ -2473,8 +2858,8 @@ def import_sub2api_registered(payload: object, group_name: str = "") -> dict:
                 "INSERT OR REPLACE INTO registered "
                 "(email, group_name, mail_kind, password, access_token, session_token, refresh_token, "
                 "id_token, device_id, csrf_token, cookie_header, totp_secret, totp_factor_id, "
-                "account_status, extra_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "account_status, extra_json, register_mode, register_timezone, register_language, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item["email"], item["group_name"] or ((old["group_name"] or "") if old else ""),
                     item["mail_kind"] or ((old["mail_kind"] or "") if old else ""),
@@ -2487,7 +2872,13 @@ def import_sub2api_registered(payload: object, group_name: str = "") -> dict:
                     # 导入使用 INSERT OR REPLACE，会整行替换，因此必须显式
                     # 保留旧状态；否则重新导入一次就会把失效账号恢复为 active。
                     ((old["account_status"] or "active") if old else "active"),
-                    json.dumps(item["extra"], ensure_ascii=False), time.time(),
+                    json.dumps(item["extra"], ensure_ascii=False),
+                    # 已有真实注册方式的老记录不覆盖；没有的才标 import。
+                    ((old["register_mode"] or "") if old else "") or "import",
+                    # 注册时区/语言是注册时刻的事实，导入不覆盖。
+                    ((old["register_timezone"] or "") if old else ""),
+                    ((old["register_language"] or "") if old else ""),
+                    time.time(),
                 ),
             )
             # Sub2API 示例同时携带 Outlook 收件箱凭证。同步写入邮箱表，
@@ -2575,8 +2966,8 @@ def import_2fa_registered(text: str, group_name: str = "") -> dict:
                 "INSERT OR REPLACE INTO registered "
                 "(email, group_name, mail_kind, password, access_token, session_token, refresh_token, "
                 "id_token, device_id, csrf_token, cookie_header, totp_secret, totp_factor_id, "
-                "account_status, extra_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "account_status, extra_json, register_mode, register_timezone, register_language, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item["email"], grp,
                     ((old["mail_kind"] or "") if old else ""),
@@ -2588,6 +2979,9 @@ def import_2fa_registered(text: str, group_name: str = "") -> dict:
                     keep("", "totp_factor_id"),
                     account_status,
                     json.dumps({"import_2fa": True}, ensure_ascii=False),
+                    ((old["register_mode"] or "") if old else "") or "import",
+                    ((old["register_timezone"] or "") if old else ""),
+                    ((old["register_language"] or "") if old else ""),
                     time.time(),
                 ),
             )
@@ -3019,7 +3413,8 @@ def list_registered(
         f"CASE WHEN {invalid_check} THEN 'permanently_invalid' ELSE account_status END AS account_status, "
         f"CASE WHEN {invalid_check} THEN 0 ELSE length(access_token) END AS at_len, "
         f"CASE WHEN {invalid_check} THEN 0 ELSE length(session_token) END AS st_len, "
-        f"CASE WHEN {invalid_check} THEN 0 ELSE length(refresh_token) END AS rt_len, extra_json, created_at FROM registered "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(refresh_token) END AS rt_len, "
+        f"register_mode, register_timezone, register_language, extra_json, created_at FROM registered "
         f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         [*args, limit, offset],
     )
@@ -3517,6 +3912,128 @@ def reset_proxy_lease_usage() -> float:
         )
         con.commit()
     return started_at
+
+
+# ─── CPA 静态家宽代理租用 ─────────────────────────────────────────────
+#
+# 计数模型：cpa_proxy_leases 一行 = 一个候选人在本空间占用的一个家宽代理，
+# 某代理的「计数」= 该 proxy 值的行数。分配取计数最少（并列时随机一条）；
+# 凭证从 CPA 删除/视为删除后删行，即该代理计数 -1。
+
+def lease_cpa_proxy(workspace_db_id: int, email: str, pool_text: str) -> str:
+    """为候选人从 CPA 静态家宽池租一个代理，返回租到的代理串。
+
+    已绑定过且绑定代理仍在当前池中的，直接复用原绑定（保证已推送凭证的
+    proxy_url 稳定、计数不变）；绑定代理已不在池中时释放后重新分配。
+    """
+    key = str(email or "").strip().lower()
+    pool = [
+        line.strip()
+        for line in str(pool_text or "").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not key or not pool:
+        return ""
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT proxy FROM cpa_proxy_leases WHERE workspace_master_id=? AND email=?",
+            (workspace_db_id, key),
+        ).fetchone()
+        if row:
+            bound = str(row["proxy"] or "").strip()
+            if bound in pool:
+                return bound
+            con.execute(
+                "DELETE FROM cpa_proxy_leases WHERE workspace_master_id=? AND email=?",
+                (workspace_db_id, key),
+            )
+        counts = {p: 0 for p in pool}
+        for r in con.execute(
+            "SELECT proxy, COUNT(*) AS n FROM cpa_proxy_leases "
+            "WHERE workspace_master_id=? GROUP BY proxy",
+            (workspace_db_id,),
+        ).fetchall():
+            p = str(r["proxy"] or "").strip()
+            if p in counts:
+                counts[p] = int(r["n"])
+        minimum = min(counts.values())
+        proxy = secrets.choice([p for p in pool if counts[p] == minimum])
+        con.execute(
+            "INSERT OR REPLACE INTO cpa_proxy_leases(workspace_master_id, email, proxy, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (workspace_db_id, key, proxy, time.time()),
+        )
+        con.commit()
+    return proxy
+
+
+def release_cpa_proxy(workspace_db_id: int, email: str) -> str:
+    """释放候选人租用的 CPA 家宽代理（计数 -1），返回被释放的代理串。"""
+    key = str(email or "").strip().lower()
+    if not key:
+        return ""
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT proxy FROM cpa_proxy_leases WHERE workspace_master_id=? AND email=?",
+            (workspace_db_id, key),
+        ).fetchone()
+        if not row:
+            return ""
+        con.execute(
+            "DELETE FROM cpa_proxy_leases WHERE workspace_master_id=? AND email=?",
+            (workspace_db_id, key),
+        )
+        con.commit()
+    return str(row["proxy"] or "").strip()
+
+
+def cpa_proxy_lease_counts(workspace_db_id: int) -> dict:
+    """本空间 CPA 家宽代理的当前租用计数：{proxy: 占用数}。"""
+    con = _conn()
+    return {
+        str(r["proxy"]): int(r["n"])
+        for r in con.execute(
+            "SELECT proxy, COUNT(*) AS n FROM cpa_proxy_leases "
+            "WHERE workspace_master_id=? GROUP BY proxy",
+            (workspace_db_id,),
+        ).fetchall()
+    }
+
+
+def get_cpa_proxy_lease(workspace_db_id: int, email: str) -> str:
+    """候选人在本空间已绑定的 CPA 家宽代理；未绑定返回空串。
+
+    只读查询，不分配、不校验池子——凭证既然已经带着这条代理推上了 CPA，
+    系统内同一账号的额度查询/重登录也固定走它，保持出口 IP 一致。
+    """
+    key = str(email or "").strip().lower()
+    if not key or not workspace_db_id:
+        return ""
+    con = _conn()
+    row = con.execute(
+        "SELECT proxy FROM cpa_proxy_leases WHERE workspace_master_id=? AND email=?",
+        (int(workspace_db_id), key),
+    ).fetchone()
+    return str(row["proxy"] or "").strip() if row else ""
+
+
+def get_cpa_proxy_lease_for_email(email: str) -> str:
+    """按邮箱查任意空间下的 CPA 家宽绑定；未绑定返回空串。
+
+    供公开 401 重登/公开额度检查这类没有空间上下文的入口使用；同一邮箱在
+    多个空间各有绑定时取最近一条。
+    """
+    key = str(email or "").strip().lower()
+    if not key:
+        return ""
+    con = _conn()
+    row = con.execute(
+        "SELECT proxy FROM cpa_proxy_leases WHERE email=? ORDER BY created_at DESC LIMIT 1",
+        (key,),
+    ).fetchone()
+    return str(row["proxy"] or "").strip() if row else ""
 
 
 # ─── 代理冷却 (cooldown) ─────────────────────────────────────────────
@@ -4077,6 +4594,28 @@ def get_export_internal_config() -> dict:
         "refresh_oauth":      get_setting("export_sub2api_refresh_oauth", "0") in ("1", "true"),
     }
     return {"cpa": cpa, "sub2api": sub2api}
+
+
+def get_cpa_export_template() -> dict:
+    """候选管理 CPA「导出模版配置」：勾选按模版导出时写进每个凭证 JSON。
+
+    proxy_url 是 CPA 凭证级代理字段；file_enabled 对应文件里的 disabled
+    （启用 → disabled=false）。默认启用、无代理。
+    """
+    return {
+        "proxy_url": get_setting("cpa_export_tpl_proxy_url", ""),
+        "file_enabled": get_setting("cpa_export_tpl_file_enabled", "1") in ("1", "true"),
+    }
+
+
+def save_cpa_export_template(data: dict) -> None:
+    if "proxy_url" in data:
+        set_setting("cpa_export_tpl_proxy_url", _setting_text(data["proxy_url"]))
+    if "file_enabled" in data:
+        set_setting(
+            "cpa_export_tpl_file_enabled",
+            "1" if _setting_bool(data["file_enabled"]) else "0",
+        )
 
 
 def get_public_relogin_config() -> dict:

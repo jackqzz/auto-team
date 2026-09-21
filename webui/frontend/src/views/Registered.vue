@@ -952,6 +952,19 @@ onActivated(() => load())
           </template>
         </el-table-column>
 
+        <!-- 注册模式 + 注册时区/语言 -->
+        <el-table-column label="注册模式" width="150">
+          <template #default="{ row }">
+            <el-tag v-if="row.register_mode === 'camoufox'" type="warning" size="small" effect="plain">Camoufox</el-tag>
+            <el-tag v-else-if="row.register_mode === 'protocol'" type="info" size="small" effect="plain">协议</el-tag>
+            <el-tag v-else-if="row.register_mode === 'import'" size="small" effect="plain">外部导入</el-tag>
+            <span v-else class="sub-hint">—</span>
+            <div v-if="row.register_timezone || row.register_language" class="secondary-meta">
+              <span class="sub-hint">{{ row.register_timezone || '—' }}<template v-if="row.register_language"> · {{ row.register_language }}</template></span>
+            </div>
+          </template>
+        </el-table-column>
+
         <!-- 密码 -->
         <el-table-column label="密码" min-width="160">
           <template #default="{ row }">

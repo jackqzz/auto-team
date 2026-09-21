@@ -40,6 +40,22 @@ function cst(value) {
   }).format(new Date(value))
 }
 
+// 到期倒计时：跟着 now 每 30s 重算，页面停留期间保持新鲜
+const now = ref(Date.now())
+let countdownTimer = 0
+
+function countdownText(value) {
+  const target = new Date(value || '').getTime()
+  if (!value || !Number.isFinite(target)) return ''
+  const diff = target - now.value
+  if (diff <= 0) return '已到期'
+  // ≥3 天按天显示；低于 3 天切到小时粒度（不足 1 小时按分钟）
+  if (diff >= 3 * 864e5) return `剩 ${Math.floor(diff / 864e5)}天`
+  const hours = Math.floor(diff / 36e5)
+  if (hours > 0) return `剩 ${hours}小时`
+  return `剩 ${Math.floor(diff / 6e4)}分`
+}
+
 function setRowBusy(target, id, busy) {
   target.value = { ...target.value, [id]: busy }
 }
@@ -229,8 +245,14 @@ async function deleteSelected() {
 }
 
 watch(page, () => load())
-onMounted(() => window.addEventListener('workspace-master-updated', handleWorkspaceUpdated))
-onUnmounted(() => window.removeEventListener('workspace-master-updated', handleWorkspaceUpdated))
+onMounted(() => {
+  window.addEventListener('workspace-master-updated', handleWorkspaceUpdated)
+  countdownTimer = setInterval(() => { now.value = Date.now() }, 30000)
+})
+onUnmounted(() => {
+  window.removeEventListener('workspace-master-updated', handleWorkspaceUpdated)
+  clearInterval(countdownTimer)
+})
 onActivated(() => load())
 </script>
 
@@ -448,6 +470,13 @@ onActivated(() => load())
                 <span class="renewal-val" :class="{ 'is-expiring': row.will_renew === 0 }">{{ cst(row.renewal_date) }}</span>
                 <el-tag v-if="row.is_delinquent" size="small" type="danger" effect="dark">欠费</el-tag>
                 <el-tag v-else-if="row.will_renew === 0" size="small" type="warning" effect="plain">不续订</el-tag>
+              </div>
+              <div v-if="countdownText(row.renewal_date)" class="renewal-countdown">
+                <el-tag
+                  size="small"
+                  :type="countdownText(row.renewal_date) === '已到期' ? 'danger' : 'info'"
+                  effect="plain"
+                >{{ countdownText(row.renewal_date) }}</el-tag>
               </div>
             </div>
           </template>
@@ -944,6 +973,10 @@ onActivated(() => load())
 .renewal-val {
   font-family: ui-monospace, SFMono-Regular, monospace;
   color: var(--el-text-color-regular);
+}
+
+.renewal-countdown {
+  margin-top: 4px;
 }
 
 /* style 是 scoped 的，不能蹭别处的 .text-danger，得在本文件里定义。 */

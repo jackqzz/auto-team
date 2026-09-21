@@ -30,6 +30,9 @@ export const useRuntimeStore = defineStore('runtime', () => {
     progress_percent: null,
     proxy_pool_usage: [],
   })
+  // 多任务并存时按 task_id 各存一份快照，进度页用分段标签页切换；
+  // autoStatus 仍保留给 Dashboard 等老消费方：注册任务优先，其次运行中的任务。
+  const autoTasks = ref({})
   const banner = ref('')          // 熔断/严重错误横幅
   const lastRunResult = ref(null) // { email, password, access_token_len, partial } 或 { error }
   const dataVersion = ref(0)      // 递增：通知号池/结果/记录表刷新
@@ -100,12 +103,23 @@ export const useRuntimeStore = defineStore('runtime', () => {
     if (autoEs) { try { autoEs.close() } catch (_) {} }
     const es = createSSE('/api/auto/stream', {
       state: (e) => {
-        try { autoStatus.value = JSON.parse(e.data) } catch (_) {}
+        try {
+          const d = JSON.parse(e.data)
+          const tid = d.task_id || 'register'
+          autoTasks.value = { ...autoTasks.value, [tid]: { ...d, task_id: tid } }
+          const reg = autoTasks.value.register
+          const running = Object.values(autoTasks.value)
+            .find((t) => t.state === 'running' || t.state === 'paused')
+          autoStatus.value = running && (!reg || reg.state === 'stopped')
+            ? running
+            : (reg || d)
+        } catch (_) {}
       },
       run_started: (e) => {
         try {
           const d = JSON.parse(e.data)
-          addLog(`[auto] 开始注册 ${d.email} (run=${d.run_id})`, 'evt')
+          const tag = d.task_label || 'auto'
+          addLog(`[${tag}] 开始注册 ${d.email} (run=${d.run_id})`, 'evt')
           streamRun(d.run_id) // 复用单跑 SSE，接管日志
         } catch (_) {}
       },
@@ -119,7 +133,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
           // retry_scheduled 字段决定，避免把中途失败误显示成账号失败。
           const suffix = d.ok ? '完成' : (d.retry_scheduled ? '本次失败，已排队重试' : '最终结束')
           addLog(
-            `[auto] ${tag} ${d.email} ${suffix}`,
+            `[${d.task_label || 'auto'}] ${tag} ${d.email} ${suffix}`,
             d.ok ? 'ok' : (d.retry_scheduled ? 'warn' : 'err'),
           )
           useStatsStore().refresh()
@@ -129,7 +143,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
       circuit_break: (e) => {
         try {
           const d = JSON.parse(e.data)
-          addLog(`[auto] 熔断: ${d.reason}`, 'err')
+          addLog(`[${d.task_label || 'auto'}] 熔断: ${d.reason}`, 'err')
           banner.value = d.reason
         } catch (_) {}
       },
@@ -155,7 +169,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   }
 
   return {
-    logs, autoStatus, banner, lastRunResult, dataVersion, runningSingle,
+    logs, autoStatus, autoTasks, banner, lastRunResult, dataVersion, runningSingle,
     addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream, disconnectAutoStream,
   }
 })

@@ -105,6 +105,50 @@ class AuthPhoneFlowTests(unittest.TestCase):
             ],
         )
 
+    def test_sms_rent_failure_does_not_reauthorize(self):
+        """租号失败（NO_NUMBERS 等）没有消费 authorization state，
+        下一轮应直接重租新号，而不是先重建 OAuth + 2FA。"""
+        flow = _flow_for_phone_tests()
+        ctrl = _FakePhoneController()
+        real_get_phone = ctrl.get_phone
+        rent_calls = {"n": 0}
+
+        def _flaky_get_phone():
+            rent_calls["n"] += 1
+            if rent_calls["n"] == 1:
+                ctrl.events.append(("get_phone_failed",))
+                raise RuntimeError("NO_NUMBERS")
+            return real_get_phone()
+
+        ctrl.get_phone = _flaky_get_phone
+        flow._add_phone_send = Mock(
+            return_value={
+                "page": {"type": "phone_otp_verification"},
+                "continue_url": "https://auth.openai.com/phone-verification",
+            }
+        )
+        flow._phone_otp_validate = Mock(
+            return_value={"continue_url": "https://chatgpt.com/api/auth/callback/openai"}
+        )
+        reauthorize = Mock(return_value="https://auth.openai.com/add-phone")
+
+        result = flow._do_sms_loop(ctrl, reauthorize_callback=reauthorize)
+
+        self.assertEqual(result, "https://chatgpt.com/api/auth/callback/openai")
+        reauthorize.assert_not_called()
+        self.assertEqual(rent_calls["n"], 2)
+        self.assertEqual(flow._add_phone_send.call_count, 1)
+        self.assertEqual(
+            [event[0] for event in ctrl.events],
+            [
+                "get_phone_failed",
+                "get_phone",
+                "send_succeeded",
+                "get_code",
+                "report_success",
+            ],
+        )
+
     def test_camoufox_selection_does_not_fall_back_to_api(self):
         flow = _flow_for_phone_tests()
         flow._sms_callback = object()
@@ -166,13 +210,40 @@ class AuthPhoneFlowTests(unittest.TestCase):
         flow.submit_mfa_totp.assert_called_once()
         flow._handle_add_phone_verification.assert_not_called()
 
-    def test_phone_reauthorization_builds_fresh_oauth_before_login(self):
+    def test_phone_reauthorization_uses_codex_authorize_landing(self):
+        """会话已认证时新的 Codex authorize 直落 /add-phone，
+        不再重跑 signin 登录链（已认证会话下 authorize/continue 会 409）。"""
         flow = _flow_for_phone_tests()
         flow.result = AuthResult()
         flow.result.email = "account@example.com"
-        flow.get_csrf_token = Mock(return_value="fresh-csrf")
-        flow.get_auth_url = Mock(return_value="https://auth.openai.com/fresh-authorize")
-        flow.auth_oauth_init = Mock(return_value="fresh-device")
+        flow._build_codex_authorize = Mock(
+            return_value=(
+                "https://auth.openai.com/oauth/authorize?x=1",
+                "state", "verifier", "http://localhost:1455/auth/callback", "cid",
+            )
+        )
+        flow._follow_authorize_for_callback = Mock(
+            return_value=("", "https://auth.openai.com/add-phone")
+        )
+        flow._codex_drive_login_from_log_in = Mock()
+
+        result = flow._reauthorize_for_add_phone(mail_provider="provider")
+
+        self.assertEqual(result, "https://auth.openai.com/add-phone")
+        flow._build_codex_authorize.assert_called_once_with(prompt_override="")
+        flow._codex_drive_login_from_log_in.assert_not_called()
+
+    def test_phone_reauthorization_drives_login_when_bounced_to_login(self):
+        """会话没保持住被打回 /log-in 时，在该 codex state 上重走密码/2FA。"""
+        flow = _flow_for_phone_tests()
+        flow.result = AuthResult()
+        flow.result.email = "account@example.com"
+        flow._build_codex_authorize = Mock(
+            return_value=("url", "s", "v", "r", "c")
+        )
+        flow._follow_authorize_for_callback = Mock(
+            return_value=("", "https://auth.openai.com/log-in")
+        )
         flow._codex_drive_login_from_log_in = Mock(
             return_value="https://auth.openai.com/add-phone"
         )
@@ -180,12 +251,6 @@ class AuthPhoneFlowTests(unittest.TestCase):
         result = flow._reauthorize_for_add_phone(mail_provider="provider")
 
         self.assertEqual(result, "https://auth.openai.com/add-phone")
-        flow.get_auth_url.assert_called_once_with(
-            "fresh-csrf", email="account@example.com"
-        )
-        flow.auth_oauth_init.assert_called_once_with(
-            "https://auth.openai.com/fresh-authorize"
-        )
         flow._codex_drive_login_from_log_in.assert_called_once_with(
             mail_provider="provider",
             handle_add_phone=False,

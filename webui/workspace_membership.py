@@ -674,6 +674,110 @@ def invite_candidates(workspace_db_id: int, emails: list[str], seat_type: str = 
     return _json(response)
 
 
+def accept_candidate_invite(
+    workspace_db_id: int,
+    email: str,
+    *,
+    proxy: str,
+    network_retries: int = 2,
+) -> bool:
+    """用候选人个人凭证请求 accounts/check，把待接受邀请落地为成员关系。
+
+    实测结论：wham/usage 与 /api/auth/session 都不会触发接受；只有
+    accounts/check（Web 客户端登录后枚举所属空间的那个调用）在处理
+    时会把绑定在该账号上的 pending 邀请转成成员关系。请求用候选人
+    个人 access_token + 个人 chatgpt_account_id，必须走候选人代理，
+    不触碰母号凭证与母号出口。
+
+    返回 True 表示响应的 accounts 列表里已经出现当前空间（即邀请已
+    被接受）；请求成功但空间未出现返回 False（邀请可能已过期/撤回）。
+    """
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value:
+        raise ValueError("候选人代理池为空，无法接受邀请")
+    master = db.get_workspace_master(workspace_db_id)
+    if not master:
+        raise RuntimeError("母号不存在")
+    workspace_id = str(master.get("workspace_id") or "").strip()
+    if not workspace_id:
+        raise RuntimeError("母号缺少 Workspace ID")
+    cred = db.get_registered(email)
+    token = str((cred or {}).get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("候选人缺少个人 Access Token，请先注册/导入账号凭证")
+    account_id = str(
+        (_payload(token).get("https://api.openai.com/auth") or {}).get("chatgpt_account_id") or ""
+    ).strip()
+    if not account_id:
+        raise RuntimeError("个人 Access Token 缺少 chatgpt_account_id，请重新登录刷新凭证")
+
+    session = create_http_session(proxy=proxy_value)
+    net_left = max(0, int(network_retries or 0))
+    rate_left = max(0, int(WORKSPACE_ADMIN_MAX_429_RETRIES or 0))
+    net_attempt = 0
+    rate_attempt = 0
+    response = None
+    while True:
+        try:
+            response = session.get(
+                f"{BASE}/backend-api/accounts/check/v4-2023-04-27",
+                headers={**_headers(token, account_id), "ChatGPT-Account-Id": account_id},
+                timeout=30,
+            )
+        except Exception as exc:
+            if net_left <= 0:
+                streak = db.record_candidate_proxy_failure(proxy_value)
+                logger.warning(
+                    "接受邀请代理传输失败 proxy=%s streak=%s/%s workspace_db_id=%s email=%s",
+                    proxy_value, streak, db.CANDIDATE_PROXY_FAILURE_STREAK,
+                    workspace_db_id, email,
+                )
+                raise QuotaNetworkError(
+                    f"接受邀请网络错误（已重试{net_attempt}次）：{exc}"
+                ) from exc
+            net_left -= 1
+            net_attempt += 1
+            delay = min(10.0, float(net_attempt))
+            logger.warning(
+                "接受邀请网络异常，将重试 workspace_db_id=%s email=%s attempt=%s wait=%.1fs error=%s",
+                workspace_db_id, email, net_attempt, delay, str(exc)[:180],
+            )
+            time.sleep(delay)
+            continue
+        if response.status_code >= 500 and net_left > 0:
+            net_left -= 1
+            net_attempt += 1
+            delay = min(10.0, float(net_attempt))
+            logger.warning(
+                "接受邀请上游 %s，将重试 workspace_db_id=%s email=%s attempt=%s wait=%.1fs",
+                response.status_code, workspace_db_id, email, net_attempt, delay,
+            )
+            time.sleep(delay)
+            continue
+        if response.status_code == 429 and rate_left > 0:
+            rate_left -= 1
+            delay = _retry_after_seconds(response, rate_attempt)
+            rate_attempt += 1
+            logger.warning(
+                "接受邀请触发限流，退避重试 workspace_db_id=%s email=%s attempt=%s wait=%.1fs",
+                workspace_db_id, email, rate_attempt, delay,
+            )
+            time.sleep(delay)
+            continue
+        break
+
+    # 拿到响应即证明代理链路可用，清零连击（与额度查询同一纪律）。
+    db.clear_candidate_proxy_failure(proxy_value)
+    if response.status_code >= 300:
+        raise UpstreamHttpError(
+            int(response.status_code),
+            f"accounts/check HTTP {response.status_code}: {_response_debug_body(response)[:300]}",
+        )
+    data = response.json() if response is not None else {}
+    accounts = data.get("accounts") if isinstance(data, dict) else {}
+    return workspace_id in (accounts or {})
+
+
 def check_candidate_membership(
     workspace_db_id: int,
     emails: list[str],
@@ -1037,6 +1141,101 @@ def _canonical_candidate_seat_type(value: object) -> str:
     return normalized
 
 
+def _seat_type_from_plan_type(plan_type: object) -> str:
+    """把 ``/api/auth/session`` 里 ``account.planType`` 映射到 canonical 席位。
+
+    例如 ``self_serve_business_prolite`` = 高级席位（prolite）。这是成员自己
+    会话里暴露的空间席位标识：planType 中带 prolite/premium/advanced 的为高级
+    席位，带 usage/codex 的为 Usage-based，其余已知商业/团队计划按标准席位。
+    不认识的 planType 返回 ""，不猜。
+    """
+    normalized = str(plan_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not normalized:
+        return ""
+    if "prolite" in normalized or "premium" in normalized or "advanced" in normalized:
+        return "prolite"
+    if "usage" in normalized or "codex" in normalized:
+        return "usage_based"
+    if any(k in normalized for k in ("business", "team", "enterprise", "workspace", "edu")):
+        return "default"
+    return ""
+
+
+def fetch_candidate_seat_via_session(
+    workspace_db_id: int,
+    email: str,
+    *,
+    proxy: str,
+) -> dict[str, str]:
+    """用候选人自己的空间 session 调 ``GET /api/auth/session`` 解析席位。
+
+    成员会话的 ``account.planType`` 自证席位（如 ``self_serve_business_prolite``），
+    不需要母号管理权限，也不要求上游成员列表已收录该成员——刚通过登录自动
+    接受邀请进空间的成员也能解析。请求必须走候选人代理（与额度查询同一套
+    纪律：绝不回退到母号出口或直连）。
+
+    返回 ``{"seat_type": canonical, "plan_type": 原始值}``；拿不到凭证、
+    无 session_token、请求失败或 planType 不认识时返回空 dict。
+    """
+    email = str(email or "").strip().lower()
+    proxy_value = str(proxy or "").strip()
+    if not email or not proxy_value:
+        return {}
+    rows = db.list_workspace_credentials_by_emails(workspace_db_id, [email])
+    if not rows:
+        return {}
+    session_token = str(rows[0].get("session_token") or "").strip()
+    if not session_token:
+        return {}
+    master = db.get_workspace_master(workspace_db_id) or {}
+    wid = str(master.get("workspace_id") or "").strip()
+    session = create_http_session(proxy=proxy_value)
+    session.cookies.set(
+        "__Secure-next-auth.session-token",
+        session_token,
+        domain=".chatgpt.com",
+        path="/",
+    )
+    try:
+        response = session.get(
+            f"{BASE}/api/auth/session",
+            headers={
+                "Accept": "application/json",
+                "Origin": BASE,
+                "Referer": f"{BASE}/",
+                "oai-device-id": _workspace_device_id(wid),
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        logger.warning(
+            "候选人 session 席位查询网络异常 workspace_db_id=%s email=%s error=%s",
+            workspace_db_id, email, str(exc)[:180],
+        )
+        return {}
+    if response.status_code < 200 or response.status_code >= 300:
+        logger.warning(
+            "候选人 session 席位查询失败 workspace_db_id=%s email=%s status=%s body=%s",
+            workspace_db_id, email, response.status_code, _response_debug_body(response),
+        )
+        return {}
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    account = data.get("account") if isinstance(data, dict) else {}
+    plan = str((account or {}).get("planType") or (account or {}).get("plan_type") or "").strip()
+    seat = _seat_type_from_plan_type(plan)
+    if not seat:
+        if plan:
+            logger.info(
+                "候选人 session planType 未识别 workspace_db_id=%s email=%s planType=%s",
+                workspace_db_id, email, plan,
+            )
+        return {}
+    return {"seat_type": seat, "plan_type": plan}
+
+
 def _refresh_candidate_seat_snapshot(workspace_db_id: int, email: str) -> dict:
     current = fetch_candidate_seats(workspace_db_id, [email]).get(str(email).strip().lower(), {})
     if current:
@@ -1060,13 +1259,15 @@ def resolve_candidate_seat_type(
     email: str,
     *,
     payload: dict | None = None,
+    proxy: str = "",
 ) -> str:
     """解析候选人当前席位类型。
 
     优先级：
     1. 本地候选席位缓存；
     2. 本次登录/凭证结果里携带的席位字段；
-    3. 远端 Team 管理接口查询；
+    3. 成员自己的 ``/api/auth/session`` planType（需传候选人代理）；
+    4. 远端 Team 管理接口查询（仅在尚无空间凭证时）；
 
     返回 canonical seat_type：default / usage_based / prolite / ""。
     """
@@ -1093,12 +1294,28 @@ def resolve_candidate_seat_type(
             return seat
     row = db.get_workspace_candidate(workspace_db_id, email) or {}
     # 已经拿到当前空间凭证时，说明该成员已经成功进入空间；
-    # 这时不要再回母号查 members/users，直接使用本地缓存即可。
+    # 这时不要再回母号查 members/users——先查本地缓存，缓存空时改用
+    # 成员自己的 session 问 /api/auth/session 拿 planType（需候选人代理）。
     if db.list_workspace_credentials_by_emails(workspace_db_id, [email]):
         for value in (row.get("seat_type"), row.get("gpt_seat"), row.get("codex_seat")):
             seat = _canonical_candidate_seat_type(value)
             if seat in {"default", "usage_based", "prolite"}:
                 return seat
+        session_seat = fetch_candidate_seat_via_session(
+            workspace_db_id, email, proxy=proxy,
+        ).get("seat_type", "")
+        if session_seat in {"default", "usage_based", "prolite"}:
+            # 顺手回填本地缓存，后续解析/席位切换不用再发请求。
+            try:
+                db.update_workspace_candidate_seat_type(
+                    workspace_db_id, email, session_seat,
+                )
+            except Exception:
+                logger.debug(
+                    "回填 session 席位到候选缓存失败 workspace_db_id=%s email=%s",
+                    workspace_db_id, email, exc_info=True,
+                )
+            return session_seat
         return ""
     refreshed = _refresh_candidate_seat_snapshot(workspace_db_id, email)
     seat = _canonical_candidate_seat_type(refreshed.get("raw_seat_type") or refreshed.get("seat_type"))
@@ -1216,7 +1433,62 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
             "error": "候选关系不存在或母号已删除，不执行入箱",
             "seat": seat,
         }
+    _cleanup_cpa_credential_after_trash(workspace_db_id, email, reason)
     return {"ok": True, "seat": seat}
+
+
+# 只有「额度耗尽 / 凭证永久失效」这类自动化入箱才联动删除 CPA 凭证；
+# 手动入箱（manual_trash）和踢出（kicked）不动 CPA，由用户自行处置；
+# 各种 *_retry 是排期占位状态，不走到这里。
+_CPA_TRASH_CLEANUP_REASONS = {"quota_zero", "quota_403", "login_403", "account_invalid"}
+
+
+def _cleanup_cpa_credential_after_trash(workspace_db_id: int, email: str, reason: str) -> None:
+    """入箱联动：从 CPA 删掉该账号的凭证文件，并释放其租用的家宽代理。
+
+    无论 CPA 删除结果如何（成功 / 404 找不到 / 请求失败）都释放代理绑定——
+    该账号已入箱，绑定留在本地只会让池计数虚高；找不到文件按约定也计数-1。
+    """
+    if str(reason or "").strip() not in _CPA_TRASH_CLEANUP_REASONS:
+        return
+    try:
+        cfg = dict((db.get_export_internal_config() or {}).get("cpa") or {})
+        ws_settings = db.get_workspace_settings(workspace_db_id)
+        for setting_key, cfg_key in (
+            ("auto_push_cpa_url", "cpa_url"),
+            ("auto_push_cpa_mgmt_key", "cpa_mgmt_key"),
+        ):
+            value = str(ws_settings.get(setting_key) or "").strip()
+            if value:
+                cfg[cfg_key] = value
+        if cfg.get("cpa_url") and cfg.get("cpa_mgmt_key"):
+            from . import exporter  # 懒 import，保持模块载入轻量
+            result = exporter.delete_cpa_auth_file(cfg, email)
+            if result.get("ok"):
+                logger.info(
+                    "入箱联动删除 CPA 凭证 workspace_db_id=%s email=%s deleted=%s not_found=%s",
+                    workspace_db_id, email, bool(result.get("deleted")), bool(result.get("not_found")),
+                )
+            else:
+                logger.warning(
+                    "入箱联动删除 CPA 凭证失败 workspace_db_id=%s email=%s error=%s",
+                    workspace_db_id, email, str(result.get("error") or "")[:300],
+                )
+        else:
+            logger.info(
+                "入箱联动跳过 CPA 删除（本空间未生效 CPA 配置）workspace_db_id=%s email=%s",
+                workspace_db_id, email,
+            )
+    except Exception:
+        logger.exception(
+            "入箱联动 CPA 删除异常 workspace_db_id=%s email=%s", workspace_db_id, email
+        )
+    released = db.release_cpa_proxy(workspace_db_id, email)
+    if released:
+        logger.info(
+            "入箱联动释放 CPA 家宽代理 workspace_db_id=%s email=%s proxy=%s",
+            workspace_db_id, email, db._mask_proxy(released),
+        )
 
 
 def trash_workspace_candidates_by_email(

@@ -64,7 +64,9 @@ http.interceptors.response.use(
     err.status = error?.response?.status
     err.data = data
     const hash = window.location.hash || ''
-    const onPublicPage = hash.startsWith('#/public-relogin')
+    // /redeem 是公开兑换页；注意不能用 startsWith('#/redeem')，会把管理页 /redeem-codes 也算进去
+    const onPublicPage =
+      hash.startsWith('#/public-relogin') || hash === '#/redeem' || hash.startsWith('#/redeem?')
     if (err.status === 401 && !onPublicPage && !hash.startsWith('#/login')) {
       window.location.hash = '#/login'
     }

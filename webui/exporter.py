@@ -25,7 +25,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +478,13 @@ def export_to_cpa(cred: dict, cfg: dict, *,
     CurlMime = _import_cffi_mime()
 
     token_data = build_cpa_token_json(cred)
+    # 凭证级代理：CPA 静态家宽池为本次推送分配的代理写进凭证 JSON 的
+    # proxy_url 字段（CPA/CLIProxyAPI 按凭证维度使用）。只认调用方显式
+    # 传入的 cfg["credential_proxy_url"]——cred 里可能混入导入源自带的
+    # proxy_url 字段，不能默认采用。
+    credential_proxy = str(cfg.get("credential_proxy_url") or "").strip()
+    if credential_proxy:
+        token_data["proxy_url"] = credential_proxy
     email = token_data.get("email") or "unknown"
     filename = f"{email}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
@@ -859,6 +866,50 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
 
 
 # ──────────────────────── 连通性测试 ────────────────────────
+
+
+def delete_cpa_auth_file(cfg: dict, email: str, *,
+                         log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+    """删除 CPA 上的 ``<email>.json`` 凭证文件。
+
+    404/找不到视为已删除（``ok=True, not_found=True``）——调用方只关心
+    "CPA 里不再有这个凭证"，不关心它是不是这次请求删掉的。
+    """
+    log = log_fn or (lambda m, lvl="info": logger.info(m))
+    api_url = (cfg.get("cpa_url") or "").rstrip("/").strip()
+    api_key = (cfg.get("cpa_mgmt_key") or "").strip()
+    if not api_url or not api_key:
+        return {"ok": False, "skipped": True, "error": "CPA 未配置 URL 或管理密钥"}
+    email = str(email or "").strip()
+    if not email:
+        return {"ok": False, "error": "email 为空"}
+    cffi = _import_cffi()
+    filename = f"{email}.json"
+    url = f"{api_url}/v0/management/auth-files?name={quote(filename, safe='')}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Management-Key": api_key,
+    }
+    try:
+        resp = cffi.delete(
+            url,
+            headers=headers,
+            verify=False,
+            timeout=int(cfg.get("cpa_timeout") or DEFAULT_TIMEOUT),
+            impersonate="chrome110",
+        )
+    except Exception as e:
+        log(f"[CPA] 删除 {filename} 请求异常: {e}", "error")
+        return {"ok": False, "error": str(e), "file_name": filename}
+    body = (resp.text or "")[:300]
+    if resp.status_code in (200, 201, 204):
+        log(f"[CPA] 已删除凭证文件 {filename}", "info")
+        return {"ok": True, "deleted": True, "file_name": filename}
+    if resp.status_code == 404:
+        log(f"[CPA] 凭证文件 {filename} 不存在，按已删除处理", "info")
+        return {"ok": True, "deleted": False, "not_found": True, "file_name": filename}
+    log(f"[CPA] 删除 {filename} 失败: HTTP {resp.status_code} {body}", "warn")
+    return {"ok": False, "error": f"HTTP {resp.status_code}: {body}", "file_name": filename}
 
 
 def test_cpa(cfg: dict) -> dict:

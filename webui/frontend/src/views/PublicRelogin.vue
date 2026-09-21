@@ -802,8 +802,10 @@ const checkAccounts = async (items, notify = true, autoReloginOn401 = false) => 
 }
 
 const doCheck = async () => {
-  const rows = checkableAccounts.value
-  if (!rows.length) return ElMessage.warning('没有可检测的账号（停用账号已过滤）')
+  const selectedIds = new Set(selectedAccounts.value.map((item) => item.id))
+  const rows = checkableAccounts.value.filter((item) => selectedIds.has(item.id))
+  if (!selectedAccounts.value.length) return ElMessage.warning('请先勾选要检查的账号')
+  if (!rows.length) return ElMessage.warning('所选账号都不可检测（停用账号已过滤）')
   await checkAccounts([...rows])
 }
 
@@ -871,11 +873,18 @@ function formatCheckedAt(value) {
 }
 
 const doRelogin = async (onlyRevived = true) => {
+  if (!selectedAccounts.value.length) return ElMessage.warning('请先勾选要重登录的账号')
+  const selectedIds = new Set(selectedAccounts.value.map((item) => item.id))
   const list = accounts.value.filter((item) => (
-    item.status !== 'deactivated'
+    selectedIds.has(item.id)
+    && item.status !== 'deactivated'
     && (item.status === '401' || !onlyRevived)
   ))
-  if (!list.length) return ElMessage.warning('没有可重新登录的账号')
+  if (!list.length) {
+    return ElMessage.warning(
+      onlyRevived ? '所选账号里没有 401 状态的账号' : '没有可重新登录的账号',
+    )
+  }
   relogining.value = true
   reloginProgress.value = { done: 0, total: list.length }
   const targetIds = new Set(list.map((item) => item.id))
@@ -1454,12 +1463,24 @@ onBeforeUnmount(() => {
             <Icon icon="lucide:eraser" class="btn-icon" /> 清空列表
           </el-button>
 
-          <el-button :loading="checking" type="primary" @click="doCheck" class="action-btn">
-            <Icon icon="lucide:check-circle-2" class="btn-icon" /> 检查额度 / 401
+          <el-button
+            :loading="checking"
+            type="primary"
+            :disabled="!selectedAccounts.length"
+            @click="doCheck"
+            class="action-btn"
+          >
+            <Icon icon="lucide:check-circle-2" class="btn-icon" /> 检查额度 / 401 ({{ selectedAccounts.length }})
           </el-button>
 
-          <el-button :loading="relogining" type="success" @click="doRelogin(true)" class="action-btn">
-            <Icon icon="lucide:refresh-cw" class="btn-icon" /> 一键重新登录
+          <el-button
+            :loading="relogining"
+            type="success"
+            :disabled="!selectedAccounts.length"
+            @click="doRelogin(true)"
+            class="action-btn"
+          >
+            <Icon icon="lucide:refresh-cw" class="btn-icon" /> 一键重新登录 ({{ selectedAccounts.length }})
           </el-button>
 
           <el-button @click="poolPushDrawerVisible = true" class="action-btn">
@@ -1499,6 +1520,10 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="action-right">
+          <a class="nav-link" href="#/redeem">
+            <Icon icon="lucide:ticket" /> 凭证兑换
+          </a>
+          <el-divider direction="vertical" />
           <div class="config-switches">
             <el-checkbox v-model="sub2RefreshOauth" :disabled="loading || downloading" size="small">
               导出前 RT 刷新 OAuth
@@ -2037,6 +2062,17 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px;
 }
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--el-color-primary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.nav-link:hover { text-decoration: underline; }
 
 .help-icon {
   font-size: 14px;

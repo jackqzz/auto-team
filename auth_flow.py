@@ -464,6 +464,10 @@ class AuthResult:
         self.refresh_token: str = ""
         self.cookie_header: str = ""
         self.totp_secret: str = ""
+        # Camoufox 注册时浏览器实际生效的时区/语言（geoip 跟随出口 IP）。
+        # 协议注册不走浏览器，这两个字段留空。
+        self.register_timezone: str = ""
+        self.register_language: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -480,6 +484,8 @@ class AuthResult:
             "refresh_token": self.refresh_token,
             "cookie_header": self.cookie_header,
             "totp_secret": self.totp_secret,
+            "register_timezone": self.register_timezone,
+            "register_language": self.register_language,
         }
 
 
@@ -1413,34 +1419,55 @@ class AuthFlow:
         self,
         mail_provider: Optional[MailProvider] = None,
     ) -> str:
-        """为 add-phone 换号建立一套全新的 OAuth + 登录/2FA 状态。
+        """为 add-phone 换号建立一套停在 /add-phone 页面的新授权状态。
 
         ``/api/accounts/add-phone/send`` 是绑定在一次 authorize state 上的
-        一次性步骤。旧实现只释放手机号后重试该 POST，第二个号码必然可能收到
-        ``Invalid authorization step``。这里通过 ChatGPT signin 入口建立一套
-        全新授权状态，再调用 ``_codex_drive_login_from_log_in`` 完成密码/TOTP
-        （无密码账号则完成邮箱 OTP + TOTP），最后只返回新的 add-phone URL，
-        不在此处租号或提交手机号。
+        一次性步骤，发码即消费。换号需要一套新的、停在 add-phone 的 state。
+
+        走到这里时登录会话已在 auth-server 上认证完毕，任何新 authorize
+        都会**跳过登录页**：账号若被门控手机验证则直落 /add-phone —— 正是
+        要的状态。所以不再像旧实现那样重跑 chatgpt signin 的密码/TOTP：
+        已认证会话下那条路拿不到 login 屏，authorize/continue 必然
+        409 invalid_state（2026-09-18 实测 100% 复现；9/10 之前还能走通，
+        属 OpenAI 侧行为变化）。
+
+        现在直接用一组新的 Codex authorize（prompt="" 让会话自动推进）：
+        - 落 /add-phone → 直接返回，零登录开销；
+        - 落 /log-in    → 会话没保持住，在该 codex state 上照旧走密码/2FA
+                          （与 oauth_codex_rt_exchange 主流程同款路径）；
+        - 其它落点      → 抛错并带 final_url，便于排查。
         """
         email = (self.result.email or "").strip()
         if not email:
             raise RuntimeError("换号前重新 OAuth 缺少账号邮箱")
 
-        logger.info("[sms] 换号前重新初始化 OAuth，并重新执行密码/2FA")
-        csrf_token = self.get_csrf_token()
-        auth_url = self.get_auth_url(csrf_token, email=email)
-        self.auth_oauth_init(auth_url)
-
-        continue_url = self._codex_drive_login_from_log_in(
-            mail_provider=mail_provider,
-            handle_add_phone=False,
+        logger.info("[sms] 换号前重新发起 Codex 授权（会话已认证，预期直落 add-phone）")
+        auth_url, _state, _verifier, redirect_uri, _client_id = (
+            self._build_codex_authorize(prompt_override="")
         )
-        continue_url = self._normalize_continue_url(continue_url or "")
-        if not self._is_add_phone_state(page_type="", continue_url=continue_url):
+        _callback, final_url = self._follow_authorize_for_callback(
+            auth_url, redirect_uri, "sms_reauth_codex"
+        )
+        final_url = self._normalize_continue_url(final_url or "")
+        if self._is_add_phone_state(page_type="", continue_url=final_url):
+            return final_url
+
+        if "/log-in" in (final_url or ""):
+            logger.info("[sms] 会话未保持住被打回 /log-in，在 codex state 上重走密码/2FA")
+            continue_url = self._codex_drive_login_from_log_in(
+                mail_provider=mail_provider,
+                handle_add_phone=False,
+            )
+            continue_url = self._normalize_continue_url(continue_url or "")
+            if self._is_add_phone_state(page_type="", continue_url=continue_url):
+                return continue_url
             raise RuntimeError(
                 "换号前重新登录/2FA完成，但未进入 add-phone 状态"
             )
-        return continue_url
+
+        raise RuntimeError(
+            f"换号前重新授权未回到 add-phone 状态 final={final_url[:160]}"
+        )
 
     def _codex_drive_login_from_log_in(
         self,
@@ -1853,13 +1880,19 @@ class AuthFlow:
             except Exception:
                 pass
 
+        # 当前 authorization state 是否已被 add-phone/send 消费。
+        # 租号失败（NO_NUMBERS 等）根本没碰 state，下一轮直接重租即可——
+        # 无条件重授权会白白烧掉授权，还可能 409 让整个循环连第二次租号
+        # 都摸不到。
+        state_consumed = False
+
         for phone_attempt in range(1, max_phone_attempts + 1):
             logger.info("[sms] 🔁 第 %d/%d 个号尝试...", phone_attempt, max_phone_attempts)
 
             # 一次 add-phone/send 会消费当前 authorization state。第二个号码
             # 不能只 cleanup 后继续 POST；必须重新建立 OAuth 授权并重新走密码
             # + TOTP（或邮箱 OTP + TOTP）流程，再租新号码。
-            if phone_attempt > 1:
+            if state_consumed:
                 if reauthorize_callback is None:
                     last_err = RuntimeError(
                         "SMS 换号前无法重新建立 OAuth/2FA 授权状态；"
@@ -1881,6 +1914,7 @@ class AuthFlow:
                         raise RuntimeError(
                             "换号前重新授权未回到 add-phone 状态"
                         )
+                    state_consumed = False  # 新 state 已建立，尚未消费
                     logger.info(
                         "[sms] 重新授权成功，继续 add-phone: %s",
                         fresh_url[:180],
@@ -1904,6 +1938,9 @@ class AuthFlow:
                 continue
 
             # 阶段 2：通知 OpenAI 发码到这个号
+            # add-phone/send 一旦发出即视为消费当前 authorization state
+            # （无论服务端返回成功还是业务错误），下一轮必须先重新授权。
+            state_consumed = True
             send_resp = None
             try:
                 logger.info("[sms] 📤 准备 POST add-phone/send (phone=%s) ...", phone)
@@ -3616,16 +3653,20 @@ class AuthFlow:
                 + (f"，已有 cookie: {sorted(cookies)}" if cookies else "，无任何 cookie")
             )
 
-            # CF 明确返回 403 时，不在同一个坏出口上消耗剩余 warmup 次数。
-            # 自动任务由回调按本次任务计数快照重新租代理；SID/动态代理即使返回
-            # 同一 URL，新 session 也会触发服务端轮换出口 IP。
-            if status == 403 and attempt < 3 and self._on_proxy_switch:
+            # 只要这一轮没种到 cookie 就说明当前出口不可用：403 是 CF 拦，
+            # status=None 是超时/断连（死出口最常见的形态，同 IP 重试只会
+            # 再白等 40s），其它状态码同理。有代理池回调就立即换出口，不在
+            # 同一坏出口上消耗剩余 warmup 次数；回调缺失或池里没新代理时
+            # 退回旧行为（重建会话，SID/动态代理可借此轮换出口 IP）。
+            if attempt < 3 and self._on_proxy_switch:
+                reason = (
+                    f"warmup HTTP {status}：未种到 oai-did"
+                    if status is not None
+                    else "warmup 请求失败（超时/断连）：未种到 oai-did"
+                )
                 current_proxy = (self.config.proxy or "").strip()
                 try:
-                    new_proxy = self._on_proxy_switch(
-                        current_proxy,
-                        "warmup HTTP 403：未种到 oai-did",
-                    )
+                    new_proxy = self._on_proxy_switch(current_proxy, reason)
                 except Exception as e:
                     logger.warning(f"warmup 请求切换代理失败，继续原代理重试: {e}")
                     new_proxy = None
@@ -3638,7 +3679,7 @@ class AuthFlow:
                         user_agent=self._ua,
                     )
                     logger.warning(
-                        f"warmup HTTP 403，已切换代理并清空旧会话，"
+                        f"{reason}，已切换代理并清空旧会话，"
                         f"继续第 {attempt + 2}/4 次尝试"
                     )
                     # 新出口要重新做国家/时区/语言联动；探测失败不阻断 warmup。
@@ -5669,6 +5710,50 @@ class AuthFlow:
                 title,
             )
 
+        def _capture_geoip_fingerprint(page, attempt: int) -> None:
+            """读取并打印 Camoufox 当前生效的时区/语言，同时写进 result 供落库。
+
+            geoip=True 让浏览器指纹跟随出口 IP；初始加载失败切代理重试后
+            时区可能变化，所以每次 attempt 都重新读，最终以成功那次的值为准。
+            """
+            try:
+                info = page.evaluate(
+                    "() => ({"
+                    "tz: (Intl.DateTimeFormat().resolvedOptions() || {}).timeZone || '',"
+                    "off: new Date().getTimezoneOffset(),"
+                    "lang: navigator.language || '',"
+                    "langs: Array.isArray(navigator.languages) ? navigator.languages.join(',') : '',"
+                    "})"
+                ) or {}
+            except Exception as exc:
+                logger.info(
+                    "[camoufox] 浏览器时区/语言读取失败 attempt=%s: %s",
+                    attempt, str(exc)[:160],
+                )
+                return
+            tz = str(info.get("tz") or "").strip()
+            lang = str(info.get("lang") or "").strip()
+            if tz:
+                self.result.register_timezone = tz
+            if lang:
+                self.result.register_language = lang
+            try:
+                # getTimezoneOffset 返回「本地时间 + 多少分钟 = UTC」，
+                # 正值表示落后于 UTC（如美东 240 → UTC-4）。
+                off_min = int(info.get("off"))
+                sign = "-" if off_min > 0 else "+"
+                abs_min = abs(off_min)
+                utc_off = f"UTC{sign}{abs_min // 60}"
+                if abs_min % 60:
+                    utc_off += f":{abs_min % 60:02d}"
+            except Exception:
+                utc_off = "?"
+            logger.info(
+                "[camoufox] geoip 指纹 attempt=%s timezone=%s utc_offset=%s "
+                "language=%s languages=%s",
+                attempt, tz or "?", utc_off, lang or "?", info.get("langs") or "",
+            )
+
         def _page_text(page, label: str) -> None:
             try:
                 body = str(page.locator("body").inner_text(timeout=1500) or "")
@@ -6417,6 +6502,9 @@ class AuthFlow:
                 page = browser.new_page()
                 _initial_load_page = page
                 _install_password_observer(page)
+                # geoip 已生效：打印本次出口的时区/语言，并记入 result 供落库。
+                # 即使后续 goto 失败切代理，本次指纹也已留在日志里。
+                _capture_geoip_fingerprint(page, _initial_attempt)
                 try:
                     context = page.context
                 except Exception:
@@ -7420,10 +7508,12 @@ class AuthFlow:
                 except Exception:
                     # fallback: 与 auto_manq.generate_random_person 同逻辑
                     try:
-                        from faker import Faker
-                        person_name = Faker("en_US").first_name()
+                        from persona_names import random_full_name
+                        person_name = random_full_name()
                     except Exception:
-                        person_name = random.choice(("Alex", "Taylor", "Jordan"))
+                        person_name = random.choice(
+                            ("Alex Carter", "Taylor Reed", "Jordan Hayes")
+                        )
                     while True:
                         person_age = round(random.gauss(mu=36.5, sigma=8))
                         if 18 <= person_age <= 55:
@@ -7792,7 +7882,12 @@ class AuthFlow:
         self._restore_codex_token_family()
         if not self.result.is_valid():
             raise RuntimeError("Camoufox 注册完成但未获取有效 access/session token")
-        logger.info("[camoufox] 注册流程完成 email=%s", email)
+        logger.info(
+            "[camoufox] 注册流程完成 email=%s timezone=%s language=%s",
+            email,
+            self.result.register_timezone or "?",
+            self.result.register_language or "?",
+        )
         return self.result
 
     def run_register(

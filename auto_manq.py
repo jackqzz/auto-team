@@ -226,19 +226,14 @@ def _workspace_id_from_session(session: dict[str, Any]) -> str:
             return account_id
     raise ValueError("母号 session 中缺少 account.id")
 
-try:
-    from faker import Faker
-except ImportError:  # pragma: no cover - handled by the project dependency
-    Faker = None
-
-fake = Faker("en_US") if Faker is not None else None
+from persona_names import random_full_name
 
 
 def generate_random_person() -> tuple[str, int]:
-    """生成随机英文名和 18～55 岁之间的正态分布年龄。"""
-    if fake is None:
-        raise RuntimeError("请先安装 Faker 依赖: pip install Faker")
-    name = fake.first_name()
+    """生成随机英文全名和 18～55 岁之间的正态分布年龄。"""
+    # 资料页是 Full name 输入框：名+姓组合空间 2 万+，不再像只填
+    # first_name 那样几百个号就开始批量撞 Jordan/Alex。
+    name = random_full_name()
 
     while True:
         age = round(random.gauss(mu=36.5, sigma=8))

@@ -23,6 +23,13 @@ export const getExportConfig = () => http.get('/api/settings/export')
 export const saveExportConfig = (payload) => http.post('/api/settings/export', payload)
 export const testExport = (target) => http.post('/api/settings/export/test', { target })
 
+// ──────────────── CPA 导出模版配置 ────────────────
+// 候选管理页 CPA 导出勾选「按模版导出」时，把 proxy_url（凭证级代理）和
+// 启停（file_enabled → JSON 里的 disabled）写进每个凭证文件。
+export const getCpaExportTemplate = () => http.get('/api/settings/cpa-export-template')
+export const saveCpaExportTemplate = (payload) =>
+  http.post('/api/settings/cpa-export-template', payload)
+
 // ──────────────── 公开 401 重登录配置 ────────────────
 export const getPublicReloginConfig = () => http.get('/api/settings/public-relogin')
 export const savePublicReloginConfig = (payload) => http.post('/api/settings/public-relogin', payload)

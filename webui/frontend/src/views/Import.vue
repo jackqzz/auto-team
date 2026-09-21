@@ -19,6 +19,7 @@ const runtime = useRuntimeStore()
 const providers = ref([])
 const kind = ref('')
 const groupName = ref('')
+const relaySuffix = ref('')
 const groups = ref([])
 const text = ref('')
 const loading = ref(false)
@@ -28,6 +29,9 @@ const errors = ref([])      // [{ line, error }]
 const current = computed(
   () => providers.value.find((p) => p.kind === kind.value) || null,
 )
+
+// 通用 OTP（中转链接）来源支持给每条取件链接尾部追加自定义串，如 ?json=1
+const isRelayProvider = computed(() => kind.value === 'icloud_relay')
 
 const lineCount = computed(
   () => text.value.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#')).length,
@@ -96,7 +100,12 @@ async function doImport() {
   result.value = ''
   errors.value = []
   try {
-    const r = await importAccounts(text.value.trim(), kind.value, groupName.value)
+    const r = await importAccounts(
+      text.value.trim(),
+      kind.value,
+      groupName.value,
+      isRelayProvider.value ? relaySuffix.value.trim() : '',
+    )
     const groupLabel = groupName.value || '未分组'
     result.value = `导入到“${groupLabel}”：解析 ${r.parsed} 行，新增 ${r.inserted}，更新 ${r.updated}，跳过 ${r.skipped}`
     ElMessage.success('导入完成')
@@ -157,6 +166,17 @@ async function doImport() {
           <div class="hint" style="margin-top: 6px">
             已存在的邮箱再次导入时，也会移动到本次选择的分组。
             “补齐2FA”要求已有 OpenAI 密码；通用 OTP 外部账号请导入“邮箱----OpenAI密码----OTP 中转链接”，旧的两段格式仍可导入但会被补齐任务跳过。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="isRelayProvider" label="中转链接追加参数（可选）">
+          <el-input
+            v-model="relaySuffix"
+            style="width: 360px"
+            placeholder="例如 ?json=1 或 &format=json"
+            clearable
+          />
+          <div class="hint" style="margin-top: 6px; width: 100%">
+            原样拼接到每行中转链接的尾部（多行导入时每条链接都追加）。留空则不追加。
           </div>
         </el-form-item>
       </el-form>

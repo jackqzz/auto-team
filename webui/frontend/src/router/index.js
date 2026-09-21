@@ -18,6 +18,12 @@ const routes = [
     meta: { public: true, showInMenu: true, title: '公开重登', icon: 'Refresh', group: '工具' },
   },
   {
+    path: '/redeem',
+    name: 'redeem',
+    component: () => import('@/views/Redeem.vue'),
+    meta: { public: true, showInMenu: true, title: '凭证兑换', icon: 'Ticket', group: '工具' },
+  },
+  {
     path: '/',
     name: 'dashboard',
     component: () => import('@/views/Dashboard.vue'),
@@ -82,6 +88,12 @@ const routes = [
     name: 'workspace-candidates-trash',
     component: () => import('@/views/CandidateManagement.vue'),
     meta: { title: '垃圾箱', icon: 'Delete', group: '空间', trash: true, hideInMenu: true },
+  },
+  {
+    path: '/redeem-codes',
+    name: 'redeem-codes',
+    component: () => import('@/views/RedeemCodes.vue'),
+    meta: { title: '兑换管理', icon: 'Tickets', group: '空间' },
   },
   {
     path: '/settings/mail',

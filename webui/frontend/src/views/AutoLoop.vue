@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref } from 'vue'
+import { computed, onActivated, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
@@ -17,9 +17,74 @@ const { form } = storeToRefs(useFormStore())
 const proxyStore = useProxyStore()
 const { count: proxyCount } = storeToRefs(proxyStore)
 const runtime = useRuntimeStore()
-const { autoStatus } = storeToRefs(runtime)
+const { autoTasks } = storeToRefs(runtime)
 
-const st = computed(() => autoStatus.value.state || 'stopped')
+// 多任务分段页签：每个控制器（批量注册/仅登录/各空间凭证任务）一个页签，
+// 选中谁下方的进度卡就显示谁，两个任务并行时不再互相抢占同一个状态块。
+const activeTaskId = ref('register')
+const taskStatus = computed(
+  () => autoTasks.value[activeTaskId.value] || autoTasks.value.register || { task_id: 'register', task_label: '批量注册', state: 'stopped' }
+)
+
+// 用户手动关掉的任务页签：任务跑完不自动消失，等用户点 ×；
+// 同一任务再次启动时取消关闭标记，页签重新出现。
+const closedTaskIds = ref(new Set())
+
+const taskOptions = computed(() => {
+  const order = { running: 0, paused: 1, stopped: 2 }
+  return Object.values(autoTasks.value)
+    .filter((t) => {
+      if (t.task_id === 'register') return true
+      if (t.state !== 'stopped') return true
+      // 已停止的页签只保留「确实跑过」且没被用户关掉的
+      return Number(t.started_at || 0) > 0 && !closedTaskIds.value.has(t.task_id)
+    })
+    .sort((a, b) => {
+      const oa = order[a.state] ?? 3
+      const ob = order[b.state] ?? 3
+      if (oa !== ob) return oa - ob
+      if ((a.task_id === 'register') !== (b.task_id === 'register')) return a.task_id === 'register' ? -1 : 1
+      return String(a.task_label || '').localeCompare(String(b.task_label || ''))
+    })
+    .map((t) => {
+      const known = t.task_total_known !== false && t.task_total != null
+      const counter = known ? ` ${t.task_completed || 0}/${t.task_total}` : ''
+      return {
+        value: t.task_id,
+        label: `${t.task_label || t.task_id}${counter}`,
+        dot: { running: 'success', paused: 'warning' }[t.state] || 'info',
+      }
+    })
+})
+
+// 任务重新跑起来（state 不再是 stopped）时取消它的关闭标记。
+watch(autoTasks, (tasks) => {
+  const reopened = Object.values(tasks || {})
+    .filter((t) => t.state && t.state !== 'stopped')
+    .map((t) => t.task_id)
+    .filter((id) => closedTaskIds.value.has(id))
+  if (reopened.length) {
+    const next = new Set(closedTaskIds.value)
+    reopened.forEach((id) => next.delete(id))
+    closedTaskIds.value = next
+  }
+  // 选中页签消失（被用户关掉）时，回退到还在跑的任务，否则回注册任务。
+  const ids = new Set(taskOptions.value.map((t) => t.value))
+  if (!ids.has(activeTaskId.value)) {
+    const alive = taskOptions.value.find((t) => t.dot !== 'info')
+    activeTaskId.value = alive ? alive.value : 'register'
+  }
+}, { deep: true })
+
+function closeTaskTab(id) {
+  closedTaskIds.value = new Set([...closedTaskIds.value, id])
+  if (activeTaskId.value === id) {
+    const alive = taskOptions.value.find((t) => t.dot !== 'info')
+    activeTaskId.value = alive ? alive.value : 'register'
+  }
+}
+
+const st = computed(() => taskStatus.value.state || 'stopped')
 const canStart = computed(() => st.value === 'stopped')
 const canPause = computed(() => st.value === 'running')
 const canResume = computed(() => st.value === 'paused')
@@ -32,25 +97,25 @@ const stateType = computed(() => ({
   stopped: 'info', running: 'success', paused: 'warning',
 }[st.value] || 'info'))
 
-const workers = computed(() => Array.isArray(autoStatus.value.workers) ? autoStatus.value.workers : [])
+const workers = computed(() => Array.isArray(taskStatus.value.workers) ? taskStatus.value.workers : [])
 const proxyUsage = computed(() => (
-  Array.isArray(autoStatus.value.proxy_pool_usage)
-    ? autoStatus.value.proxy_pool_usage
+  Array.isArray(taskStatus.value.proxy_pool_usage)
+    ? taskStatus.value.proxy_pool_usage
     : []
 ))
-const taskTotalKnown = computed(() => autoStatus.value.task_total_known !== false && autoStatus.value.task_total != null)
-const taskTotal = computed(() => taskTotalKnown.value ? Number(autoStatus.value.task_total || 0) : null)
-const taskCompleted = computed(() => Number(autoStatus.value.task_completed || 0))
+const taskTotalKnown = computed(() => taskStatus.value.task_total_known !== false && taskStatus.value.task_total != null)
+const taskTotal = computed(() => taskTotalKnown.value ? Number(taskStatus.value.task_total || 0) : null)
+const taskCompleted = computed(() => Number(taskStatus.value.task_completed || 0))
 const taskProgress = computed(() => {
   if (!taskTotalKnown.value) return 0
   if (!taskTotal.value) return st.value === 'stopped' ? 100 : 0
-  const value = Number(autoStatus.value.progress_percent)
+  const value = Number(taskStatus.value.progress_percent)
   if (Number.isFinite(value)) return Math.max(0, Math.min(100, value))
   return Math.max(0, Math.min(100, taskCompleted.value * 100 / taskTotal.value))
 })
-const taskInProgress = computed(() => Number(autoStatus.value.task_in_progress || workers.value.length || 0))
+const taskInProgress = computed(() => Number(taskStatus.value.task_in_progress || workers.value.length || 0))
 const taskRemaining = computed(() => taskTotalKnown.value
-  ? Math.max(0, Number(autoStatus.value.task_remaining ?? (taskTotal.value - taskCompleted.value)))
+  ? Math.max(0, Number(taskStatus.value.task_remaining ?? (taskTotal.value - taskCompleted.value)))
   : null)
 const progressStatus = computed(() => (
   st.value === 'stopped' && taskTotalKnown.value && taskCompleted.value >= (taskTotal.value || 0)
@@ -124,7 +189,8 @@ async function start() {
   } catch (e) { ElMessage.error('启动失败: ' + e.message) }
 }
 async function call(fn, name) {
-  try { await fn(); ElMessage.success(name + ' 成功') }
+  // 暂停/恢复/停止作用于当前页签选中的任务（task_id 定位控制器）
+  try { await fn(activeTaskId.value); ElMessage.success(name + ' 成功') }
   catch (e) { ElMessage.error(name + ' 失败: ' + e.message) }
 }
 </script>
@@ -327,6 +393,27 @@ async function call(fn, name) {
         <el-button type="danger" :disabled="!canStop" @click="call(autoStop, '停止')">停止</el-button>
       </el-space>
 
+      <!-- 多任务分段页签：每个任务一块独立进度，避免两个任务的状态互相抢占。
+           任务跑完页签不自动消失，用户点 × 才关闭。 -->
+      <div v-if="taskOptions.length > 1" class="task-tabs">
+        <button
+          v-for="t in taskOptions"
+          :key="t.value"
+          type="button"
+          class="task-tab"
+          :class="{ 'is-active': t.value === activeTaskId }"
+          @click="activeTaskId = t.value"
+        >
+          <span class="task-dot" :class="`is-${t.dot}`"></span>{{ t.label }}
+          <span
+            v-if="t.value !== 'register'"
+            class="task-tab-close"
+            title="关闭页签"
+            @click.stop="closeTaskTab(t.value)"
+          >×</span>
+        </button>
+      </div>
+
       <el-descriptions :column="6" border size="small" style="margin-top: 16px">
         <el-descriptions-item label="状态"><StatusDot :type="stateType" :text="stateLabel" /></el-descriptions-item>
         <el-descriptions-item label="任务对象">
@@ -337,17 +424,17 @@ async function call(fn, name) {
           <span v-if="taskTotalKnown"> / {{ taskTotal }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="成功">
-          <b style="color: var(--el-color-success)">{{ autoStatus.registered_ok || 0 }}</b>
-          <span v-if="autoStatus.target_count"> / {{ autoStatus.target_count }}</span>
+          <b style="color: var(--el-color-success)">{{ taskStatus.registered_ok || 0 }}</b>
+          <span v-if="taskStatus.target_count"> / {{ taskStatus.target_count }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="最终失败">
-          <b style="color: var(--el-color-danger)">{{ autoStatus.registered_fail || 0 }}</b>
+          <b style="color: var(--el-color-danger)">{{ taskStatus.registered_fail || 0 }}</b>
         </el-descriptions-item>
         <el-descriptions-item label="重试账号">
-          <b style="color: var(--el-color-warning)">{{ autoStatus.retry_count || 0 }}</b>
-          <span v-if="autoStatus.retry_attempts">（{{ autoStatus.retry_attempts }} 次）</span>
+          <b style="color: var(--el-color-warning)">{{ taskStatus.retry_count || 0 }}</b>
+          <span v-if="taskStatus.retry_attempts">（{{ taskStatus.retry_attempts }} 次）</span>
         </el-descriptions-item>
-        <el-descriptions-item label="并发">{{ autoStatus.concurrency || 1 }}</el-descriptions-item>
+        <el-descriptions-item label="并发">{{ taskStatus.concurrency || 1 }}</el-descriptions-item>
       </el-descriptions>
 
       <div style="margin-top: 16px">
@@ -358,7 +445,7 @@ async function call(fn, name) {
               ? `${taskCompleted} / ${taskTotal}（剩余 ${taskRemaining}）`
               : `${taskCompleted} 个已完成（总数不限）` }}
             <span v-if="taskInProgress"> · {{ taskInProgress }} 个执行中</span>
-            <span v-if="autoStatus.task_retrying"> · {{ autoStatus.task_retrying }} 个待重试</span>
+            <span v-if="taskStatus.task_retrying"> · {{ taskStatus.task_retrying }} 个待重试</span>
           </span>
         </div>
         <el-progress
@@ -381,7 +468,7 @@ async function call(fn, name) {
           worker-{{ w.id }} · {{ w.email }} · {{ w.proxy || '直连' }}
         </el-tag>
       </div>
-      <p v-if="autoStatus.last_message" class="hint" style="margin-top: 8px">{{ autoStatus.last_message }}</p>
+      <p v-if="taskStatus.last_message" class="hint" style="margin-top: 8px">{{ taskStatus.last_message }}</p>
     </el-card>
 
     <el-card v-if="proxyUsage.length" shadow="never" style="margin-bottom: 16px">
@@ -539,6 +626,68 @@ async function call(fn, name) {
   font-weight: 400;
   color: var(--el-text-color-secondary);
   margin-left: 10px;
+}
+
+/* 多任务分段页签：分段胶囊样式，激活项高亮，任务状态用色点区分 */
+.task-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 16px;
+  padding: 4px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius-md, 10px);
+  background: var(--el-fill-color-lighter);
+}
+
+.task-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--app-radius-sm, 8px);
+  background: transparent;
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.task-tab:hover {
+  color: var(--el-text-color-primary);
+}
+
+.task-tab.is-active {
+  background: var(--el-bg-color);
+  color: var(--el-text-color-primary);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.task-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.task-dot.is-success { background: var(--el-color-success); }
+.task-dot.is-warning { background: var(--el-color-warning); }
+.task-dot.is-info { background: var(--el-color-info-light-5); }
+
+.task-tab-close {
+  margin-left: 4px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--el-text-color-secondary);
+  border-radius: 50%;
+  padding: 0 3px;
+}
+
+.task-tab-close:hover {
+  color: var(--el-color-danger);
+  background: var(--el-color-danger-light-8);
 }
 
 .proxy-row {
