@@ -250,6 +250,7 @@ const tagStatusFilter = ref("");
 const groupNameFilter = ref("");
 const tagFilter = ref("");
 const redeemStatusFilter = ref("");
+const quotaStatusFilter = ref("");
 const searchKeyword = ref("");
 const quickTab = ref(isTrashView.value ? "trash" : "all");
 
@@ -849,6 +850,7 @@ async function load() {
       group_name: groupNameFilter.value,
       tag: tagFilter.value,
       redeem_status: redeemStatusFilter.value,
+      quota_status: quotaStatusFilter.value,
       keyword: searchKeyword.value || undefined,
     });
     options.value = a.items || [];
@@ -895,6 +897,7 @@ function handleQuickTabChange(tab) {
   if (isTrashView.value) return;
   quickTab.value = tab;
   redeemStatusFilter.value = "";
+  quotaStatusFilter.value = "";
   if (tab === "all") {
     trashStatusFilter.value = "active";
     tagStatusFilter.value = "";
@@ -926,6 +929,12 @@ function handleQuickTabChange(tab) {
     joinStatusFilter.value = "";
     credentialStatusFilter.value = "";
     redeemStatusFilter.value = "has_code";
+  } else if (tab === "zero") {
+    trashStatusFilter.value = "active";
+    tagStatusFilter.value = "";
+    joinStatusFilter.value = "";
+    credentialStatusFilter.value = "";
+    quotaStatusFilter.value = "zero";
   } else if (tab === "trash") {
     trashStatusFilter.value = "trashed";
     tagStatusFilter.value = "";
@@ -944,6 +953,7 @@ function resetFilters() {
   groupNameFilter.value = "";
   tagFilter.value = "";
   redeemStatusFilter.value = "";
+  quotaStatusFilter.value = "";
   searchKeyword.value = "";
   quickTab.value = isTrashView.value ? "trash" : "all";
 }
@@ -1408,6 +1418,7 @@ async function selectAllFiltered() {
       group_name: groupNameFilter.value,
       tag: tagFilter.value,
       redeem_status: redeemStatusFilter.value,
+      quota_status: quotaStatusFilter.value,
       keyword: searchKeyword.value || undefined,
     });
     const items = a.items || [];
@@ -2314,7 +2325,7 @@ watch(autoProliteSeatTarget, (value) => {
 });
 
 watch(
-  [accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter, tagFilter, redeemStatusFilter],
+  [accountStatusFilter, joinStatusFilter, credentialStatusFilter, seatTypeFilter, trashStatusFilter, tagStatusFilter, groupNameFilter, tagFilter, redeemStatusFilter, quotaStatusFilter],
   () => {
     page.value = 1;
     clearSelection();
@@ -2710,6 +2721,13 @@ onBeforeUnmount(() => {
             @click="handleQuickTabChange('redeem')"
           >
             已生成兑换码
+          </button>
+          <button
+            class="tab-chip"
+            :class="{ active: quickTab === 'zero' }"
+            @click="handleQuickTabChange('zero')"
+          >
+            额度 0%
           </button>
           <button
             class="tab-chip"

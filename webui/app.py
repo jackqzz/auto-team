@@ -981,7 +981,7 @@ def _is_non_default_seat(value: object) -> bool:
     return normalized in {"usage_based", "usagebased", "codex", "codex席位"}
 
 
-def _candidate_quota_ineligible_reason(row: dict | None) -> str:
+def _candidate_quota_ineligible_reason(row: dict | None, *, strict_seat: bool = True) -> str:
     if not row:
         return "候选人不属于当前空间"
     if str(row.get("account_status") or "active") == "permanently_invalid":
@@ -1005,8 +1005,10 @@ def _candidate_quota_ineligible_reason(row: dict | None) -> str:
     if _is_non_default_seat(seat):
         return "Codex席位不参与额度查询"
     # 非 Codex 的可参与席位目前只有标准席位和 ProLite。未知席位不应
-    # 因为本地缓存缺失而误进入自动任务，待席位同步后再参与。
-    if seat not in {"default", "standard", "standard_seat", "gpt席位", "标准席位", "prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"}:
+    # 因为本地缓存缺失而误进入自动任务（定时查询/自动重置），待席位
+    # 同步后再参与；手动额度查询不受此限——wham/usage 并不依赖席位
+    # 类型，席位未知一样可以调。
+    if strict_seat and seat not in {"default", "standard", "standard_seat", "gpt席位", "标准席位", "prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"}:
         return "席位类型未知，暂不参与额度查询"
     return ""
 
@@ -3244,7 +3246,9 @@ def _reset_credit_target(req: WorkspaceResetCreditReq) -> str:
         str(item.get("email") or "").strip().lower(): item
         for item in db.list_workspace_candidate_options(req.workspace_id)
     }
-    reason = _candidate_quota_ineligible_reason({**(options.get(email) or {}), **row})
+    reason = _candidate_quota_ineligible_reason(
+        {**(options.get(email) or {}), **row}, strict_seat=False
+    )
     if reason:
         raise HTTPException(400, reason)
     return email
@@ -3324,6 +3328,7 @@ def api_workspace_candidate_options(
     group_name: str = "",
     tag: str = "",
     redeem_status: str = "",
+    quota_status: str = "",
     keyword: str = "",
 ):
     limit = max(1, min(1000, int(limit or 100)))
@@ -3334,10 +3339,12 @@ def api_workspace_candidate_options(
         credential_status=credential_status, seat_type=seat_type,
         trash_status=trash_status, tag_status=tag_status,
         group_name=group_name, tag=tag, redeem_status=redeem_status,
+        quota_status=quota_status,
         keyword=keyword,
     )
     for item in items:
-        reason = _candidate_quota_ineligible_reason(item)
+        # 行上的可查询标记按手动口径判定：席位未同步只挡自动任务，不挡手动查询。
+        reason = _candidate_quota_ineligible_reason(item, strict_seat=False)
         item["quota_eligible"] = not reason
         item["quota_ineligible_reason"] = reason
     total = db.count_workspace_candidate_options(
@@ -3345,6 +3352,7 @@ def api_workspace_candidate_options(
         credential_status=credential_status, seat_type=seat_type,
         trash_status=trash_status, tag_status=tag_status,
         group_name=group_name, tag=tag, redeem_status=redeem_status,
+        quota_status=quota_status,
         keyword=keyword,
     )
     stats = db.get_workspace_candidate_stats(workspace_id)
@@ -3836,7 +3844,9 @@ def api_workspace_candidate_quota(req: WorkspaceCandidatesReq):
     trash_window = _candidate_trash_zero_quota_window(req.workspace_id, settings)
     for email in req.emails:
         key = email.strip().lower()
-        ineligible_reason = _candidate_quota_ineligible_reason(candidate_rows.get(key))
+        ineligible_reason = _candidate_quota_ineligible_reason(
+            candidate_rows.get(key), strict_seat=False
+        )
         if ineligible_reason:
             results[key] = {"ok": False, "error": ineligible_reason, "skipped": True}
             continue

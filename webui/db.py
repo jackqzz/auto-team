@@ -1161,6 +1161,7 @@ def _workspace_candidate_option_filters(
     group_name: str = "",
     tag: str = "",
     redeem_status: str = "",
+    quota_status: str = "",
     keyword: str = "",
 ):
     join_status_expr = _workspace_candidate_join_status_expr()
@@ -1234,6 +1235,21 @@ def _workspace_candidate_option_filters(
             + " (SELECT 1 FROM redeem_codes rc"
               " WHERE rc.workspace_master_id=c.workspace_master_id AND rc.email=c.email)"
         )
+    normalized_quota = str(quota_status or "").strip().lower()
+    if normalized_quota:
+        if normalized_quota != "zero":
+            raise ValueError("quota_status 只能是 zero")
+        # 与 app._is_zero_quota_payload 的「any」口径一致：任一窗口
+        # used_percent>=100（剩余 0%）或 credits_balance<=0；查询失败
+        # （带 error_code）和没查过额度的行都不算耗尽。
+        clauses.append(
+            "json_valid(COALESCE(wc.quota_json,''))"
+            " AND json_extract(wc.quota_json,'$.error_code') IS NULL"
+            " AND (CAST(COALESCE(json_extract(wc.quota_json,'$.primary.used_percent'),0) AS REAL)>=100"
+            "  OR CAST(COALESCE(json_extract(wc.quota_json,'$.secondary.used_percent'),0) AS REAL)>=100"
+            "  OR (json_extract(wc.quota_json,'$.credits_balance') IS NOT NULL"
+            "      AND CAST(json_extract(wc.quota_json,'$.credits_balance') AS REAL)<=0))"
+        )
     kw = str(keyword or "").strip()
     if kw:
         like = "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
@@ -1257,10 +1273,11 @@ def list_workspace_candidate_options(
     group_name: str = "",
     tag: str = "",
     redeem_status: str = "",
+    quota_status: str = "",
     keyword: str = "",
 ) -> list[dict]:
     where, args = _workspace_candidate_option_filters(
-        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name, tag, redeem_status, keyword,
+        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name, tag, redeem_status, quota_status, keyword,
     )
     join_status_expr = _workspace_candidate_join_status_expr()
     sql = """SELECT r.email, r.group_name, c.seat_type, c.member_id,
@@ -1327,10 +1344,11 @@ def count_workspace_candidate_options(
     group_name: str = "",
     tag: str = "",
     redeem_status: str = "",
+    quota_status: str = "",
     keyword: str = "",
 ) -> int:
     where, args = _workspace_candidate_option_filters(
-        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name, tag, redeem_status, keyword,
+        workspace_master_id, account_status, join_status, credential_status, seat_type, trash_status, tag_status, group_name, tag, redeem_status, quota_status, keyword,
     )
     return int(_conn().execute("""SELECT COUNT(*) FROM registered r
         JOIN workspace_candidates c ON c.email=r.email
