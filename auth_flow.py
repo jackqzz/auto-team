@@ -603,6 +603,15 @@ class AuthFlow:
             "1", "true", "yes", "on"
         )
         self._trace_dump_path = ""
+        if self._trace_dump_enabled:
+            try:
+                os.makedirs("outputs", exist_ok=True)
+                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                self._trace_dump_path = os.path.join("outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl")
+                logger.info(f"HTTP 明文抓包已启用: {self._trace_dump_path}")
+            except Exception as e:
+                logger.warning(f"初始化 HTTP 抓包文件失败: {e}")
+                self._trace_dump_enabled = False
         logger.debug(
             f"指纹: impersonate={self._fingerprint['impersonate']} "
             f"screen={self._fingerprint['screen']} lang={self._fingerprint['lang']} "
@@ -739,15 +748,6 @@ class AuthFlow:
                 cookie_pairs.append(("__Secure-next-auth.session-token", session_token))
 
         return "; ".join(f"{name}={value}" for name, value in cookie_pairs if name and value)
-        if self._trace_dump_enabled:
-            try:
-                os.makedirs("outputs", exist_ok=True)
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                self._trace_dump_path = os.path.join("outputs", f"auth_trace_{ts}_{os.getpid()}.jsonl")
-                logger.info(f"HTTP 明文抓包已启用: {self._trace_dump_path}")
-            except Exception as e:
-                logger.warning(f"初始化 HTTP 抓包文件失败: {e}")
-                self._trace_dump_enabled = False
 
     def _trace_http(self, step: str, resp, extra_request: dict | None = None):
         """可选 HTTP 细粒度追踪（用于协议调试）"""
@@ -1284,6 +1284,8 @@ class AuthFlow:
                 )
                 if is_workspace_like:
                     workspace_id = self._workspace_id_for_selection(resp.text or "")
+                    if not workspace_id and "/consent" in current:
+                        workspace_id = self._extract_consent_workspace_id(resp.text or "")
                     if workspace_id:
                         next_url = self._workspace_select(workspace_id)
                         if next_url:
@@ -5110,6 +5112,35 @@ class AuthFlow:
             return ""
         return ""
 
+    @staticmethod
+    def _extract_consent_workspace_id(html_text: str) -> str:
+        """从 codex consent 页表单字段提取当前选中的 workspace_id。
+
+        consent 页不是 JSON 页面：workspace 选项是真表单字段
+        （``<input type="hidden" name="workspace_id" value="uuid">`` 镜像当前
+        选中项，``<input type="radio" name="workspace_id" checked value="uuid">``
+        是用户可见的选中态），通用 JSON 正则抓不到。
+        """
+        if not html_text:
+            return ""
+        try:
+            text = html_text.replace('\\"', '"')
+            patterns = [
+                r'<input[^>]*type="hidden"[^>]*name="workspace_id"[^>]*value="([0-9a-fA-F-]{36})"',
+                r'<input[^>]*name="workspace_id"[^>]*type="hidden"[^>]*value="([0-9a-fA-F-]{36})"',
+                r'<input[^>]*name="workspace_id"[^>]*checked[^>]*value="([0-9a-fA-F-]{36})"',
+                r'<input[^>]*checked[^>]*name="workspace_id"[^>]*value="([0-9a-fA-F-]{36})"',
+                r'name="workspace_id"[^>]*value="([0-9a-fA-F-]{36})"',
+                r'value="([0-9a-fA-F-]{36})"[^>]*name="workspace_id"',
+            ]
+            for p in patterns:
+                m = re.search(p, text, flags=re.IGNORECASE)
+                if m:
+                    return (m.group(1) or "").strip()
+        except Exception:
+            return ""
+        return ""
+
     # ── Step 10: 跟踪重定向链 ──
     def follow_redirect_chain(self, start_url: str) -> tuple[str, str]:
         """手动跟踪重定向，返回 (callback_url, final_url)"""
@@ -5152,9 +5183,11 @@ class AuthFlow:
                 callback_url = current_url
                 self._sniff_login_verifier(current_url, f"redirect_hop_{i+1}_callback_url")
 
-            # workspace 页面常见为 200，需要主动调 workspace/select 获取下一跳
-            if "/workspace" in current_url and resp.status_code == 200:
+            # workspace/consent 页面常见为 200，需要主动调 workspace/select 获取下一跳
+            if ("/workspace" in current_url or "/consent" in current_url) and resp.status_code == 200:
                 workspace_id = self._workspace_id_for_selection(resp.text or "")
+                if not workspace_id and "/consent" in current_url:
+                    workspace_id = self._extract_consent_workspace_id(resp.text or "")
                 if workspace_id:
                     logger.info("workspace 页面提取到 workspace_id=%s，尝试继续授权", workspace_id)
                     next_url = self._workspace_select(workspace_id)

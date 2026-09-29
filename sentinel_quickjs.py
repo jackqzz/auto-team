@@ -28,9 +28,11 @@ Public API:
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -46,7 +48,23 @@ SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 
 
 def _resolve_node_binary() -> str:
-    return (os.getenv("OPENAI_SENTINEL_NODE_PATH", "") or "").strip() or "node"
+    override = (os.getenv("OPENAI_SENTINEL_NODE_PATH", "") or "").strip()
+    if override:
+        return override
+    if shutil.which("node"):
+        return "node"
+    # systemd 等精简环境里 nvm 装的 node 不在 PATH，取最高版本兜底
+    candidates = glob.glob(str(Path.home() / ".nvm/versions/node/*/bin/node"))
+    if not candidates:
+        return "node"
+
+    def _ver(p: str) -> tuple:
+        try:
+            return tuple(int(x) for x in Path(p).parent.parent.name.lstrip("v").split("."))
+        except ValueError:
+            return ()
+
+    return max(candidates, key=_ver)
 
 
 def _quickjs_script_path() -> Path:
