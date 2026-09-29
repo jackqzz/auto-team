@@ -6,7 +6,7 @@ import { useRoute, useRouter } from "vue-router";
 import { storeToRefs } from "pinia";
 import { useProxyStore } from "@/stores/proxy";
 import { listWorkspaceMasters, syncWorkspace, syncWorkspaceMembers } from "@/api/workspaces";
-import { listExportFormats, exportRegistered, pushRegisteredToCpa } from "@/api/register";
+import { listExportFormats, exportRegistered, pushRegisteredToCpa, pushRegisteredToSub2api } from "@/api/register";
 import { generateRedeemCodes } from "@/api/redeemCodes";
 import { getCpaExportTemplate, saveCpaExportTemplate } from "@/api/settings";
 import { copyText, fmtTime } from "@/api/request";
@@ -157,8 +157,9 @@ function importGlobalProxyPool() {
 
 const trashEnabled = ref(true);
 const trashInvalidEnabled = ref(true);
-const trashZeroDelayMinutes = ref(60);
-const trashZeroQuotaWindow = ref("any");
+const trashAction = ref("seat");
+const trashZeroDelayMinutes = ref(1);
+const trashZeroQuotaWindow = ref("weekly");
 const trashGapSeconds = ref(30);
 
 const seatProtectEnabled = ref(false);
@@ -178,6 +179,8 @@ const autoProliteSeatNextAt = ref(0);
 const autoSeatIntervalMinutes = ref(5);
 const autoSeatSwitchGapSeconds = ref(30);
 const autoProliteCandidateSeatType = ref("default");
+const autoStandardSeatSource = ref("switch");
+const autoProliteSeatSource = ref("switch");
 const autoStandardSeatTarget = ref(0);
 const autoProliteSeatTarget = ref(0);
 
@@ -196,8 +199,9 @@ const candidateStats = ref({
     invalid_total_count: 0,
     trash_enabled: true,
     trash_invalid_enabled: true,
-    trash_zero_delay_minutes: 60,
-    trash_zero_quota_window: "any",
+    trash_action: "seat",
+    trash_zero_delay_minutes: 1,
+    trash_zero_quota_window: "weekly",
     trash_gap_seconds: 30,
   },
   seat_fulfillment: {
@@ -211,6 +215,7 @@ const candidateStats = ref({
       protect_refresh_time: "00:00",
       protect_window_key: "",
       target: 0,
+      source: "switch",
     },
     prolite: {
       count: 0,
@@ -222,6 +227,7 @@ const candidateStats = ref({
       protect_refresh_time: "00:00",
       protect_window_key: "",
       target: 0,
+      source: "switch",
     },
     codex: {
       count: 0,
@@ -1482,11 +1488,15 @@ async function runMembershipAction(command) {
 }
 
 async function runExportAction(command) {
-  if (command === "push") return push();
   if (command === "export_outbound") return exportAndOutbound();
   if (command === "invite_csv") return openInviteCsv();
   if (command === "redeem_codes") return openRedeemCodesDialog();
   return doExport(command);
+}
+
+function runPushAction(command) {
+  if (command === "push_cpa") return push();
+  if (command === "push_sub2api") return pushSub2api();
 }
 
 async function kick() {
@@ -1624,6 +1634,7 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       quota_proxy_pool: quotaProxyPool.value,
       trash_enabled: trashEnabled.value,
       trash_invalid_enabled: trashInvalidEnabled.value,
+      trash_action: trashAction.value,
       trash_zero_delay_minutes: trashZeroDelayMinutes.value,
       trash_zero_quota_window: trashZeroQuotaWindow.value,
       trash_gap_seconds: trashGapSeconds.value,
@@ -1640,6 +1651,8 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
       auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
       auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
+      auto_standard_seat_source: autoStandardSeatSource.value,
+      auto_prolite_seat_source: autoProliteSeatSource.value,
       kick_delay_min_seconds: kickDelayMinSeconds.value,
       kick_delay_max_seconds: kickDelayMaxSeconds.value,
     });
@@ -1695,8 +1708,9 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     quotaProxyPool.value = String(c.quota_proxy_pool || "");
     trashEnabled.value = c.trash_enabled !== false;
     trashInvalidEnabled.value = c.trash_invalid_enabled !== false;
-    trashZeroDelayMinutes.value = Number(c.trash_zero_delay_minutes || 60);
-    trashZeroQuotaWindow.value = String(c.trash_zero_quota_window || "any");
+    trashAction.value = c.trash_action === "kick" ? "kick" : "seat";
+    trashZeroDelayMinutes.value = Number(c.trash_zero_delay_minutes || 1);
+    trashZeroQuotaWindow.value = String(c.trash_zero_quota_window || "weekly");
     trashGapSeconds.value = Math.min(600, Math.max(0, Number(c.trash_gap_seconds ?? 30)));
     seatProtectEnabled.value = Boolean(c.seat_protect_enabled);
     seatProtectThreshold.value = Number(c.seat_protect_threshold || 8);
@@ -1715,6 +1729,12 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     autoProliteCandidateSeatType.value = ["default", "usage_based", "all"].includes(String(c.auto_prolite_candidate_seat_type || "default"))
       ? String(c.auto_prolite_candidate_seat_type || "default")
       : "default";
+    autoStandardSeatSource.value = ["switch", "invite", "mixed"].includes(String(c.auto_standard_seat_source || "switch"))
+      ? String(c.auto_standard_seat_source || "switch")
+      : "switch";
+    autoProliteSeatSource.value = ["switch", "invite", "mixed"].includes(String(c.auto_prolite_seat_source || "switch"))
+      ? String(c.auto_prolite_seat_source || "switch")
+      : "switch";
     kickDelayMinSeconds.value = Math.min(600, Math.max(0, Number(c.kick_delay_min_seconds ?? 2)));
     kickDelayMaxSeconds.value = Math.min(600, Math.max(0, Number(c.kick_delay_max_seconds ?? 5)));
     try {
@@ -1756,8 +1776,9 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       quotaProxyPool.value = "";
       trashEnabled.value = true;
       trashInvalidEnabled.value = true;
-      trashZeroDelayMinutes.value = 60;
-      trashZeroQuotaWindow.value = "any";
+      trashAction.value = "seat";
+      trashZeroDelayMinutes.value = 1;
+      trashZeroQuotaWindow.value = "weekly";
       trashGapSeconds.value = 30;
       seatProtectEnabled.value = false;
       seatProtectThreshold.value = 8;
@@ -1776,6 +1797,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoSeatIntervalMinutes.value = 5;
       autoSeatSwitchGapSeconds.value = 30;
       autoProliteCandidateSeatType.value = "default";
+      autoStandardSeatSource.value = "switch";
+      autoProliteSeatSource.value = "switch";
       kickDelayMinSeconds.value = 2;
       kickDelayMaxSeconds.value = 5;
     }
@@ -1818,6 +1841,7 @@ async function toggleQuotaSchedule() {
           quota_proxy_pool: quotaProxyPool.value,
           trash_enabled: trashEnabled.value,
           trash_invalid_enabled: trashInvalidEnabled.value,
+          trash_action: trashAction.value,
           trash_zero_delay_minutes: trashZeroDelayMinutes.value,
           trash_zero_quota_window: trashZeroQuotaWindow.value,
           trash_gap_seconds: trashGapSeconds.value,
@@ -1834,6 +1858,8 @@ async function toggleQuotaSchedule() {
           auto_seat_interval_minutes: autoSeatIntervalMinutes.value,
           auto_seat_switch_gap_seconds: autoSeatSwitchGapSeconds.value,
           auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
+          auto_standard_seat_source: autoStandardSeatSource.value,
+          auto_prolite_seat_source: autoProliteSeatSource.value,
           kick_delay_min_seconds: kickDelayMinSeconds.value,
           kick_delay_max_seconds: kickDelayMaxSeconds.value,
         }
@@ -2215,6 +2241,24 @@ async function push() {
   }
 }
 
+async function pushSub2api() {
+  const emails = selected.value.map((x) => x.email).filter(Boolean);
+  if (!emails.length) return ElMessage.warning("请选择候选人");
+  const missing = selected.value.filter((x) => !x.has_access_token).length;
+  if (missing) ElMessage.warning(`${missing} 个候选人缺少空间凭证，推送接口可能跳过`);
+  pushing.value = true;
+  setOperation(emails, "推送中…");
+  try {
+    const r = await pushRegisteredToSub2api(emails, proxyList.value.join("\n"), workspaceId.value);
+    ElMessage.success(r.message || `推送完成（${emails.length} 个）`);
+  } catch (e) {
+    ElMessage.error("推送失败: " + e.message);
+  } finally {
+    clearOperation(emails);
+    pushing.value = false;
+  }
+}
+
 watch(workspaceId, async (id) => {
   settingsLoadGeneration += 1;
   settingsReady.value = false;
@@ -2260,6 +2304,7 @@ watch(
     quotaProxyPool,
     trashEnabled,
     trashInvalidEnabled,
+    trashAction,
     trashZeroDelayMinutes,
     trashZeroQuotaWindow,
     seatProtectEnabled,
@@ -2305,7 +2350,10 @@ watch(autoSeatIntervalMinutes, (value) => {
   if (autoProliteSeatEnabled.value) autoProliteSeatNextAt.value = Date.now() / 1000 + minutes * 60;
 });
 
-watch([autoStandardSeatEnabled, autoProliteSeatEnabled, autoProliteCandidateSeatType], queueSpaceSettingsSave);
+watch(
+  [autoStandardSeatEnabled, autoProliteSeatEnabled, autoProliteCandidateSeatType, autoStandardSeatSource, autoProliteSeatSource],
+  queueSpaceSettingsSave
+);
 
 // 补齐目标：0 = 已购席位上限；填正数时不能超过已购上限（上限未同步到时由后端钳制）。
 watch(autoStandardSeatTarget, (value) => {
@@ -3006,11 +3054,25 @@ onBeforeUnmount(() => {
               </template>
             </el-dropdown>
 
+            <el-dropdown @command="runPushAction">
+              <el-button size="small" plain type="warning" :loading="pushing">
+                <Icon icon="lucide:upload-cloud" class="btn-icon" />
+                推送号池
+                <Icon icon="lucide:chevron-down" class="btn-icon-end" />
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="push_cpa">推送到 CPA 号池</el-dropdown-item>
+                  <el-dropdown-item command="push_sub2api">推送到 Sub2API 号池</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+
             <el-dropdown
               @command="runExportAction"
               @visible-change="(v) => v && loadExportFormats()"
             >
-              <el-button size="small" plain type="success" :loading="exporting || pushing">
+              <el-button size="small" plain type="success" :loading="exporting">
                 <Icon icon="lucide:download" class="btn-icon" />
                 导出候选人
                 <Icon icon="lucide:chevron-down" class="btn-icon-end" />
@@ -3025,7 +3087,6 @@ onBeforeUnmount(() => {
                     {{ fmt.label }}
                   </el-dropdown-item>
                   <el-dropdown-item divided command="invite_csv">导出邀请 CSV</el-dropdown-item>
-                  <el-dropdown-item command="push">推送到 CPA 号池</el-dropdown-item>
                   <el-dropdown-item command="export_outbound">出库并导出加密 Sub2 (自动标记出库)</el-dropdown-item>
                   <el-dropdown-item divided command="redeem_codes">生成并导出兑换码</el-dropdown-item>
                 </el-dropdown-menu>
@@ -3591,7 +3652,7 @@ onBeforeUnmount(() => {
                         style="width: 100%; margin-top: 8px"
                       />
                       <div v-if="cpaStaticProxyEnabled" class="field-hint">
-                        自动推送 CPA 时给每个凭证绑定池里租用计数最少的一条代理，写进凭证的
+                        推送 CPA 时给每个凭证绑定池里租用计数最少的一条代理，写进凭证的
                         proxy_url；账号因额度耗尽/凭证失效入垃圾箱时，自动删除 CPA 里的凭证并回收计数。
                       </div>
                     </el-form-item>
@@ -3604,6 +3665,7 @@ onBeforeUnmount(() => {
                   <div class="field-hint">
                     仅本空间生效，每项留空都跟随「自动导出」里的全局配置；
                     地址和密钥都配齐时，即使该目标全局未启用，本空间也会推送。
+                    手动「推送号池」按钮同样走这里的专属地址/密钥/分组。
                   </div>
                 </div>
 
@@ -3686,6 +3748,16 @@ onBeforeUnmount(() => {
                       0 表示补到已购席位上限（当前 {{ currentWorkspace?.seats_default_entitled ?? '未同步' }} 席）；也可填不超过上限的固定目标。
                     </div>
                   </el-form-item>
+                  <el-form-item label="补齐来源">
+                    <el-select v-model="autoStandardSeatSource" style="width: 100%">
+                      <el-option label="仅切换已加入成员" value="switch" />
+                      <el-option label="仅邀请未加入候选成员" value="invite" />
+                      <el-option label="先切换已加入成员，不足再邀请" value="mixed" />
+                    </el-select>
+                    <div class="field-hint">
+                      邀请模式下把已划分到本空间、尚未受邀的候选人直接邀请到标准席位，成员在凭证登录时自动接受邀请；无需先加为成员再切席位。
+                    </div>
+                  </el-form-item>
                 </el-form>
                 <div v-if="autoStandardSeatEnabled && autoStandardSeatNextAt" class="countdown-hint">
                   下次轮询：{{ new Date(autoStandardSeatNextAt * 1000).toLocaleString() }}
@@ -3717,7 +3789,17 @@ onBeforeUnmount(() => {
                       0 表示补到已购高级席位上限（当前 {{ currentWorkspace?.seats_prolite_entitled ?? '未同步' }} 席）；也可填不超过上限的固定目标。
                     </div>
                   </el-form-item>
-                  <el-form-item label="目标候选人类型">
+                  <el-form-item label="补齐来源">
+                    <el-select v-model="autoProliteSeatSource" style="width: 100%">
+                      <el-option label="仅切换已加入成员" value="switch" />
+                      <el-option label="仅邀请未加入候选成员" value="invite" />
+                      <el-option label="先切换已加入成员，不足再邀请" value="mixed" />
+                    </el-select>
+                    <div class="field-hint">
+                      邀请模式下把已划分到本空间、尚未受邀的候选人直接邀请到 ProLite 席位，成员在凭证登录时自动接受邀请；无需先加为成员再升级。
+                    </div>
+                  </el-form-item>
+                  <el-form-item v-if="autoProliteSeatSource !== 'invite'" label="目标候选人类型">
                     <el-select v-model="autoProliteCandidateSeatType" style="width: 100%">
                       <el-option label="标准席位" value="default" />
                       <el-option label="Codex席位" value="usage_based" />
@@ -3862,6 +3944,17 @@ onBeforeUnmount(() => {
                   <el-switch v-model="trashInvalidEnabled" />
                 </div>
                 <el-form label-position="top" class="settings-form sub-form">
+                  <el-form-item label="入箱前置动作">
+                    <el-select v-model="trashAction" style="width: 100%">
+                      <el-option label="席位切换为 Codex（成员留在空间）" value="seat" />
+                      <el-option label="踢出空间（成员被移除）" value="kick" />
+                    </el-select>
+                    <div class="field-hint">
+                      候选人入箱前先对远端执行的动作。「席位切换为 Codex」把成员降到按量计费席位后留在空间里；
+                      「踢出空间」直接调用移除成员接口，成员离开空间，适合不允许或不适合切 Codex 席位的母号。
+                      踢出未被远端确认时不会入箱，会自动重试。手动「踢出空间」按钮与此无关，始终可用。
+                    </div>
+                  </el-form-item>
                   <el-form-item label="额度耗尽判定窗口">
                     <el-select v-model="trashZeroQuotaWindow" style="width: 100%">
                       <el-option label="任一窗口耗尽" value="any" />

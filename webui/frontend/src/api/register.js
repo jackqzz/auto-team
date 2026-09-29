@@ -46,6 +46,9 @@ export const exportToPanel = (email, targets) =>
 export const pushRegisteredToCpa = (emails, proxy = '', workspace_id = null) =>
   http.post('/api/registered/push_cpa', { emails, proxy, ...(workspace_id ? { workspace_id } : {}) })
 
+export const pushRegisteredToSub2api = (emails, proxy = '', workspace_id = null) =>
+  http.post('/api/registered/push_sub2api', { emails, proxy, ...(workspace_id ? { workspace_id } : {}) })
+
 // ──────────────── 自动跑号 auto-loop ────────────────
 export const autoStart = (payload) => http.post('/api/auto/start', payload)
 export const autoPause = (taskId = '') => http.post('/api/auto/pause', null, { params: { task_id: taskId } })

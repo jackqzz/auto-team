@@ -47,6 +47,10 @@ const defaults = {
   // 本次自动任务完成后是否推送到已启用的 CPA / SUB2API。
   autoExport: true,
   autoExportRefreshOauth: false,
+  // 两段式补 RT：第一段只批量注册不取 RT，整批收口后统一冷却 N 分钟，
+  // 再自动登录补 RT（含手机接码）。比一口气跑完的成功率高。
+  autoRtTwoStep: false,
+  autoRtDelayMin: 30,
 }
 
 // el-select 的 clearable 清空时把值写成 **undefined**（不是 ''），而 proxy 在三个

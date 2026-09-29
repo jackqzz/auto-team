@@ -155,6 +155,23 @@ class AutoLoopController:
         # 目标成功数：0 = 不限量（保持旧行为）；>0 时累计成功达标即自动停止
         self._target_count: int = 0
         self._account_retry_count: int = 1
+        # ── 两段式 RT 模式 ──
+        # 第一段只批量注册（不取 RT、不推送号池）；等整批收口后统一冷却，
+        # 再逐个走登录链路补 RT（含手机接码）。两步都成功才计入成功。
+        self._rt_two_step: bool = False
+        self._rt_delay_seconds: float = 0.0
+        # 第一段成功、等待冷却后补 RT 的账号：{"email", "login_password", ...,
+        #   "ready_at", "_rt_step2": True}
+        self._rt_pending: list[dict] = []
+        # 冷却计时从“第一段收口”那一刻统一起算（用户语义：整批跑完再等 N 分钟），
+        # 不是每个账号各自的完成时间。_arm 后迟到的项也对齐到同一起点。
+        self._rt_delay_armed: bool = False
+        self._rt_armed_at: float = 0.0
+        # 第一段强制关掉 auto_export（无 RT 的号不应推号池），第二段恢复用户原值。
+        self._rt_auto_export: bool = True
+        # 启动时缓存的邮箱源信息：第一段收口的判定要用。
+        self._mail_source_kind: str = "outlook"
+        self._mail_pooled: bool = True
 
     # ──────────────────────── 公共 API ────────────────────────
 
@@ -186,6 +203,22 @@ class AutoLoopController:
             self._account_records = {}
             self._account_retry_used = {}
             self._registration_retry_queue = []
+            # 两段式 RT：仅对注册任务生效；仅登录本身就是"第二段"，再叠加没意义。
+            self._rt_two_step = (
+                bool(self._options.get("rt_two_step"))
+                and not self._options.get("login_only")
+            )
+            self._rt_delay_seconds = max(
+                0.0, float(self._options.get("rt_step_delay_minutes") or 0) * 60
+            )
+            self._rt_pending = []
+            self._rt_delay_armed = False
+            self._rt_armed_at = 0.0
+            self._rt_auto_export = bool(self._options.get("auto_export", True))
+            if self._rt_two_step:
+                # 第一段只注册：RT/OAuth/接码/推送整体留到第二段统一执行。
+                self._options["want_refresh_token"] = False
+                self._options["auto_export"] = False
             if self._options.get("login_only"):
                 try:
                     self._login_queue = db.list_login_candidates(
@@ -258,6 +291,17 @@ class AutoLoopController:
                     provider_cls = get_provider_class(mail_source)
                 except MailProviderError as e:
                     return {"ok": False, "error": str(e)}
+                self._mail_source_kind = mail_source
+                self._mail_pooled = provider_cls.pooled
+                if self._rt_two_step and not provider_cls.pooled and not self._target_count:
+                    # 非池化邮箱源（临时地址自造邮箱）没有有限号池，
+                    # “第一段整批跑完”只能靠执行数量限制来划定边界；
+                    # 不设上限的话补 RT 阶段永远不会触发。
+                    return {
+                        "ok": False,
+                        "error": "两段式补 RT 需要「执行数量限制」作为批次边界："
+                                 "当前邮箱源没有有限号池，不设上限时无法判定第一段何时结束",
+                    }
                 if provider_cls.pooled:
                     try:
                         self._task_total = db.count_accounts(
@@ -486,6 +530,7 @@ class AutoLoopController:
                     "run_id": info.get("run_id", ""),
                     "proxy": info.get("proxy", ""),
                     "started_at": info.get("started_at", 0),
+                    "stage": info.get("stage", ""),
                 }
                 for wid, info in sorted(self._worker_status.items())
             ]
@@ -569,6 +614,16 @@ class AutoLoopController:
                 "login_only": bool(self._options.get("login_only")),
                 "ensure_credentials": bool(self._options.get("ensure_credentials", True)),
                 "task_type": "login" if self._options.get("login_only") else "register",
+                "rt_two_step": self._rt_two_step,
+                "rt_pending": len(self._rt_pending),
+                # 冷却统一起算后才给出预计开跑时间；未收口期间为 None。
+                "rt_ready_at": (
+                    min(
+                        (float(item.get("ready_at") or 0) for item in self._rt_pending),
+                        default=None,
+                    )
+                    if self._rt_delay_armed else None
+                ),
                 "login_candidate_count": self._login_candidate_count,
                 "remaining": (
                     max(0, self._target_count - self._registered_ok)
@@ -820,6 +875,174 @@ class AutoLoopController:
             self._registration_retry_queue.insert(0, retry_account)
         return True
 
+    # ── 两段式 RT：第二段（冷却后统一补 RT）──
+
+    def _registration_drained(self) -> bool:
+        """第一段（批量注册）是否已经收口。
+
+        收口条件：重试队列已空 + 没有在跑的注册 run + 号池抽干。
+        非池化邮箱源（自造地址）没有有限号池，批次边界由「执行数量限制」
+        划定：第一段终态（成功入冷却 / 最终失败）数达到 target 即收口。
+        """
+        with self._lock:
+            if self._registration_retry_queue:
+                return False
+            if any(
+                (info or {}).get("stage") == "register"
+                for info in self._worker_status.values()
+            ):
+                return False
+            pooled = self._mail_pooled
+            target = self._target_count
+            group_name = self._options.get("group_name", "")
+            terminal = sum(
+                1 for record in self._account_records.values()
+                if record.get("status") in {"success", "failed", "rt_pending"}
+            )
+        # 批次边界：设了执行数量限制时以第一段终态数收口；号池抽干同样收口。
+        if target and terminal >= target:
+            return True
+        if pooled:
+            try:
+                return db.count_accounts(
+                    status="available",
+                    kind=self._mail_source_kind,
+                    group_name=group_name,
+                ) == 0
+            except Exception:
+                logger.exception("号池余量查询失败，按未收口处理")
+                return False
+        return False
+
+    def _rt_step1_saturated(self) -> bool:
+        """第一段名额是否已占满：终态 + 在途注册数达到「执行数量限制」。
+
+        只用于挡住**新领号**（claim_next / 占位生成）；已排队的重试仍照常
+        派发——它们属于在途账号，且不重派会让收口判定里的“重试队列为空”
+        永远不成立。
+        """
+        if not self._target_count:
+            return False
+        with self._lock:
+            in_flight = sum(
+                1 for info in self._worker_status.values()
+                if (info or {}).get("stage") == "register"
+            )
+            terminal = sum(
+                1 for record in self._account_records.values()
+                if record.get("status") in {"success", "failed", "rt_pending"}
+            )
+            return terminal + in_flight >= self._target_count
+
+    def _arm_rt_cooldown(self) -> None:
+        """第一段收口：为全部冷却中账号统一定时起算点（只执行一次）。"""
+        with self._lock:
+            if self._rt_delay_armed:
+                return
+            self._rt_delay_armed = True
+            self._rt_armed_at = time.time()
+            ready_at = self._rt_armed_at + self._rt_delay_seconds
+            for item in self._rt_pending:
+                item["ready_at"] = ready_at
+            count = len(self._rt_pending)
+            self._last_message = (
+                f"第一段注册收口：{count} 个账号进入冷却，"
+                f"{self._rt_delay_seconds / 60:g} 分钟后统一补 RT"
+            )
+        logger.info(
+            "[auto-loop] 两段式：第一段收口，%d 个账号冷却 %.0fs 后统一补 RT",
+            count,
+            self._rt_delay_seconds,
+        )
+        self._broadcast("state", self._snapshot())
+
+    def _pop_mature_rt(self) -> Optional[dict]:
+        """取一个已到冷却时间的补 RT 账号；未收口/未到期都返回 None。"""
+        if not self._rt_two_step:
+            return None
+        if not self._rt_delay_armed:
+            if not self._registration_drained():
+                return None
+            self._arm_rt_cooldown()
+        with self._lock:
+            self._rt_pending.sort(
+                key=lambda item: float(item.get("ready_at") or 0)
+            )
+            if (
+                self._rt_pending
+                and float(self._rt_pending[0].get("ready_at") or 0) <= time.time()
+            ):
+                return self._rt_pending.pop(0)
+        return None
+
+    def _enqueue_rt_pending(self, account_key: str, account: dict, run_id: str) -> None:
+        """第一段注册成功：账号记入冷却队列，等待整批收口后补 RT。
+
+        第二段是登录流程，需要的字段在这里一次性固化：OpenAI 密码和
+        TOTP 来自刚落库的注册结果，邮箱池凭证（relay_url 等）取自号池行。
+        非池化占位账号的 email 是虚拟地址，真实邮箱由 registrar 在 run
+        结束时回写进 runs 表，这里按 run_id 取回。
+        """
+        email = str(account.get("email") or "").strip().lower()
+        if not email or email.endswith("@placeholder.local"):
+            try:
+                con = db._conn()
+                try:
+                    row = con.execute(
+                        "SELECT email FROM runs WHERE run_id=?", (run_id,)
+                    ).fetchone()
+                finally:
+                    con.close()
+                if row and row["email"]:
+                    email = str(row["email"]).strip().lower()
+            except Exception:
+                logger.exception("补 RT 真实邮箱解析失败 run=%s", run_id)
+        try:
+            reg = db.get_registered(email) or {}
+        except Exception:
+            reg = {}
+        try:
+            pool = db.get_account(email) or {}
+        except Exception:
+            pool = {}
+        with self._lock:
+            record = self._account_records.get(account_key)
+            if record and record.get("status") not in {"success", "failed"}:
+                record["status"] = "rt_pending"
+            if self._rt_delay_armed:
+                # 收口后被迟到项（极少见）也对齐到统一起算点
+                ready_at = self._rt_armed_at + self._rt_delay_seconds
+            else:
+                ready_at = time.time() + self._rt_delay_seconds
+            self._rt_pending.append({
+                "email": email,
+                "kind": reg.get("mail_kind") or pool.get("kind")
+                        or account.get("kind") or "",
+                "login_password": reg.get("password") or "",
+                "totp_secret": reg.get("totp_secret") or "",
+                "relay_url": pool.get("relay_url") or account.get("relay_url") or "",
+                "group_name": reg.get("group_name") or account.get("group_name") or "",
+                # 第二段本质是登录；键保持账号级统计一致（占位键也能对上）
+                "_auto_task_key": account_key,
+                "_proxy_usage_detail": "auto_rt_step2",
+                "_rt_step2": True,
+                "ready_at": ready_at,
+            })
+            self._last_message = (
+                f"{email} 第一段完成，进入冷却队列（待补 RT {len(self._rt_pending)} 个）"
+            )
+        logger.info(
+            "[auto-loop] %s 第一段注册完成，进入补 RT 冷却队列", email
+        )
+
+    def _queue_rt_retry(self, account: dict) -> bool:
+        """第二段失败重试：回到冷却队列尾部，立即到期、不再等冷却。"""
+        retry_account = dict(account)
+        retry_account["ready_at"] = time.time()
+        with self._lock:
+            self._rt_pending.insert(0, retry_account)
+        return True
+
     def _reserve_retry_state(self, account_key: str) -> None:
         """在把账号放入队列前暂时锁住它，避免其它 worker 抢先开始重试。"""
         if not account_key:
@@ -946,8 +1169,12 @@ class AutoLoopController:
         queued = False
         if retry_number:
             self._reserve_retry_state(key)
+            # 第二段（补 RT）的失败必须回到冷却队列；投进注册重试队列
+            # 会把这个号重新跑一遍 Camoufox 注册。
             queued = (
-                self._queue_login_retry(account)
+                self._queue_rt_retry(account)
+                if account.get("_rt_step2")
+                else self._queue_login_retry(account)
                 if self._options.get("login_only")
                 else self._queue_registration_retry(account, pooled)
             )
@@ -1010,12 +1237,23 @@ class AutoLoopController:
                 self._login_queue = []
                 self._login_seen = set()
                 self._login_context = ""
+                # 冷却中没等到补 RT 的账号：注册结果已入库（有 AT 没 RT），
+                # 用户随时可以用「仅执行无 RT 账号」的仅登录任务补跑。
+                rt_abandoned = len(self._rt_pending)
+                self._rt_pending = []
+                self._rt_delay_armed = False
+                self._rt_armed_at = 0.0
                 self._last_message = (
                     f"已停止（完成 {self._task_completed}"
                     f"/{self._task_total if self._task_total_known else '?'}，"
                     f"成功 {self._registered_ok} / 最终失败 {self._registered_fail}"
                     f" / 重试 {self._retry_count}）"
                 )
+                if rt_abandoned:
+                    self._last_message += (
+                        f"；{rt_abandoned} 个账号冷却中未补 RT"
+                        "（已有 AT，可用“仅执行无 RT 账号”补跑）"
+                    )
             self._broadcast("state", self._snapshot())
 
     def _worker_loop(self, worker_id: int):
@@ -1076,15 +1314,18 @@ class AutoLoopController:
                             if self._registration_retry_queue else None
                         )
                     if account is None:
-                        try:
-                            account = db.claim_next(
-                                kind=mail_source,
-                                group_name=self._options.get("group_name", ""),
-                            )
-                        except ValueError as e:
-                            logger.error(f"[worker-{worker_id}] 分组参数无效: {e}")
-                            self._set_message(str(e))
-                            return
+                        if self._rt_two_step and self._rt_step1_saturated():
+                            account = None  # 本批第一段名额已满，不再领新号
+                        else:
+                            try:
+                                account = db.claim_next(
+                                    kind=mail_source,
+                                    group_name=self._options.get("group_name", ""),
+                                )
+                            except ValueError as e:
+                                logger.error(f"[worker-{worker_id}] 分组参数无效: {e}")
+                                self._set_message(str(e))
+                                return
                 else:
                     with self._lock:
                         account = (
@@ -1092,15 +1333,28 @@ class AutoLoopController:
                             if self._registration_retry_queue else None
                         )
                     if account is None:
-                        account = {
-                            "email": f"{mail_source}_placeholder_"
-                                     f"{int(time.time())}_{worker_id}@placeholder.local",
-                            "password": "", "client_id": "", "refresh_token": "",
-                            "relay_url": "", "kind": mail_source,
-                            # 临时地址每次都是新的邮箱，但一次失败重试
-                            # 仍属于同一个逻辑账号对象。
-                            "_auto_task_key": f"placeholder:{time.time_ns()}:{worker_id}",
-                        }
+                        if self._rt_two_step and self._rt_step1_saturated():
+                            account = None  # 本批第一段名额已满，不再造占位
+                        else:
+                            account = {
+                                "email": f"{mail_source}_placeholder_"
+                                         f"{int(time.time())}_{worker_id}@placeholder.local",
+                                "password": "", "client_id": "", "refresh_token": "",
+                                "relay_url": "", "kind": mail_source,
+                                # 临时地址每次都是新的邮箱，但一次失败重试
+                                # 仍属于同一个逻辑账号对象。
+                                "_auto_task_key": f"placeholder:{time.time_ns()}:{worker_id}",
+                            }
+            # 第一段收口后，派发已到期（冷却完成）的补 RT 账号
+            if (
+                not account
+                and not self._options.get("login_only")
+                and self._rt_two_step
+            ):
+                rt_account = self._pop_mature_rt()
+                if rt_account is not None:
+                    account = rt_account
+                    pooled = False  # 不是号池 claim，失败不落号池状态
             if not account:
                 idle_round += 1
                 queue_name = (
@@ -1110,10 +1364,14 @@ class AutoLoopController:
                     self._set_message(
                         f"worker-{worker_id} {queue_name}空，等待新任务..."
                     )
-                # 空 10 轮（约 30s）就停掉这个 worker
+                # 空 10 轮（约 30s）就停掉这个 worker；但两段式还有账号在
+                # 冷却等补 RT 时不能退场——它们是本任务未完成的尾巴。
                 if idle_round >= 10:
-                    logger.info(f"[worker-{worker_id}] {queue_name}空 30s，停止")
-                    return
+                    with self._lock:
+                        rt_waiting = self._rt_two_step and bool(self._rt_pending)
+                    if not rt_waiting:
+                        logger.info(f"[worker-{worker_id}] {queue_name}空 30s，停止")
+                        return
                 # 等 3s 再试
                 for _ in range(30):
                     if self._stop_event.is_set() or self._pause_event.is_set():
@@ -1134,7 +1392,9 @@ class AutoLoopController:
                     if retry_reserved:
                         # 另一个 worker 恰好在把账号放入重试队列，
                         # 等原 worker 完成统计后再取，不能把队列项丢掉。
-                        if self._options.get("login_only"):
+                        if account.get("_rt_step2"):
+                            self._rt_pending.insert(0, account)
+                        elif self._options.get("login_only"):
                             self._login_queue.insert(0, account)
                         else:
                             self._registration_retry_queue.insert(0, account)
@@ -1200,6 +1460,23 @@ class AutoLoopController:
 
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
+            if account.get("_rt_step2"):
+                # 两段式第二段本质是登录链路：密码+TOTP 登录 → Codex OAuth
+                # 拿 RT → 命中 add-phone 就走接码。沿用空间凭证获取任务的
+                # 参数形状；代理仍由上面的租取逻辑注入。
+                run_options.update({
+                    "login_only": True,
+                    "want_access_token": True,
+                    "want_session_token": True,
+                    "want_refresh_token": True,
+                    "ensure_credentials": False,  # 第一段已处理 2FA/密码
+                    "want_2fa": False,
+                    "auto_export": self._rt_auto_export,
+                    "register_mode": "protocol",  # 登录走协议流，不再起浏览器
+                    "debug_mode": False,
+                    "login_emails": None,
+                    "login_no_rt_only": False,
+                })
             if proxy:
                 run_options["proxy"] = proxy
             active_proxy = [proxy]
@@ -1255,7 +1532,11 @@ class AutoLoopController:
 
                 # 启动阶段也要做账号级错误分类。账号永久失效只针对
                 # 仅登录/候选场景做后处理，且不会进入重试队列。
-                if self._options.get("login_only") and category == "account":
+                # 两段式第二段同样是登录语义，复用同一处理。
+                login_semantics = bool(
+                    self._options.get("login_only") or account.get("_rt_step2")
+                )
+                if login_semantics and category == "account":
                     try:
                         db.mark_registered_permanently_invalid(account.get("email", ""), str(e))
                     except Exception:
@@ -1289,7 +1570,7 @@ class AutoLoopController:
                         worker_id,
                         account.get("email", ""),
                     )
-                elif (not self._options.get("login_only")) and not self._stop_event.is_set():
+                elif (not login_semantics) and not self._stop_event.is_set():
                     # 保留注册模式原有的启动失败退避，避免 start_registration
                     # 连续抛错时在重试队列里高速空转。
                     time.sleep(2)
@@ -1301,6 +1582,13 @@ class AutoLoopController:
                     "run_id": run_id,
                     "proxy": active_proxy[0],
                     "started_at": time.time(),
+                    # 阶段标记：第一段收口的“无在途注册”判定只看 register，
+                    # 补 RT 阶段的在跑登录不参与该判定。
+                    "stage": (
+                        "rt" if account.get("_rt_step2")
+                        else "login" if self._options.get("login_only")
+                        else "register"
+                    ),
                 }
             self._broadcast("state", self._snapshot())
             self._broadcast("run_started", {
@@ -1315,12 +1603,21 @@ class AutoLoopController:
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)
-            retry_scheduled = self._finish_with_optional_retry(
-                account,
-                ok,
-                category,
-                pooled=pooled,
+            # 两段式：第一段注册成功的账号不算最终成功，进冷却队列等第二段；
+            # 只有补 RT 也成功（_rt_step2 的 run ok）才计入最终结果。
+            rt_cooling = bool(
+                ok and self._rt_two_step and not account.get("_rt_step2")
             )
+            if rt_cooling:
+                self._enqueue_rt_pending(account_key, account, run_id)
+                retry_scheduled = False
+            else:
+                retry_scheduled = self._finish_with_optional_retry(
+                    account,
+                    ok,
+                    category,
+                    pooled=pooled,
+                )
             if retry_scheduled:
                 with self._lock:
                     retry_no = self._account_retry_used.get(account_key, 0)
@@ -1355,6 +1652,8 @@ class AutoLoopController:
                 "ok": ok,
                 "category": category,
                 "retry_scheduled": retry_scheduled,
+                "rt_cooling": rt_cooling,
+                "rt_step2": bool(account.get("_rt_step2")),
             })
 
             # 冷却（每个 worker 自己的节奏）

@@ -698,8 +698,8 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     # 空间专属的 CPA 推送配置；每项留空都跟随全局导出配置。
     "auto_push_cpa_url": "",
     "auto_push_cpa_mgmt_key": "",
-    # CPA 静态家宽代理池：默认关闭；启用后自动推送 CPA 时给凭证 JSON 写
-    # proxy_url，按租用计数最少取用；与全局/空间候选人代理池完全独立。
+    # CPA 静态家宽代理池：默认关闭；启用后推送 CPA（含手动推送）时给凭证
+    # JSON 写 proxy_url，按租用计数最少取用；与全局/空间候选人代理池完全独立。
     "cpa_static_proxy_enabled": False,
     "cpa_static_proxy_pool": "",
     # Codex/Usage-based 席位是否跳过自动推送。只影响自动流程，手动推送不受此限。
@@ -715,11 +715,14 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     "quota_auto_reset_enabled": False,
     "trash_enabled": True,
     "trash_invalid_enabled": True,
-    "trash_zero_delay_minutes": 60,
-    # 额度耗尽判定看哪个限流窗口：any / five_hour / weekly。
+    # 入箱前置动作：seat = 席位切换为 Codex（成员留在空间）；kick = 直接从
+    # 空间踢出成员（有的母号空间不支持/不适合切 Codex，只能踢人）。
+    "trash_action": "seat",
+    "trash_zero_delay_minutes": 1,
+    # 额度耗尽判定看哪个限流窗口：any / five_hour / weekly，默认仅看周限制。
     # 上游 wham/usage 的 primary/secondary 并不固定对应 5h/周（多数账号只有
     # 周窗口且落在 primary），所以窗口按 window_seconds 认，不按字段名认。
-    "trash_zero_quota_window": "any",
+    "trash_zero_quota_window": "weekly",
     # 同一轮回收里连续入箱时，两次入箱之间的等待秒数（串行限速）。
     "trash_gap_seconds": 30,
     "seat_protect_enabled": False,
@@ -742,6 +745,10 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     # 席位补齐是串行的：每切换一个成员后等待这么多秒再切下一个。
     "auto_seat_switch_gap_seconds": 30,
     "auto_prolite_candidate_seat_type": "default",
+    # 补齐来源：switch=仅切换已加入成员；invite=仅邀请划分到空间但尚未受邀的
+    # 候选人（直接邀请到目标席位）；mixed=先切换已加入成员，不足时再邀请。
+    "auto_standard_seat_source": "switch",
+    "auto_prolite_seat_source": "switch",
     # 批量踢出空间成员：每踢完一个在 [min, max] 秒内随机 sleep，再踢下一个；
     # 两个都填 0 表示不等待。
     "kick_delay_min_seconds": 2,
@@ -1474,8 +1481,9 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
             "invalid_total_count": int(data.get("invalid_total_count") or 0),
             "trash_enabled": bool(settings.get("trash_enabled", True)),
             "trash_invalid_enabled": bool(settings.get("trash_invalid_enabled", True)),
-            "trash_zero_delay_minutes": int(settings.get("trash_zero_delay_minutes") or 60),
-            "trash_zero_quota_window": str(settings.get("trash_zero_quota_window") or "any"),
+            "trash_action": str(settings.get("trash_action") or "seat"),
+            "trash_zero_delay_minutes": int(settings.get("trash_zero_delay_minutes") or 1),
+            "trash_zero_quota_window": str(settings.get("trash_zero_quota_window") or "weekly"),
             "trash_gap_seconds": normalize_gap_seconds(settings.get("trash_gap_seconds"), 30),
         },
         "seat_fulfillment": {
@@ -1489,6 +1497,7 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
                 "protect_refresh_time": str(settings.get("seat_protect_refresh_time") or "00:00"),
                 "protect_window_key": str(settings.get("seat_protect_window_key") or ""),
                 "target": int(settings.get("auto_standard_seat_target") or 0),
+                "source": str(settings.get("auto_standard_seat_source") or "switch"),
             },
             "prolite": {
                 "count": int(data.get("prolite_seat_count") or 0),
@@ -1500,6 +1509,7 @@ def get_workspace_candidate_stats(workspace_master_id: int) -> dict:
                 "protect_refresh_time": str(settings.get("prolite_seat_protect_refresh_time") or "00:00"),
                 "protect_window_key": str(settings.get("prolite_seat_protect_window_key") or ""),
                 "target": int(settings.get("auto_prolite_seat_target") or 0),
+                "source": str(settings.get("auto_prolite_seat_source") or "switch"),
             },
             "codex": {
                 "count": int(data.get("codex_seat_count") or 0),
@@ -1980,12 +1990,18 @@ def remove_workspace_assignment(workspace_master_id: int, emails: list[str]) -> 
     return counts
 
 
-def mark_workspace_candidates_kicked(workspace_master_id: int, emails: list[str]) -> dict:
-    """踢出空间成员后的本地落库：候选行保留但移入本空间垃圾箱（trash_reason='kicked'）。
+def mark_workspace_candidates_kicked(
+    workspace_master_id: int,
+    emails: list[str],
+    reason: str = "kicked",
+) -> dict:
+    """踢出空间成员后的本地落库：候选行保留但移入本空间垃圾箱（trash_reason 默认 'kicked'）。
 
     一个事务里完成：清空 member_id/席位快照、加入状态回到 not_invited、
     trash_status='trashed'，并删掉该空间凭证（人已不在空间，凭证即失效）。
     注册结果/号池不受影响；从垃圾箱恢复后仍是普通候选人，可再次邀请。
+    ``reason``：踢出模式下的自动入箱会传入真实触发原因（如 quota_zero），
+    保留"为什么入箱"的语义而不是一律记成 kicked。
     """
     cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
     counts = {"candidates": 0, "credentials": 0}
@@ -1993,6 +2009,7 @@ def mark_workspace_candidates_kicked(workspace_master_id: int, emails: list[str]
         return counts
     marks = ",".join("?" * len(cleaned))
     now = time.time()
+    reason = str(reason or "kicked")[:500]
     with _lock:
         con = _conn()
         rc = con.execute(
@@ -2000,11 +2017,11 @@ def mark_workspace_candidates_kicked(workspace_master_id: int, emails: list[str]
             UPDATE workspace_candidates
                SET member_id='', seat_type='', codex_seat='', gpt_seat='',
                    workspace_join_status='not_invited',
-                   trash_status='trashed', trash_due_at=0, trash_reason='kicked',
+                   trash_status='trashed', trash_due_at=0, trash_reason=?,
                    updated_at=?
              WHERE workspace_master_id=? AND email IN ({marks})
             """,
-            [now, int(workspace_master_id), *cleaned],
+            [reason, now, int(workspace_master_id), *cleaned],
         )
         counts["candidates"] = rc.rowcount
         rc = con.execute(
@@ -3800,13 +3817,29 @@ def create_run(run_id: str, email: str, log_path: str) -> None:
         con.commit()
 
 
-def finish_run(run_id: str, status: str, error: str = "", category: str = "") -> None:
+def finish_run(
+    run_id: str,
+    status: str,
+    error: str = "",
+    category: str = "",
+    email: str = "",
+) -> None:
     with _lock:
         con = _conn()
-        con.execute(
-            "UPDATE runs SET status=?, finished_at=?, error=?, error_category=? WHERE run_id=?",
-            (status, time.time(), (error or "")[:500], category or None, run_id),
-        )
+        if email:
+            # 非池化邮箱源（占位地址）注册出的真实邮箱在 run 结束时才确定；
+            # 回写 runs.email 让调度层能按 run_id 找回账号。
+            con.execute(
+                "UPDATE runs SET status=?, finished_at=?, error=?, error_category=?, email=? "
+                "WHERE run_id=?",
+                (status, time.time(), (error or "")[:500], category or None,
+                 email.lower(), run_id),
+            )
+        else:
+            con.execute(
+                "UPDATE runs SET status=?, finished_at=?, error=?, error_category=? WHERE run_id=?",
+                (status, time.time(), (error or "")[:500], category or None, run_id),
+            )
         con.commit()
 
 

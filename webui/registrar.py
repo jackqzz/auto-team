@@ -904,7 +904,7 @@ def _do_register(
             f"st={result_summary['session_token_len']} "
             f"rt={result_summary['refresh_token_len']}"
         )
-        db.finish_run(run_id, "done")
+        db.finish_run(run_id, "done", email=d.get("email") or "")
 
     except Exception as e:
         err = str(e)

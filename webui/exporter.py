@@ -1105,21 +1105,60 @@ def push_many_to_cpa(
     rows: list[dict], cpa_cfg: dict,
     on_tokens_refreshed: Optional[Callable[[dict], None]] = None,
     proxy: str = "",
+    credential_proxy_for: Optional[Callable[[dict], str]] = None,
 ) -> list[dict]:
-    """批量推送 CPA；每个账号独立执行，单条失败不终止后续账号。"""
+    """批量推送 CPA；每个账号独立执行，单条失败不终止后续账号。
+
+    credential_proxy_for：可选的按凭证解析函数，返回非空时写进该凭证的
+    credential_proxy_url（CPA 静态家宽池按凭证分配的 proxy_url）。
+    """
     results = []
-    cfg = dict(cpa_cfg or {})
-    cfg["enabled"] = True
+    base_cfg = dict(cpa_cfg or {})
+    base_cfg["enabled"] = True
     if proxy:
-        cfg["proxy"] = proxy
+        base_cfg["proxy"] = proxy
     for cred in rows:
         email = str(cred.get("email") or "").strip().lower()
         try:
+            cfg = base_cfg
+            if credential_proxy_for is not None:
+                leased = str(credential_proxy_for(cred) or "").strip()
+                if leased:
+                    cfg = {**base_cfg, "credential_proxy_url": leased}
             exported = run_exports(
                 cred, cpa_cfg=cfg, sub2api_cfg=None,
                 on_tokens_refreshed=on_tokens_refreshed,
             )
             result = exported.get("cpa") or {"ok": False, "error": "CPA 未执行"}
+            results.append({"email": email, **result})
+        except Exception as e:
+            results.append({"email": email, "ok": False, "error": str(e)})
+    return results
+
+
+def push_many_to_sub2api(
+    rows: list[dict], sub2api_cfg: dict,
+    on_tokens_refreshed: Optional[Callable[[dict], None]] = None,
+    proxy: str = "",
+) -> list[dict]:
+    """批量推送 Sub2API；每个账号独立执行，单条失败不终止后续账号。
+
+    refresh_oauth / timeout 跟随 sub2api_cfg 内的配置（全局导出设置或
+    空间专属覆盖后的最终值），不在此处改写。
+    """
+    results = []
+    base_cfg = dict(sub2api_cfg or {})
+    base_cfg["enabled"] = True
+    if proxy:
+        base_cfg["proxy"] = proxy
+    for cred in rows:
+        email = str(cred.get("email") or "").strip().lower()
+        try:
+            exported = run_exports(
+                cred, cpa_cfg=None, sub2api_cfg=base_cfg,
+                on_tokens_refreshed=on_tokens_refreshed,
+            )
+            result = exported.get("sub2api") or {"ok": False, "error": "Sub2API 未执行"}
             results.append({"email": email, **result})
         except Exception as e:
             results.append({"email": email, "ok": False, "error": str(e)})

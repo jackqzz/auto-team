@@ -1078,6 +1078,8 @@ def remove_member(workspace_db_id: int, email: str, member_id: str = "") -> dict
     """把成员从空间移除（上游 DELETE users/{member_id}）。
 
     member_id 缺省时先回查成员列表再取；查不到说明人已不在空间，视为已踢出。
+    DELETE 只有 2xx 才算踢出成功；404 说明 member_id 快照过期（成员被重新
+    邀请换过 id），按邮箱重解析一次再删，重解析不到才算人已不在空间。
     """
     session, master = create_workspace_http_session(workspace_db_id)
     wid = str(master.get("workspace_id") or "").strip()
@@ -1091,20 +1093,40 @@ def remove_member(workspace_db_id: int, email: str, member_id: str = "") -> dict
     if not member_id:
         logger.info("踢出空间成员：未找到 member_id（可能已不在空间） workspace_db_id=%s email=%s", workspace_db_id, key)
         return {"member_id": "", "kicked": False, "already_gone": True}
-    response = _workspace_admin_request(
-        workspace_db_id,
-        session,
-        "delete",
-        f"{BASE}/backend-api/accounts/{wid}/users/{member_id}",
-        headers={**_headers(token, wid), "Referer": f"{BASE}/admin/members"},
-        timeout=WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS,
+    response = None
+    for attempt in range(2):
+        response = _workspace_admin_request(
+            workspace_db_id,
+            session,
+            "delete",
+            f"{BASE}/backend-api/accounts/{wid}/users/{member_id}",
+            headers={**_headers(token, wid), "Referer": f"{BASE}/admin/members"},
+            timeout=WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS,
+        )
+        if 200 <= response.status_code < 300:
+            try:
+                data = _json(response)
+            except Exception:
+                data = {}
+            logger.info("踢出空间成员 workspace_db_id=%s email=%s member_id=%s status=%s", workspace_db_id, key, member_id, response.status_code)
+            return {"member_id": member_id, "kicked": True, "result": data}
+        if response.status_code == 404 and attempt == 0 and key:
+            fresh = str(fetch_candidate_seats(workspace_db_id, [key]).get(key, {}).get("member_id") or "").strip()
+            if fresh and fresh != member_id:
+                member_id = fresh
+                continue
+            return {"member_id": member_id, "kicked": False, "already_gone": True}
+        break
+    logger.warning(
+        "踢出空间成员未被确认 workspace_db_id=%s email=%s member_id=%s status=%s body=%s",
+        workspace_db_id, key, member_id, response.status_code, _response_debug_body(response),
     )
-    try:
-        data = _json(response)
-    except Exception:
-        data = {}
-    logger.info("踢出空间成员 workspace_db_id=%s email=%s member_id=%s status=%s", workspace_db_id, key, member_id, response.status_code)
-    return {"member_id": member_id, "kicked": True, "result": data}
+    return {
+        "member_id": member_id,
+        "kicked": False,
+        "status_code": int(response.status_code),
+        "error": f"踢出成员未被确认 HTTP {response.status_code}",
+    }
 
 
 def update_member_seat_type(workspace_db_id: int, member_id: str, seat_type: str) -> dict:
@@ -1382,14 +1404,90 @@ def _ensure_candidate_usage_based(workspace_db_id: int, email: str, row: dict | 
     return refreshed or {"member_id": member_id}
 
 
+def _candidate_trash_action(workspace_db_id: int) -> str:
+    """入箱前置动作：seat = 席位切为 Codex（默认）；kick = 直接从空间踢出成员。"""
+    try:
+        value = str(db.get_workspace_settings(workspace_db_id).get("trash_action") or "seat")
+    except Exception:
+        return "seat"
+    return "kick" if value.strip().lower() == "kick" else "seat"
+
+
+def _trash_candidate_via_kick(
+    workspace_db_id: int,
+    email: str,
+    row: dict | None = None,
+    reason: str = "",
+    retries: int = 3,
+) -> dict:
+    """前置动作=踢出空间：远端移除成员后才按入箱落库。
+
+    remove_member 的成功语义二选一：kicked（删除接口 2xx）/ already_gone
+    （成员列表里已没有这个人）。踢出未被远端确认时不写垃圾箱状态，
+    返回 pending_seat 复用席位模式的同一套重新排期契约。
+    """
+    member_id = str((row or {}).get("member_id") or "").strip()
+    result: dict = {}
+    last_error = ""
+    attempts = max(1, int(retries or 1))
+    for attempt in range(attempts):
+        try:
+            result = remove_member(workspace_db_id, email, member_id)
+            last_error = ""
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)[:240]
+            logger.warning(
+                "踢出模式入箱失败 workspace_db_id=%s email=%s attempt=%s/%s",
+                workspace_db_id, email, attempt + 1, attempts,
+                exc_info=True,
+            )
+            # member_id 可能是过期快照：下次清空后由 remove_member
+            # 重新从成员列表解析（人真不在时得到 already_gone）。
+            member_id = ""
+            if attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+    if last_error:
+        return {"ok": False, "pending_seat": True, "error": last_error, "action": "kick"}
+    if not (result.get("kicked") or result.get("already_gone")):
+        return {
+            "ok": False,
+            "pending_seat": True,
+            "error": "踢出空间成员未被确认，不移入垃圾箱",
+            "action": "kick",
+            "result": result,
+        }
+    marked = db.mark_workspace_candidates_kicked(
+        workspace_db_id, [email], reason=reason or "kicked",
+    )
+    if not marked.get("candidates"):
+        return {
+            "ok": False,
+            "pending_seat": False,
+            "error": "候选关系不存在或母号已删除，不执行入箱",
+            "action": "kick",
+        }
+    _cleanup_cpa_credential_after_trash(workspace_db_id, email, reason)
+    return {"ok": True, "action": "kick", "result": result}
+
+
 def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = "", retries: int = 3) -> dict:
-    """将单个候选人移入垃圾箱，并确保席位切到 usage_based。"""
+    """将单个候选人移入垃圾箱。
+
+    前置动作由空间设置 trash_action 决定："seat"=席位切到 usage_based
+    （成员留在空间）；"kick"=直接从空间踢出成员。只有前置动作被远端
+    确认后才写本地垃圾箱状态。
+    """
     email = str(email or "").strip().lower()
     if not email:
         return {"ok": False, "error": "email 不能为空"}
     if not db.get_workspace_master(workspace_db_id):
         return {"ok": False, "pending_seat": False, "error": "母号不存在，不执行入箱"}
     row = db.get_workspace_candidate(workspace_db_id, email) or {}
+    if _candidate_trash_action(workspace_db_id) == "kick":
+        return _trash_candidate_via_kick(
+            workspace_db_id, email, row=row, reason=reason, retries=retries,
+        )
     try:
         seat = _ensure_candidate_usage_based(workspace_db_id, email, row=row, retries=retries)
     except Exception as exc:
@@ -1397,7 +1495,7 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
             "候选人移入垃圾箱前席位切换失败 workspace_db_id=%s email=%s error=%s",
             workspace_db_id, email, str(exc)[:240],
         )
-        return {"ok": False, "pending_seat": True, "error": str(exc)}
+        return {"ok": False, "pending_seat": True, "error": str(exc), "action": "seat"}
     final_seat = _canonical_candidate_seat_type(
         (seat or {}).get("raw_seat_type")
         or (seat or {}).get("seat_type")
@@ -1417,6 +1515,7 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
             "pending_seat": True,
             "error": "席位未确认切换为 Codex（usage based），不会移入垃圾箱",
             "seat": seat,
+            "action": "seat",
         }
     # 只有远端复查确认 usage_based 后，才允许改变垃圾箱状态。
     updated = db.update_workspace_candidate_trash(
@@ -1434,7 +1533,7 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
             "seat": seat,
         }
     _cleanup_cpa_credential_after_trash(workspace_db_id, email, reason)
-    return {"ok": True, "seat": seat}
+    return {"ok": True, "seat": seat, "action": "seat"}
 
 
 # 只有「额度耗尽 / 凭证永久失效」这类自动化入箱才联动删除 CPA 凭证；

@@ -133,6 +133,9 @@ class CandidateStateConsistencyTests(unittest.TestCase):
             patch.object(workspace_membership.db, "get_workspace_master", return_value={"id": 1}),
             patch.object(workspace_membership.db, "get_workspace_candidate", return_value={}),
             patch.object(
+                workspace_membership.db, "get_workspace_settings", return_value={},
+            ),
+            patch.object(
                 workspace_membership,
                 "_ensure_candidate_usage_based",
                 return_value={"raw_seat_type": "default"},
@@ -161,6 +164,9 @@ class CandidateStateConsistencyTests(unittest.TestCase):
         with (
             patch.object(workspace_membership.db, "get_workspace_master", return_value={"id": 1}),
             patch.object(workspace_membership.db, "get_workspace_candidate", return_value={}),
+            patch.object(
+                workspace_membership.db, "get_workspace_settings", return_value={},
+            ),
             patch.object(
                 workspace_membership,
                 "_ensure_candidate_usage_based",

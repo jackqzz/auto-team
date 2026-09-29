@@ -24,7 +24,7 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -256,8 +256,8 @@ class WorkspaceCandidatesReq(BaseModel):
     cool_down_seconds: int = Field(0, ge=0, le=3600)
     trash_enabled: bool = True
     trash_invalid_enabled: bool = True
-    trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
-    trash_zero_quota_window: str = Field("any", description="额度耗尽判定窗口：any / five_hour / weekly")
+    trash_zero_delay_minutes: int = Field(1, ge=1, le=1440)
+    trash_zero_quota_window: str = Field("weekly", description="额度耗尽判定窗口：any / five_hour / weekly")
     trash_gap_seconds: int = Field(30, ge=0, le=600, description="连续入箱之间的等待秒数（串行限速）")
 
 
@@ -302,11 +302,11 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     auto_push_cpa_enabled: bool = Field(True, description="本空间自动推送是否启用 CPA 目标")
     auto_push_sub2api_url: str = Field("", description="空间专属 Sub2API 地址；留空跟随全局导出配置")
     auto_push_sub2api_api_key: str = Field("", description="空间专属 Sub2API API Key；留空跟随全局导出配置")
-    auto_push_sub2api_group_ids: str = Field("", description="自动推送的 Sub2API 号池分组 ID（如 '2,5'）；留空跟随全局导出配置")
+    auto_push_sub2api_group_ids: str = Field("", description="Sub2API 号池分组 ID（如 '2,5'）；留空跟随全局导出配置")
     auto_push_cpa_url: str = Field("", description="空间专属 CPA 地址；留空跟随全局导出配置")
     auto_push_cpa_mgmt_key: str = Field("", description="空间专属 CPA 管理密钥；留空跟随全局导出配置")
-    cpa_static_proxy_enabled: bool = Field(False, description="启用后自动推送 CPA 时从静态家宽池分配凭证级代理")
-    cpa_static_proxy_pool: str = Field("", description="CPA 静态家宽代理池（每行一个）；自动推送 CPA 时按租用计数最少分配并写入凭证 proxy_url")
+    cpa_static_proxy_enabled: bool = Field(False, description="启用后推送 CPA 时从静态家宽池分配凭证级代理")
+    cpa_static_proxy_pool: str = Field("", description="CPA 静态家宽代理池（每行一个）；推送 CPA 时按租用计数最少分配并写入凭证 proxy_url")
     auto_push_skip_codex_seat: bool = Field(True, description="Codex/Usage-based 席位跳过自动推送；仅影响自动流程，手动推送不受限")
     concurrency: int = Field(1, ge=1, le=20)
     otp_timeout: int = Field(180, ge=10, le=600)
@@ -319,8 +319,9 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     )
     trash_enabled: bool = True
     trash_invalid_enabled: bool = True
-    trash_zero_delay_minutes: int = Field(60, ge=1, le=1440)
-    trash_zero_quota_window: str = Field("any", description="额度耗尽判定窗口：any / five_hour / weekly")
+    trash_action: str = Field("seat", description="入箱前置动作：seat=席位切为 Codex / kick=直接踢出空间")
+    trash_zero_delay_minutes: int = Field(1, ge=1, le=1440)
+    trash_zero_quota_window: str = Field("weekly", description="额度耗尽判定窗口：any / five_hour / weekly")
     trash_gap_seconds: int = Field(30, ge=0, le=600, description="连续入箱之间的等待秒数（串行限速）")
     seat_protect_enabled: bool = False
     seat_protect_threshold: int = Field(8, ge=1, le=1000)
@@ -335,6 +336,8 @@ class WorkspaceQuotaScheduleReq(BaseModel):
     auto_seat_interval_minutes: int = Field(5, ge=1, le=1440, description="自动补齐席位轮询周期（分钟）")
     auto_seat_switch_gap_seconds: int = Field(30, ge=0, le=600, description="串行补齐时两次成员席位切换的间隔（秒）")
     auto_prolite_candidate_seat_type: str = Field("default", description="自动补齐高级席位的候选人席位类型")
+    auto_standard_seat_source: str = Field("switch", description="标准席位补齐来源：switch=仅切换已加入成员 / invite=仅邀请未加入候选 / mixed=先切换再邀请")
+    auto_prolite_seat_source: str = Field("switch", description="高级席位补齐来源：switch=仅切换已加入成员 / invite=仅邀请未加入候选 / mixed=先切换再邀请")
     kick_delay_min_seconds: int = Field(2, ge=0, le=600, description="批量踢出成员的随机等待下限（秒）")
     kick_delay_max_seconds: int = Field(5, ge=0, le=600, description="批量踢出成员的随机等待上限（秒）")
 
@@ -1125,8 +1128,14 @@ _QUOTA_WINDOW_TOLERANCE = 600
 
 
 def _normalize_trash_zero_quota_window(value: object) -> str:
+    # 非法/空值回落到默认口径「仅看周限制」；显式存的 any / five_hour 原样保留。
     text = str(value or "").strip().lower()
-    return text if text in TRASH_ZERO_QUOTA_WINDOWS else "any"
+    return text if text in TRASH_ZERO_QUOTA_WINDOWS else "weekly"
+
+
+def _normalize_trash_action(value: object) -> str:
+    # 入箱前置动作只认 kick；其余一律回落 seat，避免手改库后误踢人。
+    return "kick" if str(value or "").strip().lower() == "kick" else "seat"
 
 
 def _candidate_trash_zero_quota_window(workspace_id: int, settings: dict | None = None) -> str:
@@ -1829,6 +1838,17 @@ def _normalize_auto_prolite_candidate_seat_type(value: object) -> str:
     return "default"
 
 
+def _normalize_auto_seat_source(value: object) -> str:
+    """席位补齐来源：switch=仅切换已加入成员（默认）；invite=仅邀请划分到
+    空间但尚未受邀的候选人；mixed=先切换已加入成员，候选不足时再邀请。"""
+    normalized = str(value or "switch").strip().lower().replace("-", "_")
+    if normalized in {"invite", "invite_only", "uninvited", "invite_uninvited"}:
+        return "invite"
+    if normalized in {"mixed", "both", "all", "switch_invite", "switch_then_invite", "invite_and_switch"}:
+        return "mixed"
+    return "switch"
+
+
 def _workspace_auto_prolite_candidates(
     workspace_id: int,
     seen: set[str] | None = None,
@@ -1872,6 +1892,89 @@ def _workspace_auto_prolite_candidates(
 
 
 _workspace_auto_advanced_candidates = _workspace_auto_prolite_candidates
+
+
+def _workspace_auto_invite_candidates(workspace_id: int, seen: set[str] | None = None) -> list[dict]:
+    """划分到当前空间、尚未受邀加入的候选人（直接邀请补齐的来源）。
+
+    join_status=not_invited 的派生口径会顺带排除：已加入（joined）、已受邀
+    待接受（pending_invite）、自行申请待审批（pending_request）的记录——
+    这三类都不是"没受邀请"的候选，直接邀请会重复占用席位。
+    """
+    seen = seen or set()
+    rows = db.list_workspace_candidate_options(
+        workspace_id,
+        account_status="active",
+        join_status="not_invited",
+        trash_status="active",
+    )
+    out = []
+    for row in rows:
+        email = str(row.get("email") or "").strip().lower()
+        if not email or email in seen:
+            continue
+        if str(row.get("workspace_join_status") or "not_invited") != "not_invited":
+            continue
+        if str(row.get("account_status") or "active") == "permanently_invalid":
+            continue
+        if str(row.get("trash_status") or "active") != "active":
+            continue
+        out.append(row)
+    return out
+
+
+def _workspace_pending_invite_rows(workspace_id: int, seat_type: str) -> list[dict]:
+    """本空间已受邀、尚未接受的候选行（限定与 ``seat_type`` 一致的邀请）。
+
+    席位在邀请里记的是受邀时写入的 seat_type；席位未知的记录按目标席位
+    保守计入，避免上游返回缺字段时把同一个待接受邀请再发一遍。
+    """
+    rows = db.list_workspace_candidate_options(
+        workspace_id,
+        account_status="active",
+        join_status="pending_invite",
+        trash_status="active",
+    )
+    out = []
+    for row in rows:
+        seat = workspace_membership._canonical_candidate_seat_type(
+            row.get("seat_label") or row.get("seat_type")
+        )
+        if seat and seat != seat_type:
+            continue
+        out.append(row)
+    return out
+
+
+def _auto_seat_invite_room(
+    workspace_id: int,
+    seat_info: dict,
+    target: int,
+    current: int,
+    seat_type: str,
+) -> int:
+    """本轮还能向 ``seat_type`` 发出的直接邀请数。
+
+    邀请发出后到成员接受前，席位在上游计为 held（待解决）而不是在用数——
+    如果还按 ``目标 - 在用`` 判缺口，一轮里会对着已占住的席位继续发邀请。
+    所以额度按 ``目标 - 在用 - 待解决`` 计算，再叠加上游 available 上限；
+    上游缺 held 字段（或未把刚发出的邀请计入）时用本地 pending_invite 记录
+    兜底，宁可少发也不能超发。
+    """
+    held_raw = seat_info.get(f"seats_{seat_type}_held")
+    try:
+        held = int(held_raw) if held_raw is not None else 0
+    except (TypeError, ValueError):
+        held = 0
+    held = max(held, len(_workspace_pending_invite_rows(workspace_id, seat_type)))
+    room = int(target or 0) - int(current or 0) - held
+    available_raw = seat_info.get(f"seats_{seat_type}_available")
+    if available_raw is not None:
+        try:
+            room = min(room, int(available_raw))
+        except (TypeError, ValueError):
+            pass
+    return max(0, room)
 
 
 def _workspace_seat_protect_exhausted(settings: dict) -> bool:
@@ -2100,6 +2203,126 @@ def _switch_candidate_to_prolite_and_verify(
 _switch_candidate_to_advanced_and_verify = _switch_candidate_to_prolite_and_verify
 
 
+def _invite_candidates_to_seat(
+    workspace_id: int,
+    candidates: list[dict],
+    settings: dict,
+    seat_type: str,
+) -> dict:
+    """把一批划分到空间但尚未受邀的候选人批量邀请到目标席位。
+
+    上游邀请接口原生支持批量（email_addresses 数组）：一次请求发出整批，
+    不像席位切换只能逐个调用——批量比串行单发请求频率更低。请求成功即
+    上游受理整批，逐邮箱落 pending_invite + 目标席位；席位保护配额按
+    批内人数一次性预留，本周期剩余配额不足时把批次截断到剩余量，而不是
+    整批放弃。
+    """
+    seat_type = workspace_membership._canonical_candidate_seat_type(seat_type)
+    if seat_type not in {"default", "usage_based", "prolite"}:
+        return {"ok": False, "invited": [], "error": f"不可邀请的席位类型: {seat_type or '未知'}"}
+    if not _workspace_exists(workspace_id):
+        return {"ok": False, "invited": [], "error": "母号已删除"}
+
+    emails: list[str] = []
+    skipped: list[dict] = []
+    for candidate in candidates:
+        email = str(candidate.get("email") or "").strip().lower()
+        if not email:
+            skipped.append({"email": email, "reason": "email 不能为空"})
+            continue
+        row = db.get_workspace_candidate(workspace_id, email) or dict(candidate)
+        if str(row.get("trash_status") or "active") != "active":
+            skipped.append({"email": email, "reason": "trashed_or_scheduled"})
+            continue
+        join_status = str(row.get("workspace_join_status") or "not_invited").strip() or "not_invited"
+        if join_status == "joined" or str(row.get("member_id") or "").strip():
+            skipped.append({"email": email, "reason": "already_joined"})
+            continue
+        if join_status != "not_invited":
+            skipped.append({"email": email, "reason": f"already_{join_status}"})
+            continue
+        emails.append(email)
+    if not emails:
+        return {"ok": True, "invited": [], "skipped": skipped}
+
+    if seat_type == "prolite":
+        protect_enabled = bool(settings.get("prolite_seat_protect_enabled"))
+        reserve = db.reserve_workspace_prolite_seat_protect_quota
+        release = db.release_workspace_prolite_seat_protect_quota
+        threshold = int(settings.get("prolite_seat_protect_threshold") or 8)
+        refresh_time = str(settings.get("prolite_seat_protect_refresh_time") or "00:00")
+        blocked_key = "blocked_by_prolite_protect"
+        label = "高级席位保护"
+    else:
+        protect_enabled = bool(settings.get("seat_protect_enabled"))
+        reserve = db.reserve_workspace_seat_protect_quota
+        release = db.release_workspace_seat_protect_quota
+        threshold = int(settings.get("seat_protect_threshold") or 8)
+        refresh_time = str(settings.get("seat_protect_refresh_time") or "00:00")
+        blocked_key = "blocked_by_protect"
+        label = "席位保护"
+
+    reserved_amount = 0
+    if protect_enabled:
+        reservation = reserve(workspace_id, len(emails))
+        if not reservation.get("allowed", False):
+            # 整批放不进剩余配额时截到剩余量再预留一次；还是放不下才算被拦。
+            remaining = max(
+                0,
+                int(reservation.get("threshold") or threshold)
+                - int(reservation.get("used_count") or 0),
+            )
+            if remaining <= 0:
+                return {
+                    "ok": False,
+                    "invited": [],
+                    "skipped": skipped,
+                    "error": (
+                        f"{label}已生效：本周期席位分配已达 "
+                        f"{int(reservation.get('threshold') or threshold)} 个，"
+                        f"下次刷新时间 {reservation.get('refresh_time') or refresh_time}"
+                    ),
+                    blocked_key: True,
+                }
+            emails = emails[:remaining]
+            reservation = reserve(workspace_id, len(emails))
+            if not reservation.get("allowed", False):
+                return {
+                    "ok": False,
+                    "invited": [],
+                    "skipped": skipped,
+                    "error": f"{label}已生效：批量预留 {len(emails)} 个席位配额未通过",
+                    blocked_key: True,
+                }
+        reserved_amount = len(emails)
+
+    try:
+        workspace_membership.invite_candidates(workspace_id, emails, seat_type=seat_type)
+    except Exception as exc:  # noqa: BLE001
+        if reserved_amount:
+            try:
+                release(workspace_id, reserved_amount)
+            except Exception:
+                logger.exception(
+                    "自动席位批量邀请保护配额回滚失败 workspace_db_id=%s amount=%s",
+                    workspace_id,
+                    reserved_amount,
+                )
+        return {"ok": False, "invited": [], "skipped": skipped, "error": f"邀请失败: {exc}"}
+
+    # 与手动邀请端点同口径：批量请求成功即上游已受理整批邀请。
+    for email in emails:
+        db.update_workspace_candidate_status(workspace_id, email, "pending_invite")
+        db.update_workspace_candidate_seat_type(workspace_id, email, seat_type)
+    return {
+        "ok": True,
+        "invited": emails,
+        "skipped": skipped,
+        "seat_type": seat_type,
+        "reserved": reserved_amount,
+    }
+
+
 def _enqueue_workspace_credentials(workspace_id: int, emails: list[str], settings: dict) -> dict:
     emails = [str(e).strip().lower() for e in emails if str(e).strip()]
     if not emails:
@@ -2223,7 +2446,9 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                 continue
 
             switched: list[str] = []
+            invited: list[str] = []
             attempted: set[str] = set()
+            invite_attempted: set[str] = set()
             while not stop.is_set():
                 if not _workspace_exists(workspace_id):
                     logger.info("母号已删除，停止自动标准席位任务 workspace_db_id=%s", workspace_id)
@@ -2253,62 +2478,137 @@ def _auto_standard_seat_worker(workspace_id: int, stop: threading.Event):
                     else (seat_info.get("seats_entitled") or 0)
                 )
                 current_default = int(seat_info.get("seats_default") or 0)
-                deficit = max(0, _auto_seat_target(settings, "auto_standard_seat_target", entitled) - current_default)
+                target = _auto_seat_target(settings, "auto_standard_seat_target", entitled)
+                deficit = max(0, target - current_default)
                 if deficit <= 0:
                     break
-                candidates = _workspace_auto_standard_candidates(workspace_id, attempted)
-                if not candidates:
+                source = _normalize_auto_seat_source(settings.get("auto_standard_seat_source"))
+                if source in {"switch", "mixed"}:
+                    candidates = _workspace_auto_standard_candidates(workspace_id, attempted)
+                else:
+                    candidates = []
+                if candidates:
+                    candidate = candidates[0]
+                    email = str(candidate.get("email") or "").strip().lower()
+                    attempted.add(email)
+                    result = _switch_candidate_to_default_and_verify(workspace_id, candidate, settings)
+                    if result.get("ok") and not result.get("skipped"):
+                        switched.append(email)
+                        logger.info(
+                            "自动标准席位切换成功 workspace_db_id=%s email=%s",
+                            workspace_id,
+                            email,
+                        )
+                    elif result.get("skipped"):
+                        logger.info(
+                            "自动标准席位候选已是目标席位 workspace_db_id=%s email=%s",
+                            workspace_id,
+                            email,
+                        )
+                    elif result.get("blocked_by_protect"):
+                        logger.info(
+                            "自动标准席位任务受到席位保护，停止本轮 workspace_db_id=%s email=%s",
+                            workspace_id,
+                            email,
+                        )
+                        break
+                    else:
+                        logger.warning(
+                            "自动标准席位切换失败 workspace_db_id=%s email=%s error=%s",
+                            workspace_id,
+                            email,
+                            result.get("error"),
+                        )
+                elif source in {"invite", "mixed"}:
+                    # 切换候选用尽（或只走邀请）：还有席位缺口时，按剩余席位
+                    # 一次性批量邀请已划分但未受邀的候选人进标准席位——上游
+                    # 原生支持批量邀请，一次请求比逐个串行调用频率更低。
+                    room = _auto_seat_invite_room(workspace_id, seat_info, target, current_default, "default")
+                    if room <= 0:
+                        logger.info(
+                            "自动标准席位任务可用席位已被占满（含待接受邀请），停止本轮 workspace_db_id=%s",
+                            workspace_id,
+                        )
+                        break
+                    invitees = _workspace_auto_invite_candidates(workspace_id, invite_attempted)
+                    if not invitees:
+                        logger.info(
+                            "自动标准席位任务无可邀请候选 workspace_db_id=%s deficit=%s",
+                            workspace_id,
+                            deficit,
+                        )
+                        break
+                    batch = invitees[:room]
+                    for candidate in batch:
+                        email = str(candidate.get("email") or "").strip().lower()
+                        if email:
+                            invite_attempted.add(email)
+                    result = _invite_candidates_to_seat(workspace_id, batch, settings, "default")
+                    batch_invited = result.get("invited") or []
+                    invited.extend(batch_invited)
+                    for item in result.get("skipped") or []:
+                        logger.info(
+                            "自动标准席位邀请跳过 workspace_db_id=%s email=%s reason=%s",
+                            workspace_id,
+                            item.get("email"),
+                            item.get("reason"),
+                        )
+                    if batch_invited:
+                        logger.info(
+                            "自动标准席位批量邀请成功 workspace_db_id=%s count=%s seat_type=default",
+                            workspace_id,
+                            len(batch_invited),
+                        )
+                    elif result.get("ok"):
+                        # 批内全部被前置过滤跳过：这轮没有再可邀的了。
+                        break
+                    elif result.get("blocked_by_protect"):
+                        logger.info(
+                            "自动标准席位任务受到席位保护，停止本轮 workspace_db_id=%s",
+                            workspace_id,
+                        )
+                        break
+                    else:
+                        # 批量请求整体失败大概率是上游/网络问题，停本轮
+                        # 等下个周期重试，避免对着故障接口继续发批。
+                        logger.warning(
+                            "自动标准席位批量邀请失败 workspace_db_id=%s count=%s error=%s",
+                            workspace_id,
+                            len(batch),
+                            result.get("error"),
+                        )
+                        break
+                else:
                     logger.info(
                         "自动标准席位任务候选不足 workspace_db_id=%s deficit=%s",
                         workspace_id,
                         deficit,
                     )
                     break
-                candidate = candidates[0]
-                email = str(candidate.get("email") or "").strip().lower()
-                attempted.add(email)
-                result = _switch_candidate_to_default_and_verify(workspace_id, candidate, settings)
-                if result.get("ok") and not result.get("skipped"):
-                    switched.append(email)
-                    logger.info(
-                        "自动标准席位切换成功 workspace_db_id=%s email=%s",
-                        workspace_id,
-                        email,
-                    )
-                elif result.get("skipped"):
-                    logger.info(
-                        "自动标准席位候选已是目标席位 workspace_db_id=%s email=%s",
-                        workspace_id,
-                        email,
-                    )
-                elif result.get("blocked_by_protect"):
-                    logger.info(
-                        "自动标准席位任务受到席位保护，停止本轮 workspace_db_id=%s email=%s",
-                        workspace_id,
-                        email,
-                    )
-                    break
-                else:
-                    logger.warning(
-                        "自动标准席位切换失败 workspace_db_id=%s email=%s error=%s",
-                        workspace_id,
-                        email,
-                        result.get("error"),
-                    )
                 if stop.is_set():
                     break
-                # 串行切换：本轮的 settings 每次循环开头都重新取，改间隔立即生效。
+                # 串行补齐：本轮的 settings 每次循环开头都重新取，改间隔立即生效。
                 stop.wait(_auto_seat_switch_gap_seconds(settings))
 
-            if switched:
+            enqueue_emails = list(dict.fromkeys([*switched, *invited]))
+            settings = _workspace_settings_snapshot(workspace_id)
+            if _normalize_auto_seat_source(settings.get("auto_standard_seat_source")) in {"invite", "mixed"}:
+                # 上轮已邀请但凭证没取到（入队失败/重启/手动邀请的）也一并补登——
+                # pending_invite 的席位已被占住，凭证任务顺便把邀请接受成 joined。
+                for pending in _workspace_pending_invite_rows(workspace_id, "default"):
+                    email = str(pending.get("email") or "").strip().lower()
+                    if email:
+                        enqueue_emails.append(email)
+                enqueue_emails = list(dict.fromkeys(enqueue_emails))
+            if enqueue_emails:
                 if not _workspace_exists(workspace_id):
-                    switched.clear()
+                    enqueue_emails.clear()
                 else:
                     try:
-                        _enqueue_workspace_credentials(workspace_id, switched, _workspace_settings_snapshot(workspace_id))
+                        _enqueue_workspace_credentials(workspace_id, enqueue_emails, settings)
                     except Exception:
-                        logger.exception("自动标准席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, switched)
-            stop.wait(_auto_seat_interval_seconds(_workspace_settings_snapshot(workspace_id)))
+                        logger.exception("自动标准席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, enqueue_emails)
+            stop.wait(_auto_seat_interval_seconds(settings))
     finally:
         with _seat_auto_schedulers_lock:
             current = _seat_auto_schedulers.get(workspace_id)
@@ -2364,7 +2664,9 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 continue
 
             switched: list[str] = []
+            invited: list[str] = []
             attempted: set[str] = set()
+            invite_attempted: set[str] = set()
             while not stop.is_set():
                 if not _workspace_exists(workspace_id):
                     logger.info("母号已删除，停止自动高级席位任务 workspace_db_id=%s", workspace_id)
@@ -2392,58 +2694,131 @@ def _auto_prolite_seat_worker(workspace_id: int, stop: threading.Event):
                 current_prolite = seat_info.get("seats_prolite")
                 if entitled is None or current_prolite is None:
                     break
-                deficit = max(0, _auto_seat_target(settings, "auto_prolite_seat_target", entitled) - int(current_prolite or 0))
+                target = _auto_seat_target(settings, "auto_prolite_seat_target", entitled)
+                deficit = max(0, target - int(current_prolite or 0))
                 if deficit <= 0:
                     break
-                candidates = _workspace_auto_prolite_candidates(
-                    workspace_id,
-                    attempted,
-                    settings.get("auto_prolite_candidate_seat_type", "default"),
-                )
-                if not candidates:
+                source = _normalize_auto_seat_source(settings.get("auto_prolite_seat_source"))
+                if source in {"switch", "mixed"}:
+                    candidates = _workspace_auto_prolite_candidates(
+                        workspace_id,
+                        attempted,
+                        settings.get("auto_prolite_candidate_seat_type", "default"),
+                    )
+                else:
+                    candidates = []
+                if candidates:
+                    candidate = candidates[0]
+                    email = str(candidate.get("email") or "").strip().lower()
+                    attempted.add(email)
+                    result = _switch_candidate_to_prolite_and_verify(workspace_id, candidate, settings)
+                    if result.get("ok") and not result.get("skipped"):
+                        switched.append(email)
+                        logger.info("自动高级席位切换成功 workspace_db_id=%s email=%s", workspace_id, email)
+                    elif result.get("skipped"):
+                        logger.info("自动高级席位候选已是目标席位 workspace_db_id=%s email=%s", workspace_id, email)
+                    elif result.get("blocked_by_prolite_protect"):
+                        logger.info(
+                            "自动高级席位任务受到高级席位保护，停止本轮 workspace_db_id=%s email=%s",
+                            workspace_id,
+                            email,
+                        )
+                        break
+                    else:
+                        logger.warning(
+                            "自动高级席位切换失败 workspace_db_id=%s email=%s error=%s",
+                            workspace_id,
+                            email,
+                            result.get("error"),
+                        )
+                elif source in {"invite", "mixed"}:
+                    # 切换候选用尽（或只走邀请）：还有席位缺口时，按剩余席位
+                    # 一次性批量邀请已划分但未受邀的候选人进 ProLite 目标席位。
+                    room = _auto_seat_invite_room(
+                        workspace_id, seat_info, target, int(current_prolite or 0), "prolite"
+                    )
+                    if room <= 0:
+                        logger.info(
+                            "自动高级席位任务可用席位已被占满（含待接受邀请），停止本轮 workspace_db_id=%s",
+                            workspace_id,
+                        )
+                        break
+                    invitees = _workspace_auto_invite_candidates(workspace_id, invite_attempted)
+                    if not invitees:
+                        logger.info(
+                            "自动高级席位任务无可邀请候选 workspace_db_id=%s deficit=%s",
+                            workspace_id,
+                            deficit,
+                        )
+                        break
+                    batch = invitees[:room]
+                    for candidate in batch:
+                        email = str(candidate.get("email") or "").strip().lower()
+                        if email:
+                            invite_attempted.add(email)
+                    result = _invite_candidates_to_seat(workspace_id, batch, settings, "prolite")
+                    batch_invited = result.get("invited") or []
+                    invited.extend(batch_invited)
+                    for item in result.get("skipped") or []:
+                        logger.info(
+                            "自动高级席位邀请跳过 workspace_db_id=%s email=%s reason=%s",
+                            workspace_id,
+                            item.get("email"),
+                            item.get("reason"),
+                        )
+                    if batch_invited:
+                        logger.info(
+                            "自动高级席位批量邀请成功 workspace_db_id=%s count=%s seat_type=prolite",
+                            workspace_id,
+                            len(batch_invited),
+                        )
+                    elif result.get("ok"):
+                        break
+                    elif result.get("blocked_by_prolite_protect"):
+                        logger.info(
+                            "自动高级席位任务受到高级席位保护，停止本轮 workspace_db_id=%s",
+                            workspace_id,
+                        )
+                        break
+                    else:
+                        logger.warning(
+                            "自动高级席位批量邀请失败 workspace_db_id=%s count=%s error=%s",
+                            workspace_id,
+                            len(batch),
+                            result.get("error"),
+                        )
+                        break
+                else:
                     logger.info(
                         "自动高级席位任务候选不足 workspace_db_id=%s deficit=%s",
                         workspace_id,
                         deficit,
                     )
                     break
-                candidate = candidates[0]
-                email = str(candidate.get("email") or "").strip().lower()
-                attempted.add(email)
-                result = _switch_candidate_to_prolite_and_verify(workspace_id, candidate, settings)
-                if result.get("ok") and not result.get("skipped"):
-                    switched.append(email)
-                    logger.info("自动高级席位切换成功 workspace_db_id=%s email=%s", workspace_id, email)
-                elif result.get("skipped"):
-                    logger.info("自动高级席位候选已是目标席位 workspace_db_id=%s email=%s", workspace_id, email)
-                elif result.get("blocked_by_prolite_protect"):
-                    logger.info(
-                        "自动高级席位任务受到高级席位保护，停止本轮 workspace_db_id=%s email=%s",
-                        workspace_id,
-                        email,
-                    )
-                    break
-                else:
-                    logger.warning(
-                        "自动高级席位切换失败 workspace_db_id=%s email=%s error=%s",
-                        workspace_id,
-                        email,
-                        result.get("error"),
-                    )
                 if stop.is_set():
                     break
-                # 串行切换：本轮的 settings 每次循环开头都重新取，改间隔立即生效。
+                # 串行补齐：本轮的 settings 每次循环开头都重新取，改间隔立即生效。
                 stop.wait(_auto_seat_switch_gap_seconds(settings))
 
-            if switched:
+            enqueue_emails = list(dict.fromkeys([*switched, *invited]))
+            settings = _workspace_settings_snapshot(workspace_id)
+            if _normalize_auto_seat_source(settings.get("auto_prolite_seat_source")) in {"invite", "mixed"}:
+                # 已邀请但凭证没取到的 pending_invite（含上轮邀请与手动邀请）
+                # 一并补登：凭证登录会顺带把待接受邀请落为 joined。
+                for pending in _workspace_pending_invite_rows(workspace_id, "prolite"):
+                    email = str(pending.get("email") or "").strip().lower()
+                    if email:
+                        enqueue_emails.append(email)
+                enqueue_emails = list(dict.fromkeys(enqueue_emails))
+            if enqueue_emails:
                 if not _workspace_exists(workspace_id):
-                    switched.clear()
+                    enqueue_emails.clear()
                 else:
                     try:
-                        _enqueue_workspace_credentials(workspace_id, switched, _workspace_settings_snapshot(workspace_id))
+                        _enqueue_workspace_credentials(workspace_id, enqueue_emails, settings)
                     except Exception:
-                        logger.exception("自动高级席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, switched)
-            stop.wait(_auto_seat_interval_seconds(_workspace_settings_snapshot(workspace_id)))
+                        logger.exception("自动高级席位后续凭证获取失败 workspace_db_id=%s emails=%s", workspace_id, enqueue_emails)
+            stop.wait(_auto_seat_interval_seconds(settings))
     finally:
         with _prolite_auto_schedulers_lock:
             current = _prolite_auto_schedulers.get(workspace_id)
@@ -2825,7 +3200,7 @@ def _candidate_trash_invalid_enabled(workspace_id: int, settings: dict | None = 
 
 def _candidate_trash_delay_seconds(workspace_id: int, settings: dict | None = None) -> int:
     cfg = _workspace_settings_snapshot(workspace_id, settings)
-    return int(cfg.get("trash_zero_delay_minutes", 60) or 60) * 60
+    return int(cfg.get("trash_zero_delay_minutes", 1) or 1) * 60
 
 
 def _candidate_trash_gap_seconds(workspace_id: int, settings: dict | None = None) -> int:
@@ -2915,6 +3290,7 @@ def _clear_candidate_trash_timer(workspace_id: int, email: str) -> bool:
 def _apply_candidate_trash(workspace_id: int, email: str, reason: str = "quota_zero") -> dict:
     result = workspace_membership.trash_workspace_candidate(workspace_id, email, reason=reason)
     if not result.get("ok") and result.get("pending_seat"):
+        action = "kick" if result.get("action") == "kick" else "seat"
         db.update_workspace_candidate_trash(
             workspace_id,
             email,
@@ -2923,8 +3299,8 @@ def _apply_candidate_trash(workspace_id: int, email: str, reason: str = "quota_z
             reason="seat_retry",
         )
         logger.warning(
-            "垃圾箱席位切换已延期 workspace_db_id=%s email=%s retry_at=10m",
-            workspace_id, email,
+            "垃圾箱前置动作已延期 workspace_db_id=%s email=%s action=%s retry_at=10m",
+            workspace_id, email, action,
         )
     return result
 
@@ -3945,8 +4321,12 @@ def api_start_quota_schedule(req: WorkspaceQuotaScheduleReq):
             value = getattr(req, key)
             if key == "auto_prolite_candidate_seat_type":
                 value = _normalize_auto_prolite_candidate_seat_type(value)
+            elif key in {"auto_standard_seat_source", "auto_prolite_seat_source"}:
+                value = _normalize_auto_seat_source(value)
             elif key == "trash_zero_quota_window":
                 value = _normalize_trash_zero_quota_window(value)
+            elif key == "trash_action":
+                value = _normalize_trash_action(value)
             settings[key] = value
     settings["quota_enabled"] = True
     db.update_workspace_settings(req.workspace_id, settings)
@@ -4146,8 +4526,12 @@ def api_save_workspace_candidate_settings(req: WorkspaceQuotaScheduleReq):
             value = getattr(req, key)
             if key == "auto_prolite_candidate_seat_type":
                 value = _normalize_auto_prolite_candidate_seat_type(value)
+            elif key in {"auto_standard_seat_source", "auto_prolite_seat_source"}:
+                value = _normalize_auto_seat_source(value)
             elif key == "trash_zero_quota_window":
                 value = _normalize_trash_zero_quota_window(value)
+            elif key == "trash_action":
+                value = _normalize_trash_action(value)
             settings[key] = value
     db.update_workspace_settings(req.workspace_id, settings)
     return {"ok": True}
@@ -5580,7 +5964,7 @@ class ManualExportReq(BaseModel):
     )
 
 
-class BulkCpaPushReq(BaseModel):
+class BulkPushReq(BaseModel):
     emails: list[str] = Field(..., min_length=1, description="选中的已注册账号邮箱")
     proxy: str = Field("", description="刷新 OAuth token 时使用的代理")
     workspace_id: Optional[int] = Field(None, description="按指定 Team 空间推送独立凭证")
@@ -5630,11 +6014,12 @@ def api_manual_export_to_panel(req: ManualExportReq):
     return {"ok": True, **out}
 
 
-@app.post("/api/registered/push_cpa")
-def api_push_registered_to_cpa(req: BulkCpaPushReq):
-    """将选中的注册结果逐个转换为 CPA token JSON 并上传到已配置 CPA。"""
-    from . import exporter
+def _bulk_push_target_rows(req: "BulkPushReq") -> tuple[list[str], dict, list[dict], list[dict], Callable]:
+    """批量推送的公共部分：邮箱去重、凭证查询、token 回写回调。
 
+    返回 ``(emails, ws_settings, found_rows, results, refresh_cb)``；
+    ``results`` 已预填未找到注册结果的邮箱错误项，调用方追加推送结果即可。
+    """
     emails = []
     seen = set()
     for email in req.emails:
@@ -5645,10 +6030,7 @@ def api_push_registered_to_cpa(req: BulkCpaPushReq):
     if not emails:
         raise HTTPException(400, "没有有效的账号邮箱")
 
-    cfg = db.get_export_internal_config()["cpa"]
-    if not cfg.get("cpa_url") or not cfg.get("cpa_mgmt_key"):
-        raise HTTPException(400, "请先在“自动导出”中配置 CPA URL 和管理密钥")
-
+    ws_settings = db.get_workspace_settings(req.workspace_id) if req.workspace_id else {}
     rows = (db.list_workspace_credentials_by_emails(req.workspace_id, emails)
             if req.workspace_id else db.list_registered_by_emails(emails))
     row_map = {str(row.get("email") or "").lower(): row for row in rows}
@@ -5662,7 +6044,81 @@ def api_push_registered_to_cpa(req: BulkCpaPushReq):
         found_rows.append(cred)
     refresh_cb = (lambda cred: db.save_workspace_credential(req.workspace_id, cred)) if req.workspace_id else (lambda cred: db.update_registered_oauth_tokens(
             cred.get("email", ""), access_token=cred.get("access_token", ""), refresh_token=cred.get("refresh_token", ""), id_token=cred.get("id_token", "")))
+    return emails, ws_settings, found_rows, results, refresh_cb
+
+
+@app.post("/api/registered/push_cpa")
+def api_push_registered_to_cpa(req: BulkPushReq):
+    """将选中的注册结果逐个转换为 CPA token JSON 并上传到已配置 CPA。"""
+    from . import exporter
+
+    emails, ws_settings, found_rows, results, refresh_cb = _bulk_push_target_rows(req)
+
+    cfg = dict(db.get_export_internal_config()["cpa"])
+    # 空间候选人的手动推送同样套用「空间专属号池推送」：专属地址/密钥覆盖
+    # 全局导出配置，留空的项继续跟随全局；空间自己配齐时全局未配置也能推。
+    for setting_key, cfg_key in (
+        ("auto_push_cpa_url", "cpa_url"),
+        ("auto_push_cpa_mgmt_key", "cpa_mgmt_key"),
+    ):
+        value = str(ws_settings.get(setting_key) or "").strip()
+        if value:
+            cfg[cfg_key] = value
+    if not cfg.get("cpa_url") or not cfg.get("cpa_mgmt_key"):
+        raise HTTPException(400, "请先在「自动导出」或空间「专属号池推送」中配置 CPA URL 和管理密钥")
+
+    # 空间开启 CPA 静态家宽代理时，手动推送也要给凭证租代理写 proxy_url；
+    # 否则重推会把之前自动推送写入的 proxy_url 抹掉，而本地租约还在。
+    credential_proxy_for = None
+    cpa_pool = str(ws_settings.get("cpa_static_proxy_pool") or "").strip()
+    if req.workspace_id and ws_settings.get("cpa_static_proxy_enabled") and cpa_pool:
+        ws_id = int(req.workspace_id)
+        credential_proxy_for = lambda cred: db.lease_cpa_proxy(
+            ws_id, str(cred.get("email") or ""), cpa_pool
+        )
     results.extend(exporter.push_many_to_cpa(
+        found_rows,
+        cfg,
+        on_tokens_refreshed=refresh_cb,
+        proxy=req.proxy,
+        credential_proxy_for=credential_proxy_for,
+    ))
+
+    succeeded = sum(1 for item in results if item.get("ok"))
+    return {
+        "ok": succeeded == len(results),
+        "total": len(results),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "results": results,
+    }
+
+
+@app.post("/api/registered/push_sub2api")
+def api_push_registered_to_sub2api(req: BulkPushReq):
+    """将选中的注册结果逐个上传到已配置 Sub2API（号池）。
+
+    与 CPA 手动推送同一套「空间专属号池推送」：auto_push_sub2api_url /
+    api_key / group_ids 覆盖全局导出配置，留空的项跟随全局；空间自己
+    配齐 URL+Key 时全局未配置也能推。refresh_oauth 跟随全局导出设置。
+    """
+    from . import exporter
+
+    emails, ws_settings, found_rows, results, refresh_cb = _bulk_push_target_rows(req)
+
+    cfg = dict(db.get_export_internal_config()["sub2api"])
+    for setting_key, cfg_key in (
+        ("auto_push_sub2api_url", "sub2api_url"),
+        ("auto_push_sub2api_api_key", "sub2api_api_key"),
+        ("auto_push_sub2api_group_ids", "sub2api_group_ids"),
+    ):
+        value = str(ws_settings.get(setting_key) or "").strip()
+        if value:
+            cfg[cfg_key] = value
+    if not cfg.get("sub2api_url") or not cfg.get("sub2api_api_key"):
+        raise HTTPException(400, "请先在「自动导出」或空间「专属号池推送」中配置 Sub2API URL 和 API Key")
+
+    results.extend(exporter.push_many_to_sub2api(
         found_rows,
         cfg,
         on_tokens_refreshed=refresh_cb,
@@ -5950,6 +6406,10 @@ class AutoLoopStartReq(BaseModel):
     account_retry_count: int = Field(1, ge=0, le=10, description="每个账号失败后的额外重试次数")
     auto_export: bool = True  # 本次任务完成后是否自动推送到已启用的面板
     export_refresh_oauth: bool = False  # 推送前是否用 RT 刷新 Codex token
+    # 两段式 RT：第一段只批量注册（不取 RT）；整批收口后统一冷却
+    # rt_step_delay_minutes，再走登录链路逐个补 RT（含手机接码）。
+    rt_two_step: bool = False
+    rt_step_delay_minutes: float = Field(30.0, ge=0, le=10080)
     # 批量页已放开关且**默认开**（主人要求每个号都绑）。
     # 这里的 default 仍保持 False —— 它只在「前端没传这个字段」时生效，
     # 是给旧前端缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不要
@@ -6079,7 +6539,12 @@ async def api_auto_stream(request: Request):
 
 @app.get("/")
 def root():
-    return FileResponse(STATIC_DIR / "index.html")
+    # index.html 引用的是带内容 hash 的 bundle，入口本身必须每次回源校验；
+    # 否则浏览器启发式缓存住旧入口，新构建的 UI 在客户端永远加载不到。
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

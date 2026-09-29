@@ -122,6 +122,15 @@ const progressStatus = computed(() => (
     ? 'success'
     : undefined
 ))
+// 两段式补 RT：冷却队列倒计时文案（快照里的 rt_ready_at 是收口后统一起算点）
+const rtReadyText = computed(() => {
+  const ts = Number(taskStatus.value.rt_ready_at || 0)
+  if (!ts) return ''
+  const secs = Math.round(ts - Date.now() / 1000)
+  if (secs <= 0) return '已到点'
+  return secs >= 60 ? `约 ${Math.ceil(secs / 60)} 分钟后` : `${secs} 秒后`
+})
+
 const groups = ref([])
 
 // 高级选项、代理租借表默认折叠：多数任务不需要展开，
@@ -167,7 +176,9 @@ async function start() {
         otp_timeout: parseInt(form.value.otpTimeout, 10) || 10,
         want_access_token: true,
       want_session_token: true,
-      want_refresh_token: form.value.autoWantOauthRt,
+      want_refresh_token: form.value.autoRtTwoStep || form.value.autoWantOauthRt,
+      rt_two_step: form.value.autoRtTwoStep && !form.value.autoLoginOnly,
+      rt_step_delay_minutes: parseFloat(form.value.autoRtDelayMin) || 0,
       add_phone_mode: form.value.autoAddPhoneMode,
       register_mode: form.value.autoRegisterMode,
       debug_mode: form.value.autoDebugMode,
@@ -236,6 +247,16 @@ async function call(fn, name) {
                 : '开启后普通注册遇到服务端已存在的邮箱会切换为密码登录并补绑缺失的 2FA；新邮箱仍按正常注册执行。没有密码的已有账号会跳过并提示。' }}
             </FieldHint>
           </div>
+
+          <div v-if="!form.autoLoginOnly" class="switch-item">
+            <el-switch v-model="form.autoRtTwoStep" />
+            <span class="switch-label">两段式补 RT</span>
+            <FieldHint>
+              第一段只批量注册不取 RT（更不会触发手机接码）；整批收口后统一冷却设定时长，
+              再逐个自动登录补 RT——中途命中 add-phone 会自动接码。<b>注册失败的号不会进入第二段</b>；
+              两步都成功才计入成功。第一段注册成功的号已带 AT/2FA 入库，中途停止不废号。
+            </FieldHint>
+          </div>
         </div>
       </div>
 
@@ -257,6 +278,13 @@ async function call(fn, name) {
           <div class="num-item">
             <label class="num-label">冷却(秒)</label>
             <el-input-number v-model="form.autoCoolDown" :min="0" :max="120" controls-position="right" />
+          </div>
+          <div v-if="form.autoRtTwoStep && !form.autoLoginOnly" class="num-item">
+            <label class="num-label">
+              补RT冷却(分)
+              <FieldHint>第一段整批注册收口后，等待多少分钟再统一登录补 RT。0 = 立即补。</FieldHint>
+            </label>
+            <el-input-number v-model="form.autoRtDelayMin" :min="0" :max="10080" controls-position="right" />
           </div>
           <div class="num-item">
             <label class="num-label">OTP 等待(秒)</label>
@@ -293,10 +321,12 @@ async function call(fn, name) {
           </div>
 
           <div class="switch-item">
-            <el-switch v-model="form.autoWantOauthRt" />
+            <el-switch v-model="form.autoWantOauthRt" :disabled="form.autoRtTwoStep && !form.autoLoginOnly" />
             <span class="switch-label">获取 refresh_token</span>
             <FieldHint>
-              关闭后跳过最后的 Codex OAuth，可缩短每个任务耗时；access token 和 session token 不受影响。
+              {{ form.autoRtTwoStep && !form.autoLoginOnly
+                ? '两段式模式下必取 RT：第一段先跳过、第二段冷却后统一补取。'
+                : '关闭后跳过最后的 Codex OAuth，可缩短每个任务耗时；access token 和 session token 不受影响。' }}
             </FieldHint>
           </div>
 
@@ -435,6 +465,10 @@ async function call(fn, name) {
           <span v-if="taskStatus.retry_attempts">（{{ taskStatus.retry_attempts }} 次）</span>
         </el-descriptions-item>
         <el-descriptions-item label="并发">{{ taskStatus.concurrency || 1 }}</el-descriptions-item>
+        <el-descriptions-item v-if="taskStatus.rt_two_step" label="补RT冷却">
+          <b>{{ taskStatus.rt_pending || 0 }}</b>
+          <span v-if="rtReadyText" class="hint"> · {{ rtReadyText }}</span>
+        </el-descriptions-item>
       </el-descriptions>
 
       <div style="margin-top: 16px">
@@ -465,7 +499,7 @@ async function call(fn, name) {
 
       <div v-if="workers.length" style="margin-top: 12px">
         <el-tag v-for="w in workers" :key="w.id" type="warning" effect="plain" style="margin: 0 6px 6px 0">
-          worker-{{ w.id }} · {{ w.email }} · {{ w.proxy || '直连' }}
+          worker-{{ w.id }} · {{ w.email }}<template v-if="w.stage === 'rt'"> · 补RT</template> · {{ w.proxy || '直连' }}
         </el-tag>
       </div>
       <p v-if="taskStatus.last_message" class="hint" style="margin-top: 8px">{{ taskStatus.last_message }}</p>

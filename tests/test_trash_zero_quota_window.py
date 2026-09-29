@@ -101,17 +101,19 @@ class ZeroQuotaWindowSelectionTests(unittest.TestCase):
 
 
 class ZeroQuotaWindowNormalisationTests(unittest.TestCase):
-    def test_unknown_values_fall_back_to_any(self):
-        for value in ("", None, "hourly", "5h", 5, "ANY "):
+    def test_unknown_values_fall_back_to_weekly(self):
+        """空值/非法值回落到默认口径「仅看周限制」。"""
+        for value in ("", None, "hourly", "5h", 5):
             self.assertEqual(
                 app._normalize_trash_zero_quota_window(value),
-                "any",
+                "weekly",
                 msg=repr(value),
             )
 
     def test_supported_values_survive_case_and_padding(self):
         self.assertEqual(app._normalize_trash_zero_quota_window(" Five_Hour "), "five_hour")
         self.assertEqual(app._normalize_trash_zero_quota_window("WEEKLY"), "weekly")
+        self.assertEqual(app._normalize_trash_zero_quota_window("ANY "), "any")
 
 
 class ZeroQuotaWindowSettingTests(unittest.TestCase):
@@ -124,19 +126,27 @@ class ZeroQuotaWindowSettingTests(unittest.TestCase):
         )
         return path
 
-    def test_setting_defaults_to_any_and_round_trips(self):
+    def test_setting_defaults_to_weekly_and_round_trips(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "test.db"
             with patch.object(db, "DB_PATH", path):
                 self._workspace(tmp)
-                self.assertEqual(
-                    db.get_workspace_settings(1)["trash_zero_quota_window"], "any"
-                )
-                db.update_workspace_settings(1, {"trash_zero_quota_window": "weekly"})
+                # 新默认口径是「仅看周限制」。
                 self.assertEqual(
                     db.get_workspace_settings(1)["trash_zero_quota_window"], "weekly"
                 )
                 self.assertEqual(app._candidate_trash_zero_quota_window(1), "weekly")
+                # 额度为 0 后延迟入箱默认 1 分钟。
+                self.assertEqual(
+                    db.get_workspace_settings(1)["trash_zero_delay_minutes"], 1
+                )
+                self.assertEqual(app._candidate_trash_delay_seconds(1), 60)
+                # 显式回选 any 仍然生效，不被默认值吞掉。
+                db.update_workspace_settings(1, {"trash_zero_quota_window": "any"})
+                self.assertEqual(
+                    db.get_workspace_settings(1)["trash_zero_quota_window"], "any"
+                )
+                self.assertEqual(app._candidate_trash_zero_quota_window(1), "any")
 
     def test_stats_expose_the_configured_window(self):
         with tempfile.TemporaryDirectory() as tmp:

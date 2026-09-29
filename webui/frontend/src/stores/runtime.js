@@ -127,11 +127,14 @@ export const useRuntimeStore = defineStore('runtime', () => {
         try {
           const d = JSON.parse(e.data)
           const tag = d.ok
-            ? '[成功]'
+            ? (d.rt_cooling ? '[入冷却]' : '[成功]')
             : (d.retry_scheduled ? '[重试中]' : (d.category === 'network' ? '[网络错误，号已 release]' : '[最终失败]'))
           // run_finished 描述的是一次尝试；是否计入最终失败由后端的
           // retry_scheduled 字段决定，避免把中途失败误显示成账号失败。
-          const suffix = d.ok ? '完成' : (d.retry_scheduled ? '本次失败，已排队重试' : '最终结束')
+          // 两段式第一段成功不等于任务成功：标记为进入冷却，等补 RT。
+          const suffix = d.ok
+            ? (d.rt_cooling ? '第一段完成，冷却后补 RT' : '完成')
+            : (d.retry_scheduled ? '本次失败，已排队重试' : '最终结束')
           addLog(
             `[${d.task_label || 'auto'}] ${tag} ${d.email} ${suffix}`,
             d.ok ? 'ok' : (d.retry_scheduled ? 'warn' : 'err'),
