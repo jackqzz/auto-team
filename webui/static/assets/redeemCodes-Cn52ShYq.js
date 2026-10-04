@@ -1,1 +1,0 @@
-import{h as s}from"./index-YUjBNhM7.js";const t=(e,a,d=!1)=>s.post("/api/workspace-candidates/redeem-codes",{workspace_id:e,emails:a,allow_secret:d}),r=(e=0)=>s.get("/api/redeem-codes",{params:{workspace_id:e}}),p=e=>s.post("/api/redeem-codes/delete",{codes:e}),m=(e,a="sub2api")=>s.post("/api/redeem",{codes:Array.isArray(e)?e:[e],format:a});export{p as d,t as g,r as l,m as r};

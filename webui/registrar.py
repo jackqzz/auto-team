@@ -529,13 +529,21 @@ def _do_register(
             else:
                 raise
 
-        # 记录注册方式到结果表：camoufox 浏览器流程 / 协议流程。
-        d["register_mode"] = (
-            "camoufox"
-            if not login_only
-            and str(options.get("register_mode") or "").strip().lower() == "camoufox"
-            else "protocol"
+        # 注册方式是「这个号当初怎么注册出来的」既定事实，不是本轮 run 的模式。
+        # 只有本轮真的执行了新注册（非仅登录，且服务端没有识别成已有账号转而
+        # 走登录链）才落值 —— camoufox 注册的号之后再跑协议登录/补齐凭证，
+        # 绝不能把 register_mode 刷成 protocol；空值交给 save_registered 按
+        # 「不带值不清空」语义保留旧记录。
+        is_true_registration = (
+            not login_only
+            and not bool(getattr(flow, "_is_existing_account", False))
         )
+        if is_true_registration:
+            d["register_mode"] = (
+                "camoufox"
+                if str(options.get("register_mode") or "").strip().lower() == "camoufox"
+                else "protocol"
+            )
 
         # ─ 已有账号“补齐2FA” ─
         # 这条路径只补绑 TOTP：账号必须先有可用的 OpenAI 密码，登录时再
@@ -819,6 +827,26 @@ def _do_register(
         else:
             # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
             db.save_registered(d)
+        # ─ 注册追溯落库 ─
+        # 只记注册语义的 run：仅登录/两段式第二段不是注册事件，不碰追溯行。
+        # 已有账号补齐分支（existing_account_flow）本质是登录，register_event=False
+        # 只刷 last_success_at，不覆盖 IP/地区/方式这些注册时刻的事实。
+        if not login_only:
+            try:
+                db.record_register_success(
+                    str(d.get("email") or email),
+                    run_id=run_id,
+                    mode=str(d.get("register_mode") or "") if is_true_registration else "",
+                    ip=str(getattr(flow.result, "register_ip", "") or "") if is_true_registration else "",
+                    region=str(getattr(flow.result, "register_region", "") or "") if is_true_registration else "",
+                    timezone=str(d.get("register_timezone") or "") if is_true_registration else "",
+                    language=str(d.get("register_language") or "") if is_true_registration else "",
+                    register_event=is_true_registration,
+                )
+            except Exception as _trace_e:
+                logging.getLogger("registrar").warning(
+                    f"[register] 注册追溯写入失败 email={d.get('email')}: {_trace_e}"
+                )
         # 仅登录空间任务：登录本身就会让被邀请的成员自动接受邀请进空间，
         # 所以这里顺手按账号自己的空间列表把候选状态提升为"已加入"，
         # 用户不用再单独跑一次候选人校验。
@@ -931,6 +959,23 @@ def _do_register(
                 )
             else:
                 db.mark_failed(email, f"[{category}] {err}")
+        # 失败累计进注册追溯：仅登录失败不算注册失败。非池化邮箱源的真实
+        # 邮箱只有在 flow 跑起来后才出现在 result.email，优先用它，对不上
+        # 才退回望占位邮箱 —— runs 表的 email 列同理也只有创建时的值。
+        if not login_only:
+            try:
+                # flow 可能根本没建出来（异常发生在 AuthFlow 之前），
+                #  getattr 链会抛 NameError —— 与 DB 调用分开兜底。
+                _femail = (
+                    str(getattr(getattr(flow, "result", None), "email", "") or "").strip()
+                    or email
+                )
+            except Exception:
+                _femail = email
+            try:
+                db.record_register_failure(_femail, run_id, err, category)
+            except Exception:
+                pass
         db.finish_run(run_id, "failed", err, category=category)
         _emit_status(run_id, "error", {"message": err, "category": category})
 
@@ -1008,14 +1053,23 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
                     value = str(ws_settings.get(setting_key) or "").strip()
                     if value:
                         overrides[cfg_key] = value
+                # 推送账号优先级：空间可改，可为负数，缺省 0。
+                try:
+                    overrides["cpa_priority"] = int(
+                        ws_settings.get("auto_push_cpa_priority") or 0
+                    )
+                except (TypeError, ValueError):
+                    overrides["cpa_priority"] = 0
                 if overrides:
                     cfg["cpa"] = {**cfg.get("cpa", {}), **overrides}
                     if not cpa_enabled and overrides.get("cpa_url") and overrides.get("cpa_mgmt_key"):
                         cfg["cpa"]["enabled"] = True
-                    logging.getLogger("registrar").info(
-                        "[export] 使用空间专属 CPA 推送配置 keys=%s workspace_db_id=%s",
-                        sorted(overrides), workspace_db_id,
-                    )
+                    if overrides.get("cpa_url") or overrides.get("cpa_mgmt_key"):
+                        logging.getLogger("registrar").info(
+                            "[export] 使用空间专属 CPA 推送配置 keys=%s workspace_db_id=%s",
+                            sorted(k for k in overrides if k != "cpa_priority"),
+                            workspace_db_id,
+                        )
             else:
                 cpa_enabled = False
             sub2api_enabled = sub2api_enabled or bool(
@@ -1028,6 +1082,64 @@ def _try_export_to_panels(run_id: str, cred: dict, options: Optional[dict] = Non
             logging.getLogger("registrar").warning(
                 "[export] 读取空间推送配置失败，回退全局配置 workspace_db_id=%s err=%s",
                 workspace_db_id, e,
+            )
+    elif (options or {}).get("personal_space"):
+        # 个人空间（Free 账号池）的推送覆盖：与空间级同一套字段名，只是
+        # 配置落在全局单例 personal_space_settings 而不是某个母号下。
+        try:
+            ps_settings = db.get_personal_settings()
+            space_sub2api_on = bool(ps_settings.get("auto_push_sub2api_enabled", True))
+            space_cpa_on = bool(ps_settings.get("auto_push_cpa_enabled", True))
+            if space_sub2api_on:
+                overrides = {}
+                for setting_key, cfg_key in (
+                    ("auto_push_sub2api_url", "sub2api_url"),
+                    ("auto_push_sub2api_api_key", "sub2api_api_key"),
+                    ("auto_push_sub2api_group_ids", "sub2api_group_ids"),
+                ):
+                    value = str(ps_settings.get(setting_key) or "").strip()
+                    if value:
+                        overrides[cfg_key] = value
+                if overrides:
+                    cfg["sub2api"] = {**cfg.get("sub2api", {}), **overrides}
+                    if not sub2api_enabled and overrides.get("sub2api_url") and overrides.get("sub2api_api_key"):
+                        cfg["sub2api"]["enabled"] = True
+                    logging.getLogger("registrar").info(
+                        "[export] 使用个人空间专属 Sub2API 推送配置 keys=%s",
+                        sorted(overrides),
+                    )
+            else:
+                sub2api_enabled = False
+            if space_cpa_on:
+                overrides = {}
+                for setting_key, cfg_key in (
+                    ("auto_push_cpa_url", "cpa_url"),
+                    ("auto_push_cpa_mgmt_key", "cpa_mgmt_key"),
+                ):
+                    value = str(ps_settings.get(setting_key) or "").strip()
+                    if value:
+                        overrides[cfg_key] = value
+                try:
+                    overrides["cpa_priority"] = int(
+                        ps_settings.get("auto_push_cpa_priority") or 0
+                    )
+                except (TypeError, ValueError):
+                    overrides["cpa_priority"] = 0
+                if overrides:
+                    cfg["cpa"] = {**cfg.get("cpa", {}), **overrides}
+                    if not cpa_enabled and overrides.get("cpa_url") and overrides.get("cpa_mgmt_key"):
+                        cfg["cpa"]["enabled"] = True
+            else:
+                cpa_enabled = False
+            sub2api_enabled = sub2api_enabled or bool(
+                space_sub2api_on and cfg.get("sub2api", {}).get("enabled")
+            )
+            cpa_enabled = cpa_enabled or bool(
+                space_cpa_on and cfg.get("cpa", {}).get("enabled")
+            )
+        except Exception as e:
+            logging.getLogger("registrar").warning(
+                "[export] 读取个人空间推送配置失败，回退全局配置 err=%s", e,
             )
 
     if not (cpa_enabled or sub2api_enabled):

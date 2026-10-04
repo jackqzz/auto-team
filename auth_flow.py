@@ -468,6 +468,10 @@ class AuthResult:
         # 协议注册不走浏览器，这两个字段留空。
         self.register_timezone: str = ""
         self.register_language: str = ""
+        # 出口 IP/地区（国家码）：协议流由 check_proxy() 探测填充；
+        # Camoufox 流在 geoip 指纹捕获时用同代理会话探测。注册追溯落库用。
+        self.register_ip: str = ""
+        self.register_region: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -486,6 +490,8 @@ class AuthResult:
             "totp_secret": self.totp_secret,
             "register_timezone": self.register_timezone,
             "register_language": self.register_language,
+            "register_ip": self.register_ip,
+            "register_region": self.register_region,
         }
 
 
@@ -3702,6 +3708,12 @@ class AuthFlow:
                 country_code = loc.group(1) if loc else ""
                 logger.info(f"网络正常 - IP: {ip.group(1) if ip else 'N/A'}, "
                             f"地区: {country_code or 'N/A'}")
+                # 记录当前出口 IP/国家码到结果：中途切代理后 re-check 会覆盖，
+                # 最终保留的是实际跑完注册链路的那个出口。
+                if ip:
+                    self.result.register_ip = ip.group(1).strip()
+                if country_code:
+                    self.result.register_region = country_code
 
                 # IP 地理联动：检测到国家码后，重新生成指纹（带时区/语言联动）
                 if country_code and country_code != self._country_code:
@@ -5770,6 +5782,26 @@ class AuthFlow:
                 self.result.register_timezone = tz
             if lang:
                 self.result.register_language = lang
+            # 追溯还需要真实出口 IP/地区：self.session 与浏览器共用
+            # config.proxy（_camoufox_proxy_config 只改协议不改出口），
+            # 用协议会话探一次 cdn-cgi/trace 即可代表浏览器出口。
+            # 探测失败不阻断注册，留空即可。
+            try:
+                _tr = self.session.get(
+                    "https://cloudflare.com/cdn-cgi/trace", timeout=10
+                )
+                if getattr(_tr, "status_code", None) == 200:
+                    _ip_m = re.search(r"ip=([^\n]+)", _tr.text or "")
+                    _loc_m = re.search(r"loc=(\w+)", _tr.text or "")
+                    if _ip_m:
+                        self.result.register_ip = _ip_m.group(1).strip()
+                    if _loc_m:
+                        self.result.register_region = _loc_m.group(1).strip()
+            except Exception as exc:
+                logger.info(
+                    "[camoufox] 出口 IP 探测失败 attempt=%s: %s",
+                    attempt, str(exc)[:160],
+                )
             try:
                 # getTimezoneOffset 返回「本地时间 + 多少分钟 = UTC」，
                 # 正值表示落后于 UTC（如美东 240 → UTC-4）。

@@ -85,6 +85,41 @@ class WorkspaceQuotaLeaseTests(unittest.TestCase):
         self.assertEqual(saved["prolite_seat_protect_threshold"], 3)
         self.assertEqual(saved["prolite_seat_protect_refresh_time"], "04:30")
 
+    def test_workspace_settings_persist_export_mode_flags(self):
+        # 「明文凭证导出」「CPA 按模版」是按空间持久化的勾选：保存接口
+        # 必须把两个 key 写进对应空间的 settings，而不是全局共享。
+        request = app.WorkspaceQuotaScheduleReq(
+            workspace_id=5,
+            export_plain_credentials=True,
+            cpa_use_template=True,
+        )
+        with (
+            patch.object(app.db, "get_workspace_settings", return_value={}),
+            patch.object(app.db, "update_workspace_settings") as update_settings,
+        ):
+            app.api_save_workspace_candidate_settings(request)
+
+        saved = update_settings.call_args.args[1]
+        self.assertTrue(saved["export_plain_credentials"])
+        self.assertTrue(saved["cpa_use_template"])
+
+    def test_workspace_settings_leave_export_flags_untouched_when_unsent(self):
+        # 未携带两个 key 的旧客户端不能覆盖空间里已存的勾选值。
+        request = app.WorkspaceQuotaScheduleReq(workspace_id=5, interval_minutes=10)
+        with (
+            patch.object(
+                app.db,
+                "get_workspace_settings",
+                return_value={"export_plain_credentials": True, "cpa_use_template": True},
+            ),
+            patch.object(app.db, "update_workspace_settings") as update_settings,
+        ):
+            app.api_save_workspace_candidate_settings(request)
+
+        saved = update_settings.call_args.args[1]
+        self.assertTrue(saved["export_plain_credentials"])
+        self.assertTrue(saved["cpa_use_template"])
+
     def test_one_quota_batch_leases_the_least_used_proxy(self):
         leases = app._candidate_quota_proxy_pool("proxy-one\nproxy-two")
 

@@ -287,5 +287,70 @@ class AutoResetScheduledWorkerTests(unittest.TestCase):
         schedule.assert_not_called()
 
 
+class AutoResetManualQuotaTests(unittest.TestCase):
+    """手动「查询额度」路径：耗尽时同样先兑券自救，恢复了就不排队入箱。"""
+
+    def _run(self, refreshed, *, quota=None):
+        req = app.WorkspaceCandidatesReq(
+            workspace_id=5,
+            emails=["one@example.com"],
+            proxy_pool="proxy-one",
+        )
+        rows = [{
+            "email": "one@example.com",
+            "has_workspace_access_token": True,
+            "account_status": "active",
+            "seat_type": "default",
+            "workspace_join_status": "joined",
+        }]
+        settings = {
+            "proxy_pool": "proxy-one",
+            "trash_enabled": True,
+            "quota_auto_reset_enabled": True,
+        }
+        with (
+            patch.object(app, "_reject_trashed_candidates"),
+            patch.object(app.db, "get_workspace_settings", return_value=settings),
+            patch.object(app.db, "list_workspace_candidate_options", return_value=rows),
+            patch.object(app.db, "list_registered_invalid_emails", return_value=set()),
+            patch.object(app.db, "get_workspace_candidate", return_value={"trash_due_at": 0}),
+            patch.object(app.workspace_membership, "fetch_candidate_quota",
+                         return_value=quota if quota is not None else _exhausted_with_credit()),
+            patch.object(app.proxy_usage, "record_lease"),
+            patch.object(app, "_try_candidate_quota_auto_reset", return_value=refreshed) as attempt,
+            patch.object(app, "_schedule_candidate_trash", return_value=True) as schedule,
+            patch.object(app, "_clear_candidate_trash_timer") as clear_timer,
+        ):
+            result = app.api_workspace_candidate_quota(req)
+        return result, attempt, schedule, clear_timer
+
+    def test_recovered_quota_marks_result_and_skips_the_trash_queue(self):
+        result, attempt, schedule, clear_timer = self._run(_payload(used=0))
+        item = result["results"]["one@example.com"]
+        attempt.assert_called_once()
+        self.assertEqual(attempt.call_args.kwargs["source"], "quota_manual")
+        self.assertTrue(item["auto_reset"])
+        self.assertEqual(item["quota"]["primary"]["used_percent"], 0)
+        schedule.assert_not_called()
+        clear_timer.assert_called_once()
+
+    def test_failed_reset_still_queues_the_trash(self):
+        result, attempt, schedule, clear_timer = self._run(None)
+        item = result["results"]["one@example.com"]
+        attempt.assert_called_once()
+        self.assertNotIn("auto_reset", item)
+        self.assertTrue(item["trash_scheduled"])
+        schedule.assert_called_once()
+        clear_timer.assert_not_called()
+
+    def test_healthy_quota_never_attempts_a_reset(self):
+        result, attempt, schedule, clear_timer = self._run(None, quota=_payload(used=10))
+        item = result["results"]["one@example.com"]
+        attempt.assert_not_called()
+        self.assertNotIn("auto_reset", item)
+        schedule.assert_not_called()
+        clear_timer.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

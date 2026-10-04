@@ -90,6 +90,12 @@ const routes = [
     meta: { title: '垃圾箱', icon: 'Delete', group: '空间', trash: true, hideInMenu: true },
   },
   {
+    path: '/personal-space',
+    name: 'personal-space',
+    component: () => import('@/views/PersonalSpace.vue'),
+    meta: { title: '个人空间', icon: 'UserFilled', group: '空间' },
+  },
+  {
     path: '/redeem-codes',
     name: 'redeem-codes',
     component: () => import('@/views/RedeemCodes.vue'),

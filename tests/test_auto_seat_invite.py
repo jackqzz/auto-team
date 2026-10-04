@@ -387,6 +387,7 @@ class StandardWorkerInviteModeTests(unittest.TestCase):
             ),
             patch.object(app, "_invite_candidates_to_seat", side_effect=invite),
             patch.object(app, "_workspace_pending_invite_rows", return_value=[]),
+            patch.object(app, "_workspace_members_missing_credentials", return_value=[]),
             patch.object(
                 app,
                 "_enqueue_workspace_credentials",
@@ -493,6 +494,7 @@ class StandardWorkerInviteModeTests(unittest.TestCase):
                 or {"ok": False, "invited": [], "error": "boom"},
             ),
             patch.object(app, "_workspace_pending_invite_rows", return_value=[]),
+            patch.object(app, "_workspace_members_missing_credentials", return_value=[]),
             patch.object(
                 app,
                 "_enqueue_workspace_credentials",
@@ -543,6 +545,7 @@ class StandardWorkerInviteModeTests(unittest.TestCase):
                 or {"ok": False, "invited": [], "blocked_by_protect": True},
             ),
             patch.object(app, "_workspace_pending_invite_rows", return_value=[]),
+            patch.object(app, "_workspace_members_missing_credentials", return_value=[]),
             patch.object(app, "_enqueue_workspace_credentials") as enqueue,
         ):
             app._auto_standard_seat_worker(1, stop)
@@ -658,6 +661,7 @@ class StandardWorkerMixedModeTests(unittest.TestCase):
                 or {"ok": True, "invited": [c["email"] for c in cs], "skipped": []},
             ),
             patch.object(app, "_workspace_pending_invite_rows", return_value=[]),
+            patch.object(app, "_workspace_members_missing_credentials", return_value=[]),
             patch.object(
                 app,
                 "_enqueue_workspace_credentials",
@@ -713,6 +717,7 @@ class ProliteWorkerInviteModeTests(unittest.TestCase):
                 or {"ok": True, "invited": [c["email"] for c in cs], "skipped": []},
             ),
             patch.object(app, "_workspace_pending_invite_rows", return_value=[]),
+            patch.object(app, "_workspace_members_missing_credentials", return_value=[]),
             patch.object(
                 app,
                 "_enqueue_workspace_credentials",

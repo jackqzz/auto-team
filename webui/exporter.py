@@ -368,6 +368,14 @@ def _build_compat_id_token(*, access_token: str, email: str) -> str:
     return f"{_b64url_json(header)}.{_b64url_json(compat_payload)}.{signature}"
 
 
+def cpa_push_priority(value) -> int:
+    """推送 CPA 的账号优先级：可为负数；配置缺失/非法时回退默认 0。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_cpa_token_json(cred: dict) -> dict:
     """生成 CPA `/v0/management/auth-files` 的 multipart 文件内容。
 
@@ -485,6 +493,8 @@ def export_to_cpa(cred: dict, cfg: dict, *,
     credential_proxy = str(cfg.get("credential_proxy_url") or "").strip()
     if credential_proxy:
         token_data["proxy_url"] = credential_proxy
+    # 账号优先级：空间专属推送配置可改，缺省按 0 推（取代模板默认的 1）。
+    token_data["priority"] = cpa_push_priority(cfg.get("cpa_priority"))
     email = token_data.get("email") or "unknown"
     filename = f"{email}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")

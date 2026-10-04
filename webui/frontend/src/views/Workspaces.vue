@@ -513,6 +513,20 @@ onActivated(() => load())
                   <Icon icon="lucide:edit-3" />
                 </button>
               </div>
+
+              <div class="proxy-line">
+                <Icon
+                  :icon="row.has_device_fingerprint ? 'lucide:fingerprint' : 'lucide:alert-triangle'"
+                  class="proxy-icon"
+                  :style="row.has_device_fingerprint ? '' : 'color: var(--el-color-warning)'"
+                />
+                <span
+                  class="proxy-val"
+                  :style="row.has_device_fingerprint ? '' : 'color: var(--el-color-warning)'"
+                >
+                  {{ row.has_device_fingerprint ? '设备指纹已录制' : '缺设备指纹（可能 401，请用含 statsigContext 的 session 重导）' }}
+                </span>
+              </div>
             </div>
           </template>
         </el-table-column>
@@ -636,7 +650,8 @@ onActivated(() => load())
       </el-form>
 
       <div class="dialog-footer-hint">
-        共用代理将作为默认值应用；每行第三段或 JSON 中的 proxy 可单独覆盖。导入重复母号将自动更新 Session 和代理。
+        共用代理将作为默认值应用；每行第三段或 JSON 中的 proxy 可单独覆盖。导入重复母号将自动更新 Session 和代理。<br>
+        上游已将会话绑定登录时的设备指纹：请优先粘贴含 <code>statsigContext</code>（deviceId/userAgent）的完整 session JSON，否则指纹不匹配会持续 401。
       </div>
 
       <template #footer>

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from "vue";
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { Icon } from "@iconify/vue";
 import { useRoute, useRouter } from "vue-router";
@@ -41,11 +41,12 @@ import {
   deleteCandidatesEverywhere,
   trashCandidates,
   kickCandidates,
+  leaveCandidates,
   restoreCandidatesFromTrash,
+  setCandidateTrashWhitelist,
   emptyWorkspaceTrash,
   listCandidateTags,
   setCandidateTags,
-  listResetCredits,
   consumeResetCredit,
 } from "@/api/workspaceCandidates";
 import { PAGE_SIZE_OPTIONS, SELECT_ALL_FETCH_LIMIT } from "@/utils/pagination";
@@ -56,7 +57,7 @@ const options = ref([]);
 const selected = ref([]);
 const candidateTableRef = ref(null);
 const loading = ref(false);
-const seatType = ref("default");
+const seatType = ref("prolite");
 const { list: proxyList } = storeToRefs(useProxyStore());
 const route = useRoute();
 const router = useRouter();
@@ -89,6 +90,11 @@ const taskLogAutoRefresh = ref(true);
 const taskLogBoxRef = ref(null);
 let taskLogTimer = null;
 
+// 列表自动刷新：后台调度器（额度/席位/垃圾回收）会持续改行数据，页面停留期间按周期静默重拉。
+const listAutoRefresh = ref(true);
+const LIST_REFRESH_INTERVAL_MS = 15000;
+let listRefreshTimer = null;
+
 const automationPaused = ref(false);
 const quotaRunning = ref(false);
 const quotaInterval = ref(30);
@@ -101,6 +107,13 @@ const autoPushSub2apiApiKey = ref("");
 const autoPushSub2apiGroupIds = ref("");
 const autoPushCpaUrl = ref("");
 const autoPushCpaMgmtKey = ref("");
+const autoPushCpaPriority = ref(0);
+// el-input-number 在输入/清空过程会短暂给出 null/undefined/NaN；
+// 归一化后再发，避免瞬态值被后端校验拒绝。可为负数，非法值回 0。
+function cpaPriorityWire() {
+  const n = Number(autoPushCpaPriority.value);
+  return Number.isFinite(n) ? Math.round(n) : 0;
+}
 const cpaStaticProxyEnabled = ref(false);
 const cpaStaticProxyPool = ref("");
 const autoPushSkipCodexSeat = ref(true);
@@ -161,6 +174,7 @@ const trashAction = ref("seat");
 const trashZeroDelayMinutes = ref(1);
 const trashZeroQuotaWindow = ref("weekly");
 const trashGapSeconds = ref(30);
+const trashCleanupCpaOnManual = ref(false);
 
 const seatProtectEnabled = ref(false);
 const seatProtectThreshold = ref(8);
@@ -181,6 +195,8 @@ const autoSeatSwitchGapSeconds = ref(30);
 const autoProliteCandidateSeatType = ref("default");
 const autoStandardSeatSource = ref("switch");
 const autoProliteSeatSource = ref("switch");
+const autoStandardSeatCandidateOrder = ref("default");
+const autoProliteSeatCandidateOrder = ref("default");
 const autoStandardSeatTarget = ref(0);
 const autoProliteSeatTarget = ref(0);
 
@@ -241,7 +257,7 @@ const candidateStats = ref({
 
 const operationStatus = ref({});
 const quotaTaskRunning = ref(false);
-const quotaProgress = ref({ done: 0, total: 0, active: 0, succeeded: 0, failed: 0, relogged: 0 });
+const quotaProgress = ref({ done: 0, total: 0, active: 0, succeeded: 0, failed: 0, relogged: 0, autoReset: 0 });
 
 const page = ref(1);
 const pageSize = ref(100);
@@ -330,7 +346,6 @@ const candidateMembershipBusy = computed(
 
 let settingsLoadGeneration = 0;
 let settingsSaveTimer = null;
-let credentialModeLoaded = false;
 
 function setOperation(emails, text) {
   const next = { ...operationStatus.value };
@@ -409,6 +424,11 @@ function seatLabel(value) {
   if (v === "usage_based" || v === "usagebased" || v === "codex席位") return "Codex席位";
   if (["prolite", "pro_lite", "advanced", "advanced_seat", "premium", "premium_seat", "pro", "高级", "高级席位"].includes(v)) return "高级席位（ProLite）";
   return "—";
+}
+
+function fmtDate(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleDateString("zh-CN", { hour12: false });
 }
 
 function seatTypeTagType(value) {
@@ -623,15 +643,11 @@ function resetCreditsHint(info) {
   return `名下有 ${available} 张重置券，其中 ${applicable} 张可用于当前的额度耗尽状态。点击可查看并手动兑换。`;
 }
 
-// 手动兑换重置券的行内入口。券是不可逆消耗品（上游 2xx 即扣券），所以流程被
-// 刻意拆成两步：先只读拉取券列表，把 id / 有效期摆给用户看，确认后才 POST。
+// 手动兑换重置券的行内入口。券是不可逆消耗品（上游 2xx 即扣券），但 consume
+// 端点自身就会先列券再取第一张可用的，所以不再"先查一遍再弹确认"：额度未
+// 耗尽的账号直接弹确认框；剩余 0%（确实耗尽）时连确认都省掉，点下去即兑。
 const resetCreditBusyEmail = ref("");
-
-function resetCreditDate(value) {
-  if (!value) return "未知";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
-}
+const resetCreditBatchRunning = ref(false);
 
 // CPA 家宽代理单元格只显示 host:port，账号密码等敏感部分留在 tooltip 完整串里。
 function cpaProxyLabel(proxy) {
@@ -641,78 +657,178 @@ function cpaProxyLabel(proxy) {
   return m ? m[1] : s;
 }
 
+// 单个账号的兑换执行，行内点击与批量队列共用。返回结果对象便于批量统计；
+// quota_error 单独上报——券已经扣掉了，把它算成失败只会诱导用户再烧一张。
+async function consumeOneResetCredit(ws, email, proxyPool, busyText = "兑换重置券中…") {
+  resetCreditBusyEmail.value = email;
+  setOneOperation(email, busyText);
+  try {
+    const result = await consumeResetCredit(ws, email, "", proxyPool);
+    return {
+      ok: true,
+      quotaError: result?.quota_error || "",
+      windows: result?.consumed?.windows_reset,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  } finally {
+    setOneOperation(email, "");
+    resetCreditBusyEmail.value = "";
+  }
+}
+
 async function openResetCredit(row) {
   const email = String(row?.email || "").trim();
   if (!email) return;
   const ws = workspaceId.value;
   if (!ws) return ElMessage.warning("请选择母号空间");
-  if (resetCreditBusyEmail.value) return ElMessage.warning("重置券操作正在进行中");
-  // 兑换不可撤销：查询→确认→兑换期间用户可能切换空间，空间和代理池必须在入口快照。
+  if (resetCreditBusyEmail.value || resetCreditBatchRunning.value) {
+    return ElMessage.warning("重置券操作正在进行中");
+  }
+  // 兑换不可撤销：确认→兑换期间用户可能切换空间，空间和代理池必须在入口快照。
   const proxyPool = quotaProxyPool.value;
+  const info = parseQuotaInfo(row);
 
-  resetCreditBusyEmail.value = email;
-  try {
-    let listing;
-    try {
-      listing = await listResetCredits(ws, email, proxyPool);
-    } catch (e) {
-      return ElMessage.error("重置券查询失败: " + (e.message || e));
-    }
-    const usable = (listing?.credits || []).filter((c) => c?.status === "available");
-    if (!usable.length) {
-      return ElMessage.warning(`${email} 名下没有可兑换的重置券`);
-    }
-    const target = usable[0];
+  // 剩余 0% = 额度确实耗尽，券几乎必然适用，直接兑换不再弹确认。
+  if (quotaRemainingPercent(row) !== 0) {
+    const reset = info?.resetCredits;
     // 上游只重置速率窗口，救不了「空间额度耗尽」这一类，兑了也是白烧。
-    const info = parseQuotaInfo(row);
     const wastedWarning = info?.reachedType
       ? `\n\n注意：该账号当前的耗尽原因是「${info.reachedType}」，重置券只恢复速率窗口，很可能无法解决，兑换后券直接作废。`
-      : (info?.resetCredits?.applicable === 0
+      : (reset?.applicable === 0
         ? "\n\n注意：上游标记这张券当前「不适用」（额度尚未真正耗尽），现在兑换会浪费掉。"
         : "");
+    const availableText = reset
+      ? `\n\n名下可用：${reset.available ?? 0} 张（其中 ${reset.applicable ?? 0} 张适用于当前额度状态）`
+      : "";
     try {
       await ElMessageBox.confirm(
-        `即将为 ${email} 兑换 1 张额度重置券。\n\n` +
-          `券 ID：${target.id}\n` +
-          `类型：${target.reset_type || "未知"}\n` +
-          `有效期至：${resetCreditDate(target.expires_at)}\n` +
-          `名下可用：${usable.length} 张\n\n` +
-          `兑换不可撤销：上游一旦返回成功，这张券就消耗掉了，即使只重置了部分窗口。` +
+        `即将为 ${email} 兑换 1 张额度重置券。` +
+          availableText +
+          `\n\n兑换不可撤销：上游一旦返回成功，这张券就消耗掉了，即使只重置了部分窗口。` +
           wastedWarning,
         "兑换额度重置券",
         {
           type: "warning",
           confirmButtonText: "确认兑换（不可撤销）",
           cancelButtonText: "取消",
-          // 消耗类操作的文案里有换行和 ID，必须原样显示。
+          // 消耗类操作的文案里有换行，必须原样显示。
           customClass: "reset-credit-confirm",
         }
       );
     } catch (_) {
       return;
     }
+  }
 
-    setOneOperation(email, "兑换重置券中…");
-    try {
-      const result = await consumeResetCredit(ws, email, target.id, proxyPool);
-      await load();
-      if (result?.quota_error) {
-        // 券已经扣掉了，这里绝不能报成失败，否则用户会再点一次再烧一张。
-        ElMessage.warning(`重置券已兑换，但额度重查失败：${result.quota_error}`);
-      } else {
-        const windows = result?.consumed?.windows_reset;
-        ElMessage.success(
-          `重置券已兑换${windows ? `（windows_reset=${windows}）` : ""}，额度已刷新`
-        );
+  const outcome = await consumeOneResetCredit(ws, email, proxyPool);
+  await load();
+  if (!outcome.ok) {
+    ElMessage.error("重置券兑换失败: " + outcome.error);
+  } else if (outcome.quotaError) {
+    // 券已经扣掉了，这里绝不能报成失败，否则用户会再点一次再烧一张。
+    ElMessage.warning(`重置券已兑换，但额度重查失败：${outcome.quotaError}`);
+  } else {
+    ElMessage.success(
+      `重置券已兑换${outcome.windows ? `（windows_reset=${outcome.windows}）` : ""}，额度已刷新`
+    );
+  }
+}
+
+// 批量兑换：前端串行队列（与批量踢出同一节奏），一次烧一张、逐账号报状态。
+// 本地已知没券或不满足额度操作条件的直接跳过不发请求；其余交给后端 consume
+// 判定——它自己先列券再兑，失败逐账号汇总。
+async function batchResetCredits() {
+  const ws = workspaceId.value;
+  if (!ws) return ElMessage.warning("请选择母号空间");
+  if (resetCreditBusyEmail.value || resetCreditBatchRunning.value) {
+    return ElMessage.warning("重置券操作正在进行中");
+  }
+  const rows = selected.value;
+  if (!rows.length) return ElMessage.warning("请选择候选人");
+
+  const targets = [];
+  const skipCounts = new Map();
+  let notApplicable = 0;
+  let reachedWarn = 0;
+  for (const row of rows) {
+    const email = String(row?.email || "").trim();
+    const info = parseQuotaInfo(row);
+    const reset = info?.resetCredits;
+    // 后端 _reset_credit_target 会用同一套准入判定再挡一次，本地先跳过
+    // 省掉注定失败的请求。resetCredits 为 null 是"还没查过额度"，交后端判。
+    let reason = quotaIneligibleReason(row);
+    if (!reason && reset && !(reset.available > 0)) reason = "名下没有可用重置券";
+    if (!reason && !email) reason = "缺少邮箱";
+    if (reason) {
+      skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+      continue;
+    }
+    targets.push(row);
+    if (reset?.applicable === 0) notApplicable += 1;
+    if (info?.reachedType) reachedWarn += 1;
+  }
+  const skipped = rows.length - targets.length;
+  const skipText = [...skipCounts.entries()].map(([r, c]) => `${r} ${c} 个`).join("；");
+  if (!targets.length) {
+    return ElMessage.warning(`所选账号均不可兑换重置券${skipText ? `：${skipText}` : ""}`);
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `将为 ${targets.length} 个账号各兑换 1 张额度重置券（逐账号串行执行）。\n\n` +
+        `兑换不可撤销：上游一旦返回成功，这张券就消耗掉了，即使只重置了部分窗口。` +
+        (skipped ? `\n\n另有 ${skipped} 个所选账号被跳过（${skipText}）。` : "") +
+        (notApplicable ? `\n\n注意：其中 ${notApplicable} 个账号的券被上游标记为「当前不适用」（额度未真正耗尽），兑换会白烧。` : "") +
+        (reachedWarn ? `\n\n注意：其中 ${reachedWarn} 个账号的耗尽原因是空间级问题，重置券只恢复速率窗口，很可能无法解决。` : ""),
+      "批量兑换额度重置券",
+      {
+        type: "warning",
+        confirmButtonText: "确认批量兑换（不可撤销）",
+        cancelButtonText: "取消",
+        customClass: "reset-credit-confirm",
       }
-    } catch (e) {
-      ElMessage.error("重置券兑换失败: " + (e.message || e));
-    } finally {
-      setOneOperation(email, "");
+    );
+  } catch (_) {
+    return;
+  }
+
+  // 快照发起时的空间和代理池：串行队列跨多次请求，期间切空间不能把
+  // 剩余账号打到新空间上。
+  const proxyPool = quotaProxyPool.value;
+  const emails = targets.map((row) => String(row.email || "").trim());
+  resetCreditBatchRunning.value = true;
+  setOperation(emails, "排队中");
+  let succeeded = 0;
+  let quotaErrorCount = 0;
+  const failedEmails = [];
+  try {
+    for (let i = 0; i < emails.length; i += 1) {
+      const email = emails[i];
+      const outcome = await consumeOneResetCredit(
+        ws, email, proxyPool, `兑换重置券中 ${i + 1}/${emails.length}`
+      );
+      if (outcome.ok) {
+        succeeded += 1;
+        if (outcome.quotaError) quotaErrorCount += 1;
+      } else {
+        failedEmails.push(email);
+        setOneOperation(email, outcome.error || "兑换失败");
+      }
     }
   } finally {
-    resetCreditBusyEmail.value = "";
+    resetCreditBatchRunning.value = false;
   }
+  const failed = failedEmails.length;
+  const detail = failed && failed <= 5 ? `：${failedEmails.join("、")}` : "";
+  ElMessage[failed ? "warning" : "success"](
+    `重置券兑换完成：成功 ${succeeded}/${emails.length}` +
+      (quotaErrorCount ? `（其中 ${quotaErrorCount} 个额度重查失败）` : "") +
+      (failed ? `，失败 ${failed}${detail}` : "") +
+      (skipped ? `，跳过 ${skipped}` : "")
+  );
+  clearOperation(emails);
+  await load();
 }
 
 function quotaRemainingPercent(row) {
@@ -749,6 +865,18 @@ function isQuota401Row(row) {
 
 function nextQuotaText() {
   return nextQuotaAt.value ? `下次额度刷新时间：${new Date(nextQuotaAt.value * 1000).toLocaleString()}` : "";
+}
+
+// 席位补齐两个调度器共用一个轮询周期但各自记 next_at，汇总一行展示。
+function nextSeatPollText() {
+  const parts = [];
+  if (autoStandardSeatEnabled.value && autoStandardSeatNextAt.value) {
+    parts.push(`标准席位 ${new Date(autoStandardSeatNextAt.value * 1000).toLocaleString()}`);
+  }
+  if (autoProliteSeatEnabled.value && autoProliteSeatNextAt.value) {
+    parts.push(`高级席位 ${new Date(autoProliteSeatNextAt.value * 1000).toLocaleString()}`);
+  }
+  return parts.length ? `下次补齐检查：${parts.join(" · ")}` : "";
 }
 
 function taskLogTime(ts) {
@@ -840,9 +968,10 @@ async function loadStats() {
   }
 }
 
-async function load() {
+async function load({ silent = false } = {}) {
   if (!workspaceId.value) return;
-  loading.value = true;
+  // 静默刷新不翻 loading 也不弹错误，避免轮询时表格闪烁和周期性报错骚扰。
+  if (!silent) loading.value = true;
   try {
     const a = await listCandidateOptions(workspaceId.value, {
       limit: pageSize.value,
@@ -867,10 +996,35 @@ async function load() {
       loadStats();
     }
   } catch (e) {
-    ElMessage.error(e.message);
+    if (!silent) ElMessage.error(e.message);
   } finally {
-    loading.value = false;
+    if (!silent) loading.value = false;
   }
+}
+
+function stopListRefreshPolling() {
+  if (listRefreshTimer) {
+    clearInterval(listRefreshTimer);
+    listRefreshTimer = null;
+  }
+}
+
+function startListRefreshPolling() {
+  stopListRefreshPolling();
+  listRefreshTimer = setInterval(() => {
+    if (!workspaceId.value || !listAutoRefresh.value) return;
+    // 标签页不可见时跳过；用户手动筛选/翻页触发的加载进行中时也让位，下一拍再刷。
+    if (document.visibilityState !== "visible" || loading.value) return;
+    load({ silent: true });
+    loadSpaces();
+  }, LIST_REFRESH_INTERVAL_MS);
+}
+
+// 浏览器切回本标签页时立刻补一次，不必等下一个轮询周期。
+function onVisibilityRefresh() {
+  if (document.visibilityState !== "visible" || !workspaceId.value || !listAutoRefresh.value) return;
+  load({ silent: true });
+  loadSpaces();
 }
 
 async function loadCandidateGroups() {
@@ -1055,7 +1209,10 @@ async function restoreFromTrash() {
   try {
     const r = await restoreCandidatesFromTrash(workspaceId.value, emails);
     const skipped = Number(r.skipped || 0);
-    ElMessage[skipped ? "warning" : "success"](`已移出垃圾箱 ${r.restored || 0} 个${skipped ? `，跳过 ${skipped}` : ""}`);
+    const restored = Number(r.restored || 0);
+    ElMessage[skipped ? "warning" : "success"](
+      `已移出垃圾箱 ${restored} 个${restored ? "（已自动加入垃圾箱白名单）" : ""}${skipped ? `，跳过 ${skipped}` : ""}`
+    );
     clearSelection();
     await load();
   } catch (e) {
@@ -1063,6 +1220,49 @@ async function restoreFromTrash() {
   } finally {
     clearOperation(emails);
   }
+}
+
+// 垃圾箱白名单：行内开关只发单行请求；批量走同一个后端接口。
+// 白名单只拦自动回收（排期/到期/失效回收），手动入箱和踢出不受约束。
+const whitelistBusy = reactive(new Set());
+
+async function setTrashWhitelist(emails, enabled) {
+  if (!workspaceId.value || !emails.length) return;
+  try {
+    const r = await setCandidateTrashWhitelist(workspaceId.value, emails, enabled);
+    const changed = Number(r.changed || 0);
+    ElMessage.success(`${enabled ? "已加入" : "已移出"}垃圾箱白名单 ${changed} 个${emails.length - changed ? `（跳过 ${emails.length - changed}）` : ""}`);
+    await load();
+  } catch (e) {
+    ElMessage.error("白名单设置失败: " + e.message);
+  }
+}
+
+async function setRowTrashWhitelist(row, enabled) {
+  if (!row?.email || whitelistBusy.has(row.email)) return;
+  whitelistBusy.add(row.email);
+  try {
+    await setCandidateTrashWhitelist(workspaceId.value, [row.email], enabled);
+    row.trash_whitelist = enabled ? 1 : 0;
+    // 开白名单会顺带撤掉挂起的入箱排期，本地状态同步一下免得等整表刷新。
+    if (enabled && row.trash_status === "scheduled") {
+      row.trash_status = "active";
+      row.trash_due_at = 0;
+      if (row.display_status === "trash_scheduled") {
+        row.display_status = row.has_workspace_access_token ? "workspace_credential" : (row.workspace_join_status || "not_invited");
+      }
+    }
+  } catch (e) {
+    ElMessage.error("白名单设置失败: " + e.message);
+  } finally {
+    whitelistBusy.delete(row.email);
+  }
+}
+
+function toggleWhitelistBatch(enabled) {
+  const rows = selected.value.filter((x) => x.assigned);
+  if (!rows.length) return ElMessage.warning("请先选择候选人");
+  return setTrashWhitelist(rows.map((x) => x.email), enabled);
 }
 
 async function invite() {
@@ -1224,7 +1424,7 @@ async function quota() {
   };
 
   quotaTaskRunning.value = true;
-  quotaProgress.value = { done: 0, total: emails.length, active: 0, succeeded: 0, failed: 0, relogged: 0 };
+  quotaProgress.value = { done: 0, total: emails.length, active: 0, succeeded: 0, failed: 0, relogged: 0, autoReset: 0 };
   setOperation(emails, "排队中…");
 
   try {
@@ -1293,16 +1493,18 @@ async function quota() {
         succeeded: quotaProgress.value.succeeded + (result.ok ? 1 : 0),
         failed: quotaProgress.value.failed + (result.ok ? 0 : 1),
         relogged: quotaProgress.value.relogged + (result.relogin_started ? 1 : 0),
+        autoReset: quotaProgress.value.autoReset + (result.auto_reset ? 1 : 0),
       };
     });
 
-    const { succeeded, failed, relogged } = quotaProgress.value;
+    const { succeeded, failed, relogged, autoReset } = quotaProgress.value;
     const skippedText = skippedRows.length ? `，跳过 ${skippedRows.length} 个（${quotaSkipSummary(skippedRows)}）` : "";
+    const autoResetText = autoReset ? `，自动兑换重置券恢复 ${autoReset} 个` : "";
     const reloginErrors = Object.values(results).filter((x) => x?.relogin_error).map((x) => x.relogin_error);
     if (reloginErrors.length) {
-      ElMessage.warning(`额度查询完成：成功 ${succeeded}，失败 ${failed}${skippedText}；${reloginErrors.slice(0, 3).join("；")}`);
+      ElMessage.warning(`额度查询完成：成功 ${succeeded}，失败 ${failed}${skippedText}${autoResetText}；${reloginErrors.slice(0, 3).join("；")}`);
     } else {
-      ElMessage[succeeded ? "success" : "warning"](`额度查询完成：成功 ${succeeded}/${emails.length}${relogged ? `，401重登录成功 ${relogged}` : ""}${skippedText}`);
+      ElMessage[succeeded ? "success" : "warning"](`额度查询完成：成功 ${succeeded}/${emails.length}${relogged ? `，401重登录成功 ${relogged}` : ""}${autoResetText}${skippedText}`);
     }
     await load();
   } catch (e) {
@@ -1561,6 +1763,65 @@ async function kick() {
   await loadStats();
 }
 
+async function leaveSpace() {
+  // 成员主动退出：用成员自己的空间凭证调移除接口，必须有空间凭证才有身份可用。
+  const rows = selected.value.filter(
+    (x) => x.trash_status !== "trashed" && (x.workspace_join_status === "joined" || x.member_id) && x.has_workspace_access_token
+  );
+  if (!rows.length) return ElMessage.warning("所选候选人里没有已加入空间且具备空间凭证的成员");
+  const skipped = selected.value.length - rows.length;
+  const emails = rows.map((x) => x.email);
+  try {
+    await ElMessageBox.confirm(
+      `将让 ${emails.length} 个成员用自己的空间凭证主动退出 OpenAI 空间（与成员在网页上自行离开一致，释放席位）。` +
+        (skipped ? `\n\n另有 ${skipped} 个未加入空间或缺少空间凭证的候选人被跳过。` : "") +
+        `\n\n退出成功后该账号会被移入本空间垃圾箱并标记为已退出（清空成员身份/席位、删除空间凭证；注册结果与号池保留）。之后可在垃圾箱中恢复为普通候选人或彻底删除。确定？`,
+      "成员主动退出空间",
+      { type: "warning", confirmButtonText: "确认退出", cancelButtonText: "取消", customClass: "reset-credit-confirm" }
+    );
+  } catch {
+    return;
+  }
+  // 与批量踢出同一串行节奏：成员侧请求走候选人代理，一条一条来。
+  const delayMin = Math.max(0, Number(kickDelayMinSeconds.value) || 0);
+  const delayMax = Math.max(delayMin, Number(kickDelayMaxSeconds.value) || 0);
+  const ws = workspaceId.value;
+  setOperation(emails, "排队中");
+  let left = 0;
+  const failedEmails = [];
+  for (let i = 0; i < emails.length; i++) {
+    const email = emails[i];
+    setOneOperation(email, `退出中 ${i + 1}/${emails.length}`);
+    let ok = false;
+    try {
+      const r = await leaveCandidates(ws, [email]);
+      const item = (r.results || [])[0] || {};
+      ok = Boolean(item.ok ?? r.left);
+      if (ok) {
+        left++;
+        clearOperation([email]);
+      } else {
+        failedEmails.push(email);
+        setOneOperation(email, item.error || "退出失败");
+      }
+    } catch (e) {
+      failedEmails.push(email);
+      setOneOperation(email, e.message || "退出失败");
+    }
+    if (ok && i < emails.length - 1 && delayMax > 0) {
+      const wait = delayMin + Math.random() * (delayMax - delayMin);
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+    }
+  }
+  const failed = failedEmails.length;
+  const detail = failed && failed <= 5 ? `：${failedEmails.join("、")}` : "";
+  ElMessage[failed ? "warning" : "success"](`已退出空间 ${left} 个${failed ? `，失败 ${failed}${detail}` : ""}`);
+  clearOperation(emails);
+  clearSelection();
+  await load();
+  await loadStats();
+}
+
 async function deleteEverywhere() {
   const emails = selected.value.map((x) => x.email);
   if (!emails.length) return ElMessage.warning("请选择候选人");
@@ -1598,8 +1859,11 @@ async function runAssignAction(command) {
   if (command === "remove") return remove();
   if (command === "delete_everywhere") return deleteEverywhere();
   if (command === "kick") return kick();
+  if (command === "leave") return leaveSpace();
   if (command === "trash") return moveToTrash();
   if (command === "restore_trash") return restoreFromTrash();
+  if (command === "whitelist_on") return toggleWhitelistBatch(true);
+  if (command === "whitelist_off") return toggleWhitelistBatch(false);
   if (command === "outbound") return setOutboundStatus("outbound", "标记出库");
   if (command === "restore_outbound") return setOutboundStatus("active", "恢复出库账号");
   if (command === "tag_marks") return openTagDialog();
@@ -1622,8 +1886,11 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       auto_push_sub2api_group_ids: autoPushSub2apiGroupIds.value,
       auto_push_cpa_url: autoPushCpaUrl.value,
       auto_push_cpa_mgmt_key: autoPushCpaMgmtKey.value,
+      auto_push_cpa_priority: cpaPriorityWire(),
       cpa_static_proxy_enabled: cpaStaticProxyEnabled.value,
       cpa_static_proxy_pool: cpaStaticProxyPool.value,
+      export_plain_credentials: plainCredentialMode.value,
+      cpa_use_template: cpaUseTemplate.value,
       auto_push_skip_codex_seat: autoPushSkipCodexSeat.value,
       concurrency: taskConcurrency.value,
       otp_timeout: taskOtpTimeout.value,
@@ -1638,6 +1905,7 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       trash_zero_delay_minutes: trashZeroDelayMinutes.value,
       trash_zero_quota_window: trashZeroQuotaWindow.value,
       trash_gap_seconds: trashGapSeconds.value,
+      trash_cleanup_cpa_on_manual: trashCleanupCpaOnManual.value,
       seat_protect_enabled: seatProtectEnabled.value,
       seat_protect_threshold: seatProtectThreshold.value,
       seat_protect_refresh_time: seatProtectRefreshTime.value,
@@ -1653,6 +1921,8 @@ async function saveSpaceSettings(targetId = workspaceId.value) {
       auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
       auto_standard_seat_source: autoStandardSeatSource.value,
       auto_prolite_seat_source: autoProliteSeatSource.value,
+      auto_standard_seat_candidate_order: autoStandardSeatCandidateOrder.value,
+      auto_prolite_seat_candidate_order: autoProliteSeatCandidateOrder.value,
       kick_delay_min_seconds: kickDelayMinSeconds.value,
       kick_delay_max_seconds: kickDelayMaxSeconds.value,
     });
@@ -1696,9 +1966,18 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     autoPushSub2apiGroupIds.value = String(c.auto_push_sub2api_group_ids || "");
     autoPushCpaUrl.value = String(c.auto_push_cpa_url || "");
     autoPushCpaMgmtKey.value = String(c.auto_push_cpa_mgmt_key || "");
+    autoPushCpaPriority.value = Math.round(Number(c.auto_push_cpa_priority) || 0);
     cpaStaticProxyEnabled.value = Boolean(c.cpa_static_proxy_enabled);
     cpaStaticProxyPool.value = String(c.cpa_static_proxy_pool || "");
     autoPushSkipCodexSeat.value = c.auto_push_skip_codex_seat !== false;
+    // 导出勾选是按空间持久化的；老版本只存过 localStorage，空间还没存过这两个
+    // key 时用 localStorage 值做一次性迁移回退，保存后即为空间独立值。
+    plainCredentialMode.value = c.export_plain_credentials !== undefined
+      ? Boolean(c.export_plain_credentials)
+      : legacyPlainCredentialPref();
+    cpaUseTemplate.value = c.cpa_use_template !== undefined
+      ? Boolean(c.cpa_use_template)
+      : legacyCpaTemplatePref();
     taskConcurrency.value = Number(c.concurrency || 1);
     taskOtpTimeout.value = Number(c.otp_timeout || 180);
     taskRetry.value = Number(c.account_retry_count || 1);
@@ -1708,10 +1987,11 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     quotaProxyPool.value = String(c.quota_proxy_pool || "");
     trashEnabled.value = c.trash_enabled !== false;
     trashInvalidEnabled.value = c.trash_invalid_enabled !== false;
-    trashAction.value = c.trash_action === "kick" ? "kick" : "seat";
+    trashAction.value = ["kick", "leave"].includes(c.trash_action) ? c.trash_action : "seat";
     trashZeroDelayMinutes.value = Number(c.trash_zero_delay_minutes || 1);
     trashZeroQuotaWindow.value = String(c.trash_zero_quota_window || "weekly");
     trashGapSeconds.value = Math.min(600, Math.max(0, Number(c.trash_gap_seconds ?? 30)));
+    trashCleanupCpaOnManual.value = Boolean(c.trash_cleanup_cpa_on_manual);
     seatProtectEnabled.value = Boolean(c.seat_protect_enabled);
     seatProtectThreshold.value = Number(c.seat_protect_threshold || 8);
     seatProtectRefreshTime.value = String(c.seat_protect_refresh_time || "00:00");
@@ -1735,6 +2015,12 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
     autoProliteSeatSource.value = ["switch", "invite", "mixed"].includes(String(c.auto_prolite_seat_source || "switch"))
       ? String(c.auto_prolite_seat_source || "switch")
       : "switch";
+    autoStandardSeatCandidateOrder.value = ["oldest_first", "newest_first"].includes(String(c.auto_standard_seat_candidate_order || ""))
+      ? String(c.auto_standard_seat_candidate_order)
+      : "default";
+    autoProliteSeatCandidateOrder.value = ["oldest_first", "newest_first"].includes(String(c.auto_prolite_seat_candidate_order || ""))
+      ? String(c.auto_prolite_seat_candidate_order)
+      : "default";
     kickDelayMinSeconds.value = Math.min(600, Math.max(0, Number(c.kick_delay_min_seconds ?? 2)));
     kickDelayMaxSeconds.value = Math.min(600, Math.max(0, Number(c.kick_delay_max_seconds ?? 5)));
     try {
@@ -1764,9 +2050,12 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoPushSub2apiGroupIds.value = "";
       autoPushCpaUrl.value = "";
       autoPushCpaMgmtKey.value = "";
+      autoPushCpaPriority.value = 0;
       cpaStaticProxyEnabled.value = false;
       cpaStaticProxyPool.value = "";
       autoPushSkipCodexSeat.value = true;
+      plainCredentialMode.value = legacyPlainCredentialPref();
+      cpaUseTemplate.value = legacyCpaTemplatePref();
       taskConcurrency.value = 1;
       taskOtpTimeout.value = 180;
       taskRetry.value = 1;
@@ -1780,6 +2069,7 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       trashZeroDelayMinutes.value = 1;
       trashZeroQuotaWindow.value = "weekly";
       trashGapSeconds.value = 30;
+      trashCleanupCpaOnManual.value = false;
       seatProtectEnabled.value = false;
       seatProtectThreshold.value = 8;
       seatProtectRefreshTime.value = "00:00";
@@ -1799,6 +2089,8 @@ async function loadSpaceSettings(targetId = workspaceId.value) {
       autoProliteCandidateSeatType.value = "default";
       autoStandardSeatSource.value = "switch";
       autoProliteSeatSource.value = "switch";
+      autoStandardSeatCandidateOrder.value = "default";
+      autoProliteSeatCandidateOrder.value = "default";
       kickDelayMinSeconds.value = 2;
       kickDelayMaxSeconds.value = 5;
     }
@@ -1829,6 +2121,7 @@ async function toggleQuotaSchedule() {
           auto_push_sub2api_group_ids: autoPushSub2apiGroupIds.value,
           auto_push_cpa_url: autoPushCpaUrl.value,
           auto_push_cpa_mgmt_key: autoPushCpaMgmtKey.value,
+          auto_push_cpa_priority: cpaPriorityWire(),
           cpa_static_proxy_enabled: cpaStaticProxyEnabled.value,
           cpa_static_proxy_pool: cpaStaticProxyPool.value,
           auto_push_skip_codex_seat: autoPushSkipCodexSeat.value,
@@ -1845,6 +2138,7 @@ async function toggleQuotaSchedule() {
           trash_zero_delay_minutes: trashZeroDelayMinutes.value,
           trash_zero_quota_window: trashZeroQuotaWindow.value,
           trash_gap_seconds: trashGapSeconds.value,
+          trash_cleanup_cpa_on_manual: trashCleanupCpaOnManual.value,
           seat_protect_enabled: seatProtectEnabled.value,
           seat_protect_threshold: seatProtectThreshold.value,
           seat_protect_refresh_time: seatProtectRefreshTime.value,
@@ -1860,6 +2154,8 @@ async function toggleQuotaSchedule() {
           auto_prolite_candidate_seat_type: autoProliteCandidateSeatType.value,
           auto_standard_seat_source: autoStandardSeatSource.value,
           auto_prolite_seat_source: autoProliteSeatSource.value,
+          auto_standard_seat_candidate_order: autoStandardSeatCandidateOrder.value,
+          auto_prolite_seat_candidate_order: autoProliteSeatCandidateOrder.value,
           kick_delay_min_seconds: kickDelayMinSeconds.value,
           kick_delay_max_seconds: kickDelayMaxSeconds.value,
         }
@@ -2181,8 +2477,27 @@ async function exportRedeemCodes() {
 // ── CPA 导出模版配置 ──
 // 勾选导出栏「CPA 按模版」时，后端把模版里的凭证级代理 proxy_url 和
 // 「启用凭证文件」（JSON disabled 取反）写进每个 CPA 凭证文件；
-// 不勾选则按原样导出。勾选状态存 localStorage，模版存后端 settings。
+// 不勾选则按原样导出。勾选状态按空间存后端 settings，模版存全局 settings。
 const CPA_USE_TEMPLATE_KEY = "cpa_use_template";
+
+// 老版本两个导出勾选存在 localStorage（浏览器级，所有空间共享）。
+// 空间设置里还没有对应 key 时回退读它，保证升级后首个打开的空间继承旧值。
+function legacyPlainCredentialPref() {
+  try {
+    return localStorage.getItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY) === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function legacyCpaTemplatePref() {
+  try {
+    return localStorage.getItem(CPA_USE_TEMPLATE_KEY) === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
 const cpaUseTemplate = ref(false);
 const cpaTplVisible = ref(false);
 const cpaTplSaving = ref(false);
@@ -2292,8 +2607,11 @@ watch(
     autoPushSub2apiGroupIds,
     autoPushCpaUrl,
     autoPushCpaMgmtKey,
+    autoPushCpaPriority,
     cpaStaticProxyEnabled,
     cpaStaticProxyPool,
+    plainCredentialMode,
+    cpaUseTemplate,
     autoPushSkipCodexSeat,
     taskConcurrency,
     taskOtpTimeout,
@@ -2307,6 +2625,7 @@ watch(
     trashAction,
     trashZeroDelayMinutes,
     trashZeroQuotaWindow,
+    trashCleanupCpaOnManual,
     seatProtectEnabled,
     seatProtectThreshold,
     seatProtectRefreshTime,
@@ -2351,7 +2670,7 @@ watch(autoSeatIntervalMinutes, (value) => {
 });
 
 watch(
-  [autoStandardSeatEnabled, autoProliteSeatEnabled, autoProliteCandidateSeatType, autoStandardSeatSource, autoProliteSeatSource],
+  [autoStandardSeatEnabled, autoProliteSeatEnabled, autoProliteCandidateSeatType, autoStandardSeatSource, autoProliteSeatSource, autoStandardSeatCandidateOrder, autoProliteSeatCandidateOrder],
   queueSpaceSettingsSave
 );
 
@@ -2411,18 +2730,6 @@ watch(pageSize, () => {
   if (workspaceId.value) load();
 });
 
-watch(plainCredentialMode, (value) => {
-  try {
-    localStorage.setItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY, value ? "1" : "0");
-  } catch (_) {}
-});
-
-watch(cpaUseTemplate, (value) => {
-  try {
-    localStorage.setItem(CPA_USE_TEMPLATE_KEY, value ? "1" : "0");
-  } catch (_) {}
-});
-
 watch(taskLogAutoRefresh, async () => {
   if (!workspaceId.value) return;
   await loadTaskLogs(true);
@@ -2430,13 +2737,6 @@ watch(taskLogAutoRefresh, async () => {
 });
 
 onActivated(async () => {
-  if (!credentialModeLoaded) {
-    try {
-      plainCredentialMode.value = localStorage.getItem(PLAIN_CREDENTIAL_MODE_STORAGE_KEY) === "1";
-      cpaUseTemplate.value = localStorage.getItem(CPA_USE_TEMPLATE_KEY) === "1";
-    } catch (_) {}
-    credentialModeLoaded = true;
-  }
   await loadSpaces();
   if (workspaceId.value) {
     await load();
@@ -2445,14 +2745,20 @@ onActivated(async () => {
     await loadTaskLogs(true);
     await startTaskLogPolling();
   }
+  startListRefreshPolling();
+  document.addEventListener("visibilitychange", onVisibilityRefresh);
 });
 
 onDeactivated(() => {
   stopTaskLogPolling();
+  stopListRefreshPolling();
+  document.removeEventListener("visibilitychange", onVisibilityRefresh);
 });
 
 onBeforeUnmount(() => {
   stopTaskLogPolling();
+  stopListRefreshPolling();
+  document.removeEventListener("visibilitychange", onVisibilityRefresh);
   clearTimeout(settingsSaveTimer);
 });
 </script>
@@ -2944,6 +3250,18 @@ onBeforeUnmount(() => {
             </el-button>
           </div>
         </div>
+        <div class="action-group-right">
+          <el-switch
+            v-model="listAutoRefresh"
+            active-text="自动刷新"
+            size="small"
+            :title="`每 ${LIST_REFRESH_INTERVAL_MS / 1000} 秒静默刷新列表与席位统计`"
+          />
+          <el-button size="small" plain :loading="loading" @click="load()">
+            <Icon icon="lucide:refresh-cw" class="btn-icon" />
+            刷新
+          </el-button>
+        </div>
       </div>
       <div v-else class="action-toolbar">
         <div class="action-group-left">
@@ -3022,6 +3340,18 @@ onBeforeUnmount(() => {
               查询额度
             </el-button>
 
+            <el-button
+              type="warning"
+              plain
+              size="small"
+              :disabled="!selected.length || !!resetCreditBusyEmail"
+              :loading="resetCreditBatchRunning"
+              @click="batchResetCredits"
+            >
+              <Icon icon="lucide:rotate-ccw" class="btn-icon" />
+              批量重置
+            </el-button>
+
             <el-dropdown :disabled="candidateMembershipBusy" @command="changeSeat">
               <el-button size="small" :loading="seatSwitchRunning">
                 <Icon icon="lucide:arrow-left-right" class="btn-icon" />
@@ -3096,6 +3426,19 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="action-group-right">
+          <el-switch
+            v-model="listAutoRefresh"
+            active-text="自动刷新"
+            size="small"
+            :title="`每 ${LIST_REFRESH_INTERVAL_MS / 1000} 秒静默刷新列表与席位统计`"
+          />
+          <el-button size="small" plain :loading="loading" @click="load()">
+            <Icon icon="lucide:refresh-cw" class="btn-icon" />
+            刷新
+          </el-button>
+
+          <el-divider direction="vertical" class="toolbar-divider" />
+
           <el-checkbox
             v-model="plainCredentialMode"
             :disabled="exporting || pushing"
@@ -3140,8 +3483,11 @@ onBeforeUnmount(() => {
                 <el-dropdown-item divided command="outbound">标记为已出库</el-dropdown-item>
                 <el-dropdown-item v-if="tagStatusFilter === 'outbound'" command="restore_outbound">恢复出库账号</el-dropdown-item>
                 <el-dropdown-item divided command="kick" style="color: var(--el-color-warning)">踢出空间成员</el-dropdown-item>
+                <el-dropdown-item command="leave" style="color: var(--el-color-warning)">成员主动退出空间</el-dropdown-item>
                 <el-dropdown-item command="trash">移入垃圾箱</el-dropdown-item>
                 <el-dropdown-item command="restore_trash">移出垃圾箱</el-dropdown-item>
+                <el-dropdown-item divided command="whitelist_on">加入垃圾箱白名单</el-dropdown-item>
+                <el-dropdown-item command="whitelist_off">移出垃圾箱白名单</el-dropdown-item>
                 <el-dropdown-item divided command="remove" style="color: var(--el-color-danger)">移除当前空间划分</el-dropdown-item>
                 <el-dropdown-item command="delete_everywhere" style="color: var(--el-color-danger)">删除账号（全系统）</el-dropdown-item>
               </el-dropdown-menu>
@@ -3167,6 +3513,8 @@ onBeforeUnmount(() => {
             <span class="text-danger">失败 {{ quotaProgress.failed }}</span>
             <span v-if="quotaProgress.relogged" class="count-divider">·</span>
             <span v-if="quotaProgress.relogged" class="text-warning">重登 {{ quotaProgress.relogged }}</span>
+            <span v-if="quotaProgress.autoReset" class="count-divider">·</span>
+            <span v-if="quotaProgress.autoReset" class="text-success">自动重置 {{ quotaProgress.autoReset }}</span>
           </div>
         </div>
         <el-progress
@@ -3215,6 +3563,8 @@ onBeforeUnmount(() => {
                   <Icon icon="lucide:copy" />
                 </button>
               </div>
+
+              <div class="account-reg-line">注册 {{ fmtDate(row.registered_at) }}</div>
 
               <div class="account-meta-row">
                 <el-tag v-if="row.group_name" size="small" type="info" effect="plain" class="meta-tag">
@@ -3416,8 +3766,8 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
 
-        <!-- 垃圾箱状态 -->
-        <el-table-column label="生命周期" width="130">
+        <!-- 垃圾箱状态与白名单开关 -->
+        <el-table-column label="生命周期" width="150">
           <template #default="{ row }">
             <div class="lifecycle-cell">
               <el-tag
@@ -3427,6 +3777,20 @@ onBeforeUnmount(() => {
               >
                 {{ trashStatusLabel(row.trash_status) }}
               </el-tag>
+              <div class="whitelist-line">
+                <el-switch
+                  :model-value="Boolean(row.trash_whitelist)"
+                  size="small"
+                  :loading="whitelistBusy.has(row.email)"
+                  @change="(v) => setRowTrashWhitelist(row, v)"
+                />
+                <el-tooltip
+                  content="垃圾箱白名单：开启后不参与自动回收；手动移出垃圾箱的账号自动开启。手动入箱/踢出不受约束"
+                  placement="top"
+                >
+                  <span class="whitelist-label" :class="{ on: row.trash_whitelist }">白名单</span>
+                </el-tooltip>
+              </div>
               <div v-if="trashStatusHint(row)" class="trash-hint-text">
                 {{ trashStatusHint(row) }}
               </div>
@@ -3636,6 +4000,15 @@ onBeforeUnmount(() => {
                         style="width: 100%"
                       />
                     </el-form-item>
+                    <el-form-item label="CPA 账号优先级">
+                      <el-input-number
+                        v-model="autoPushCpaPriority"
+                        :max="1000"
+                        :step="1"
+                        style="width: 160px"
+                      />
+                      <div class="field-hint">写进推送凭证 JSON 的 priority 字段，可为负数，默认 0；CPA 按此决定账号调度优先顺序</div>
+                    </el-form-item>
                     <el-form-item label="CPA 静态家宽代理池">
                       <div class="setting-switch-row" style="width: 100%">
                         <div class="switch-meta">
@@ -3688,7 +4061,7 @@ onBeforeUnmount(() => {
                   券是不可逆的消耗品，兑掉就没了。只有同时满足以下条件才会自动兑换：
                   限流窗口按「额度耗尽判定窗口」的口径确实用尽、上游标记当前可用券数（applicable）大于 0、
                   且耗尽原因不是「空间额度耗尽」（那是母号空间的池子被掏空，重置券救不了）。
-                  定时轮询查到耗尽时兑一次；延迟入箱到期复查时再兑一次，兑换后额度恢复的账号不会入箱。
+                  定时轮询与手动「查询额度」查到耗尽时各兑一次；延迟入箱到期复查时再兑一次，兑换后额度恢复的账号不会入箱。
                 </div>
               </el-form>
             </div>
@@ -3724,6 +4097,11 @@ onBeforeUnmount(() => {
                 </el-form-item>
               </el-form>
 
+              <div v-if="autoStandardSeatEnabled || autoProliteSeatEnabled" class="setting-info-box">
+                <Icon icon="lucide:clock" class="box-icon" />
+                <span>{{ nextSeatPollText() || '准备就绪' }}</span>
+              </div>
+
               <div class="setting-group-box">
                 <div class="group-box-title">
                   <Icon icon="lucide:sparkles" class="box-icon" />
@@ -3756,6 +4134,16 @@ onBeforeUnmount(() => {
                     </el-select>
                     <div class="field-hint">
                       邀请模式下把已划分到本空间、尚未受邀的候选人直接邀请到标准席位，成员在凭证登录时自动接受邀请；无需先加为成员再切席位。
+                    </div>
+                  </el-form-item>
+                  <el-form-item label="候选排序">
+                    <el-select v-model="autoStandardSeatCandidateOrder" style="width: 100%">
+                      <el-option label="默认顺序" value="default" />
+                      <el-option label="注册时间长的优先" value="oldest_first" />
+                      <el-option label="注册时间短的优先" value="newest_first" />
+                    </el-select>
+                    <div class="field-hint">
+                      按候选人的注册时间决定补齐先后顺序，切换与邀请候选都生效。
                     </div>
                   </el-form-item>
                 </el-form>
@@ -3797,6 +4185,16 @@ onBeforeUnmount(() => {
                     </el-select>
                     <div class="field-hint">
                       邀请模式下把已划分到本空间、尚未受邀的候选人直接邀请到 ProLite 席位，成员在凭证登录时自动接受邀请；无需先加为成员再升级。
+                    </div>
+                  </el-form-item>
+                  <el-form-item label="候选排序">
+                    <el-select v-model="autoProliteSeatCandidateOrder" style="width: 100%">
+                      <el-option label="默认顺序" value="default" />
+                      <el-option label="注册时间长的优先" value="oldest_first" />
+                      <el-option label="注册时间短的优先" value="newest_first" />
+                    </el-select>
+                    <div class="field-hint">
+                      按候选人的注册时间决定补齐先后顺序，切换与邀请候选都生效。
                     </div>
                   </el-form-item>
                   <el-form-item v-if="autoProliteSeatSource !== 'invite'" label="目标候选人类型">
@@ -3943,16 +4341,25 @@ onBeforeUnmount(() => {
                   </div>
                   <el-switch v-model="trashInvalidEnabled" />
                 </div>
+                <div class="setting-switch-row">
+                  <div class="switch-meta">
+                    <span class="switch-title">手动入箱删除 CPA 凭证</span>
+                    <span class="switch-desc">手动移入垃圾箱/踢出/退出空间时，同步删除该账号已推送到 CPA 的凭证并释放家宽代理；关闭时仅额度耗尽等自动化入箱才删除</span>
+                  </div>
+                  <el-switch v-model="trashCleanupCpaOnManual" />
+                </div>
                 <el-form label-position="top" class="settings-form sub-form">
                   <el-form-item label="入箱前置动作">
                     <el-select v-model="trashAction" style="width: 100%">
                       <el-option label="席位切换为 Codex（成员留在空间）" value="seat" />
-                      <el-option label="踢出空间（成员被移除）" value="kick" />
+                      <el-option label="踢出空间（母号移除成员）" value="kick" />
+                      <el-option label="成员主动退出（成员身份离开空间）" value="leave" />
                     </el-select>
                     <div class="field-hint">
                       候选人入箱前先对远端执行的动作。「席位切换为 Codex」把成员降到按量计费席位后留在空间里；
-                      「踢出空间」直接调用移除成员接口，成员离开空间，适合不允许或不适合切 Codex 席位的母号。
-                      踢出未被远端确认时不会入箱，会自动重试。手动「踢出空间」按钮与此无关，始终可用。
+                      「踢出空间」用母号管理员身份调用移除成员接口；「成员主动退出」用成员自己的空间凭证调
+                      同一个接口，效果与成员在网页上自行离开一致，适合母号无权限或不想暴露管理员操作的场景。
+                      远端未确认时不会入箱，会自动重试。手动「踢出空间」按钮与此无关，始终可用。
                     </div>
                   </el-form-item>
                   <el-form-item label="额度耗尽判定窗口">
@@ -4716,6 +5123,12 @@ onBeforeUnmount(() => {
   background: var(--el-fill-color);
 }
 
+.account-reg-line {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.2;
+}
+
 .account-meta-row {
   display: flex;
   align-items: center;
@@ -4895,6 +5308,24 @@ onBeforeUnmount(() => {
 .trash-hint-text {
   font-size: 10px;
   color: var(--el-text-color-placeholder);
+}
+
+.whitelist-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 1px;
+}
+
+.whitelist-label {
+  font-size: 11px;
+  color: var(--el-text-color-placeholder);
+  cursor: default;
+}
+
+.whitelist-label.on {
+  color: var(--el-color-success);
+  font-weight: 500;
 }
 
 .status-cell {

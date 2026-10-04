@@ -373,6 +373,143 @@ def fetch_candidate_quota(
         result["reset_credits"] = reset_credits
     db.update_workspace_quota(workspace_db_id, email, result)
     return result
+
+
+def fetch_personal_quota(
+    email: str,
+    *,
+    proxy: str,
+    network_retries: int = 2,
+) -> dict:
+    """个人空间（Free 账号）的 Codex 额度查询。
+
+    与 :func:`fetch_candidate_quota` 同一条 wham/usage 通路，差异只在凭证来源：
+    个人账号的 access_token 存在 registered 里，``ChatGPT-Account-Id`` 从 token
+    的 JWT claim（chatgpt_account_id）里解码，不需要母号/空间成员会话。
+    结果写 personal_candidates.quota_json；错误语义与空间版一致。
+    """
+    email = str(email or "").strip().lower()
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value:
+        raise ValueError("个人空间代理池为空，额度查询无法租取代理")
+    row = db.get_registered(email)
+    if not row:
+        raise RuntimeError("账号不在注册结果里")
+    if str(row.get("account_status") or "") == "permanently_invalid":
+        raise QuotaAccountDeactivated("账号已永久失效", streak=0)
+    token = str(row.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("账号没有个人凭证（access_token 为空）")
+    from . import exporter  # 懒 import，保持模块载入轻量
+    account_id = str(
+        exporter._decode_jwt_payload(token).get("https://api.openai.com/auth", {}).get("chatgpt_account_id") or ""
+    ).strip()
+
+    try:
+        prior_quota = json.loads((db.get_personal_candidate(email) or {}).get("quota_json") or "{}")
+        if not isinstance(prior_quota, dict):
+            prior_quota = {}
+    except Exception:
+        prior_quota = {}
+
+    session = create_http_session(proxy=proxy_value)
+    headers = {**_headers(token, account_id), "User-Agent": "codex-cli"}
+    net_left = max(0, int(network_retries or 0))
+    rate_left = max(0, int(WORKSPACE_ADMIN_MAX_429_RETRIES or 0))
+    net_attempt = 0
+    rate_attempt = 0
+    response = None
+    while True:
+        try:
+            response = session.get(f"{BASE}/backend-api/wham/usage", headers=headers, timeout=30)
+        except Exception as exc:
+            if net_left <= 0:
+                streak = db.record_candidate_proxy_failure(proxy_value)
+                logger.warning(
+                    "个人空间额度查询代理传输失败 proxy=%s streak=%s/%s email=%s",
+                    proxy_value, streak, db.CANDIDATE_PROXY_FAILURE_STREAK, email,
+                )
+                raise QuotaNetworkError(
+                    f"额度查询网络错误（已重试{net_attempt}次）：{exc}"
+                ) from exc
+            net_left -= 1
+            net_attempt += 1
+            delay = min(10.0, float(net_attempt))
+            logger.warning(
+                "个人空间额度查询网络异常，将重试 email=%s attempt=%s wait=%.1fs error=%s",
+                email, net_attempt, delay, str(exc)[:180],
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code >= 500 and net_left > 0:
+            net_left -= 1
+            net_attempt += 1
+            delay = min(10.0, float(net_attempt))
+            logger.warning(
+                "个人空间额度查询上游 %s，将重试 email=%s attempt=%s wait=%.1fs",
+                response.status_code, email, net_attempt, delay,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code == 429 and rate_left > 0:
+            rate_left -= 1
+            delay = _retry_after_seconds(response, rate_attempt)
+            rate_attempt += 1
+            logger.warning(
+                "个人空间额度查询触发限流，退避重试 email=%s attempt=%s wait=%.1fs",
+                email, rate_attempt, delay,
+            )
+            time.sleep(delay)
+            continue
+        break
+
+    # 拿到响应即证明代理链路可用，清零连击（业务层错误另有各自的处理）。
+    db.clear_candidate_proxy_failure(proxy_value)
+
+    if response.status_code >= 300:
+        code = int(response.status_code)
+        record = {"error_code": code, "updated_at": time.time()}
+        streak = 0
+        if code == 403:
+            streak = max(0, int(prior_quota.get("consecutive_403") or 0)) + 1
+            record["consecutive_403"] = streak
+        db.update_personal_quota(email, record)
+        if code == 401:
+            raise QuotaUnauthorized("额度查询失败 HTTP 401")
+        if code == 402:
+            raise QuotaPaymentRequired(
+                f"个人空间计费异常 HTTP 402：{_response_debug_body(response)[:300]}"
+            )
+        if code == 403:
+            logger.warning(
+                "个人空间额度查询 403 email=%s streak=%s/%s body=%s",
+                email, streak, DEACTIVATION_403_STREAK,
+                _response_debug_body(response)[:300],
+            )
+            if streak >= DEACTIVATION_403_STREAK:
+                raise QuotaAccountDeactivated(
+                    f"连续 {streak} 次额度查询 403，判定账号停用", streak=streak
+                )
+            raise QuotaHttpError(code)
+        if code >= 500:
+            raise QuotaNetworkError(f"额度查询失败 HTTP {code}（已重试{net_attempt}次）")
+        raise QuotaHttpError(code)
+    payload = response.json(); rate = payload.get("rate_limit") or {}; credits = payload.get("credits") or {}
+    def window(key):
+        w = rate.get(key) or {}; return {"used_percent": w.get("used_percent"), "window_seconds": w.get("limit_window_seconds"), "reset_at": w.get("reset_at")}
+    result = {"plan_type": payload.get("plan_type") or "", "credits_balance": credits.get("balance"), "allowed": rate.get("allowed"), "primary": window("primary_window"), "secondary": window("secondary_window"), "updated_at": time.time()}
+    limit_reached = rate.get("limit_reached")
+    if limit_reached is not None:
+        result["limit_reached"] = bool(limit_reached)
+    reached_type = _reached_type(payload)
+    if reached_type:
+        result["rate_limit_reached_type"] = reached_type
+    db.update_personal_quota(email, result)
+    return result
+
+
 logger = logging.getLogger("workspace_membership")
 if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "").endswith("workspace-membership.log") for h in logger.handlers):
     _log_dir = Path(__file__).resolve().parent / "logs"
@@ -397,6 +534,23 @@ def _retry_after_seconds(response, attempt: int) -> float:
     # 实现已上提到 http_client，公开重登录页那边共用同一套 Retry-After 解析。
     # 这里保留同名薄壳，本文件的两处调用点和既有测试都不用改。
     return retry_after_seconds(response, attempt)
+
+
+def _is_subscription_update_pending(response) -> bool:
+    """429「Another subscription update is in progress」= 上游有在途席位
+    变更，不是普通限流——短退避没意义，固定等 30s 再重试。"""
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 429:
+            return False
+        body = getattr(response, "text", "") or ""
+        return "subscription update" in body.lower()
+    except Exception:
+        return False
+
+
+_SUBSCRIPTION_UPDATE_RETRY_SECONDS = 30.0
+# 成员侧 DELETE users 不走 _workspace_admin_request，订阅在途重试单独计数。
+_SUBSCRIPTION_UPDATE_MEMBER_RETRIES = 3
 
 
 def _workspace_admin_request(
@@ -484,11 +638,17 @@ def _workspace_admin_request(
                     _workspace_admin_cooldown_until.pop(key, None)
                 return response
 
-            delay = _retry_after_seconds(response, attempt)
+            if _is_subscription_update_pending(response):
+                delay = _SUBSCRIPTION_UPDATE_RETRY_SECONDS
+                log_msg = "母号管理请求遇到在途席位变更，等待后重试"
+            else:
+                delay = _retry_after_seconds(response, attempt)
+                log_msg = "母号管理请求触发限流"
             with _workspace_admin_state_lock:
                 _workspace_admin_cooldown_until[key] = time.monotonic() + delay
             logger.warning(
-                "母号管理请求触发限流 workspace_db_id=%s method=%s attempt=%s/%s wait=%.1fs",
+                "%s workspace_db_id=%s method=%s attempt=%s/%s wait=%.1fs",
+                log_msg,
                 key,
                 str(method).upper(),
                 attempt + 1,
@@ -528,8 +688,32 @@ def _workspace_external_id(workspace_db_id: int, fallback: str = "") -> str:
 
 
 def _workspace_device_id(account_id: str) -> str:
-    """为管理端请求生成稳定的浏览器设备标识。"""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"workspace-admin:{account_id or 'unknown'}"))
+    """管理端请求的设备标识：优先回放母号登录时录下的指纹。
+
+    OpenAI 现在把会话绑定到创建时的 oai-device-id——指纹不匹配时
+    /api/auth/session 只会吐已失效会话的缓存 token（401 token_invalidated）。
+    没录到指纹的老母号回退到按 workspace 派生的稳定 UUID（与旧行为一致，
+    会话若已被风控绑定则仍需带 statsigContext 的 session JSON 重导）。
+    """
+    external_id = str(account_id or "").strip()
+    if external_id:
+        try:
+            master = db.get_workspace_master_by_external_id(external_id) or {}
+            stored = str(master.get("device_id") or "").strip()
+            if stored:
+                return stored
+        except Exception:
+            pass
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"workspace-admin:{external_id or 'unknown'}"))
+
+
+def _workspace_user_agent(account_id: str) -> str:
+    """母号登录时录下的 UA；未录则空串（调用方按需补）。"""
+    try:
+        master = db.get_workspace_master_by_external_id(str(account_id or "").strip()) or {}
+        return str(master.get("user_agent") or "").strip()
+    except Exception:
+        return ""
 
 
 def _refresh_workspace_access_token(workspace_db_id: int, session) -> str:
@@ -550,15 +734,19 @@ def _refresh_workspace_access_token(workspace_db_id: int, session) -> str:
             domain=".chatgpt.com",
             path="/",
         )
+        refresh_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": BASE,
+            "Referer": f"{BASE}/admin/members",
+            "oai-device-id": _workspace_device_id(workspace_id),
+        }
+        recorded_ua = str(master.get("user_agent") or "").strip()
+        if recorded_ua:
+            refresh_headers["User-Agent"] = recorded_ua
         response = session.get(
             f"{BASE}/api/auth/session",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Origin": BASE,
-                "Referer": f"{BASE}/admin/members",
-                "oai-device-id": _workspace_device_id(workspace_id),
-            },
+            headers=refresh_headers,
             timeout=30,
         )
         if response.status_code < 200 or response.status_code >= 300:
@@ -1129,6 +1317,106 @@ def remove_member(workspace_db_id: int, email: str, member_id: str = "") -> dict
     }
 
 
+def _lease_member_side_proxy(workspace_db_id: int, email: str, detail: str = "") -> str:
+    """为成员侧请求（主动退出空间）租一条候选人代理。
+
+    CPA 绑定家宽优先；否则按空间候选人代理池（quota_proxy_pool 回退
+    proxy_pool）走 LRU 租取，与额度查询同一条纪律。空池直接抛错——
+    成员请求绝不走母号出口或直连。ProxyLeasePool 每次新建都会加载近期
+    全局租取历史，逐调用建池不影响 LRU 分配。
+    """
+    from . import proxy_usage, public_relogin  # 懒 import，保持模块载入轻量
+    bound = db.get_cpa_proxy_lease(workspace_db_id, email)
+    if bound:
+        proxy_usage.record_lease(bound, "quota", detail)
+        return bound
+    settings = db.get_workspace_settings(workspace_db_id)
+    pool_text = (
+        str(settings.get("quota_proxy_pool") or "").strip()
+        or str(settings.get("proxy_pool") or "").strip()
+    )
+    values = [line.strip() for line in pool_text.splitlines() if line.strip()]
+    if not values:
+        raise ValueError("候选人代理池为空，成员退出空间无法租取代理")
+    pool = public_relogin.ProxyLeasePool(values)
+    proxy, _, _ = pool.lease("", task_type="quota", task_detail=detail, skip_cooldown=True)
+    if not proxy:
+        raise ValueError("候选人代理池为空，成员退出空间无法租取代理")
+    return proxy
+
+
+def member_leave_workspace(workspace_db_id: int, email: str, member_id: str = "", *, proxy: str) -> dict:
+    """成员主动退出空间（上游 DELETE users/{member_id}，身份=成员自己）。
+
+    与 :func:`remove_member` 打的是同一个上游端点，区别在身份：这里用成员
+    自己的空间 Access Token + ChatGPT-Account-Id，走候选人代理；后者用母号
+    管理员身份。上游前端调用前会先查一次 owner_count，那是给 owner 身份的
+    UI 提示；候选人都是普通成员，最后一个 owner 退出服务端自己会拒绝，这里
+    不重复请求。
+
+    member_id 缺省时先回查母号成员列表再取；查不到说明人已不在空间，视为已退出。
+    DELETE 只有 2xx 才算退出成功；404 说明 member_id 快照过期（成员被重新
+    邀请换过 id），按邮箱重解析一次再删，重解析不到才算人已不在空间。
+    """
+    key = str(email or "").strip().lower()
+    master = db.get_workspace_master(workspace_db_id) or {}
+    wid = str(master.get("workspace_id") or "").strip()
+    if not wid:
+        raise RuntimeError("母号缺少 Workspace ID")
+    member_id = str(member_id or "").strip()
+    if not member_id and key:
+        member_id = str(fetch_candidate_seats(workspace_db_id, [key]).get(key, {}).get("member_id") or "").strip()
+    if not member_id:
+        logger.info("成员退出空间：未找到 member_id（可能已不在空间） workspace_db_id=%s email=%s", workspace_db_id, key)
+        return {"member_id": "", "left": False, "already_gone": True}
+    session, headers = _candidate_quota_session(workspace_db_id, key, proxy)
+    response = None
+    member_id_resolved = False
+    subscription_retries = 0
+    for _attempt in range(2 + _SUBSCRIPTION_UPDATE_MEMBER_RETRIES):
+        response = session.delete(
+            f"{BASE}/backend-api/accounts/{wid}/users/{member_id}",
+            headers={**headers, "Referer": f"{BASE}/admin/members", "Origin": BASE},
+            timeout=WORKSPACE_ADMIN_REQUEST_TIMEOUT_SECONDS,
+        )
+        if 200 <= response.status_code < 300:
+            try:
+                data = _json(response)
+            except Exception:
+                data = {}
+            logger.info("成员主动退出空间 workspace_db_id=%s email=%s member_id=%s status=%s", workspace_db_id, key, member_id, response.status_code)
+            return {"member_id": member_id, "left": True, "result": data}
+        # 上游有在途席位变更（429 subscription update）时等它落地再删——
+        # 这是前置动作失败最常见的原因，等 30s 重试通常就能过。
+        if _is_subscription_update_pending(response) and subscription_retries < _SUBSCRIPTION_UPDATE_MEMBER_RETRIES:
+            subscription_retries += 1
+            logger.info(
+                "成员退出空间：上游有在途席位变更，等待 %.0fs 后重试 workspace_db_id=%s email=%s attempt=%s/%s",
+                _SUBSCRIPTION_UPDATE_RETRY_SECONDS, workspace_db_id, key,
+                subscription_retries, _SUBSCRIPTION_UPDATE_MEMBER_RETRIES,
+            )
+            time.sleep(_SUBSCRIPTION_UPDATE_RETRY_SECONDS)
+            continue
+        if response.status_code == 404 and not member_id_resolved and key:
+            member_id_resolved = True
+            fresh = str(fetch_candidate_seats(workspace_db_id, [key]).get(key, {}).get("member_id") or "").strip()
+            if fresh and fresh != member_id:
+                member_id = fresh
+                continue
+            return {"member_id": member_id, "left": False, "already_gone": True}
+        break
+    logger.warning(
+        "成员退出空间未被确认 workspace_db_id=%s email=%s member_id=%s status=%s body=%s",
+        workspace_db_id, key, member_id, response.status_code, _response_debug_body(response),
+    )
+    return {
+        "member_id": member_id,
+        "left": False,
+        "status_code": int(response.status_code),
+        "error": f"成员退出空间未被确认 HTTP {response.status_code}",
+    }
+
+
 def update_member_seat_type(workspace_db_id: int, member_id: str, seat_type: str) -> dict:
     if seat_type not in {"default", "usage_based", "prolite"}: raise ValueError("席位类型只能是 default、usage_based 或 prolite")
     session, master = create_workspace_http_session(workspace_db_id)
@@ -1218,6 +1506,9 @@ def fetch_candidate_seat_via_session(
         domain=".chatgpt.com",
         path="/",
     )
+    # 这是候选人的 session：指纹要回放候选人登录时录下的 oai-did，
+    # 用母号的指纹只会让上游把候选人的会话也绑死。
+    candidate_device = str(rows[0].get("device_id") or "").strip() or _workspace_device_id(wid)
     try:
         response = session.get(
             f"{BASE}/api/auth/session",
@@ -1225,7 +1516,7 @@ def fetch_candidate_seat_via_session(
                 "Accept": "application/json",
                 "Origin": BASE,
                 "Referer": f"{BASE}/",
-                "oai-device-id": _workspace_device_id(wid),
+                "oai-device-id": candidate_device,
             },
             timeout=30,
         )
@@ -1405,12 +1696,12 @@ def _ensure_candidate_usage_based(workspace_db_id: int, email: str, row: dict | 
 
 
 def _candidate_trash_action(workspace_db_id: int) -> str:
-    """入箱前置动作：seat = 席位切为 Codex（默认）；kick = 直接从空间踢出成员。"""
+    """入箱前置动作：seat = 席位切为 Codex（默认）；kick = 母号踢出成员；leave = 成员主动退出。"""
     try:
-        value = str(db.get_workspace_settings(workspace_db_id).get("trash_action") or "seat")
+        value = str(db.get_workspace_settings(workspace_db_id).get("trash_action") or "seat").strip().lower()
     except Exception:
         return "seat"
-    return "kick" if value.strip().lower() == "kick" else "seat"
+    return value if value in {"kick", "leave"} else "seat"
 
 
 def _trash_candidate_via_kick(
@@ -1471,12 +1762,73 @@ def _trash_candidate_via_kick(
     return {"ok": True, "action": "kick", "result": result}
 
 
+def _trash_candidate_via_leave(
+    workspace_db_id: int,
+    email: str,
+    row: dict | None = None,
+    reason: str = "",
+    retries: int = 3,
+) -> dict:
+    """前置动作=成员主动退出：用成员自己的空间凭证调移除接口后才按入箱落库。
+
+    与踢出模式同一入箱契约：退出未被远端确认时不写垃圾箱状态，返回
+    pending_seat 复用席位模式的重新排期语义。成员侧请求必须走候选人
+    代理（CPA 家宽优先），空代理池直接失败转重试，绝不回落母号出口。
+    成员退出后其空间凭证即被吊销，mark_workspace_candidates_kicked 会
+    同步删掉本地空间凭证，与踢出模式共用同一份本地落库。
+    """
+    member_id = str((row or {}).get("member_id") or "").strip()
+    result: dict = {}
+    last_error = ""
+    attempts = max(1, int(retries or 1))
+    for attempt in range(attempts):
+        try:
+            proxy = _lease_member_side_proxy(workspace_db_id, email, detail="trash_member_leave")
+            result = member_leave_workspace(workspace_db_id, email, member_id, proxy=proxy)
+            last_error = ""
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)[:240]
+            logger.warning(
+                "成员退出模式入箱失败 workspace_db_id=%s email=%s attempt=%s/%s",
+                workspace_db_id, email, attempt + 1, attempts,
+                exc_info=True,
+            )
+            # member_id 可能是过期快照：下次清空后由 member_leave_workspace
+            # 重新从成员列表解析（人真不在时得到 already_gone）。
+            member_id = ""
+            if attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+    if last_error:
+        return {"ok": False, "pending_seat": True, "error": last_error, "action": "leave"}
+    if not (result.get("left") or result.get("already_gone")):
+        return {
+            "ok": False,
+            "pending_seat": True,
+            "error": "成员退出空间未被远端确认，不移入垃圾箱",
+            "action": "leave",
+            "result": result,
+        }
+    marked = db.mark_workspace_candidates_kicked(
+        workspace_db_id, [email], reason=reason or "left_workspace",
+    )
+    if not marked.get("candidates"):
+        return {
+            "ok": False,
+            "pending_seat": False,
+            "error": "候选关系不存在或母号已删除，不执行入箱",
+            "action": "leave",
+        }
+    _cleanup_cpa_credential_after_trash(workspace_db_id, email, reason)
+    return {"ok": True, "action": "leave", "result": result}
+
+
 def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = "", retries: int = 3) -> dict:
     """将单个候选人移入垃圾箱。
 
     前置动作由空间设置 trash_action 决定："seat"=席位切到 usage_based
-    （成员留在空间）；"kick"=直接从空间踢出成员。只有前置动作被远端
-    确认后才写本地垃圾箱状态。
+    （成员留在空间）；"kick"=母号直接把成员踢出空间；"leave"=成员用
+    自己的凭证主动退出空间。只有前置动作被远端确认后才写本地垃圾箱状态。
     """
     email = str(email or "").strip().lower()
     if not email:
@@ -1484,8 +1836,13 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
     if not db.get_workspace_master(workspace_db_id):
         return {"ok": False, "pending_seat": False, "error": "母号不存在，不执行入箱"}
     row = db.get_workspace_candidate(workspace_db_id, email) or {}
-    if _candidate_trash_action(workspace_db_id) == "kick":
+    action = _candidate_trash_action(workspace_db_id)
+    if action == "kick":
         return _trash_candidate_via_kick(
+            workspace_db_id, email, row=row, reason=reason, retries=retries,
+        )
+    if action == "leave":
+        return _trash_candidate_via_leave(
             workspace_db_id, email, row=row, reason=reason, retries=retries,
         )
     try:
@@ -1537,9 +1894,11 @@ def trash_workspace_candidate(workspace_db_id: int, email: str, reason: str = ""
 
 
 # 只有「额度耗尽 / 凭证永久失效」这类自动化入箱才联动删除 CPA 凭证；
-# 手动入箱（manual_trash）和踢出（kicked）不动 CPA，由用户自行处置；
+# 手动操作（manual_trash / 手动踢出 kicked / 手动退出 left_workspace）
+# 默认不动 CPA，空间设置 trash_cleanup_cpa_on_manual 打开后才联动；
 # 各种 *_retry 是排期占位状态，不走到这里。
 _CPA_TRASH_CLEANUP_REASONS = {"quota_zero", "quota_403", "login_403", "account_invalid"}
+_MANUAL_TRASH_REASONS = {"manual_trash", "manual", "kicked", "left_workspace", "api_trash"}
 
 
 def _cleanup_cpa_credential_after_trash(workspace_db_id: int, email: str, reason: str) -> None:
@@ -1548,11 +1907,19 @@ def _cleanup_cpa_credential_after_trash(workspace_db_id: int, email: str, reason
     无论 CPA 删除结果如何（成功 / 404 找不到 / 请求失败）都释放代理绑定——
     该账号已入箱，绑定留在本地只会让池计数虚高；找不到文件按约定也计数-1。
     """
-    if str(reason or "").strip() not in _CPA_TRASH_CLEANUP_REASONS:
+    reason_key = str(reason or "").strip()
+    try:
+        ws_settings = db.get_workspace_settings(workspace_db_id) or {}
+    except Exception:
+        ws_settings = {}
+    allowed = reason_key in _CPA_TRASH_CLEANUP_REASONS or (
+        reason_key in _MANUAL_TRASH_REASONS
+        and bool(ws_settings.get("trash_cleanup_cpa_on_manual"))
+    )
+    if not allowed:
         return
     try:
         cfg = dict((db.get_export_internal_config() or {}).get("cpa") or {})
-        ws_settings = db.get_workspace_settings(workspace_db_id)
         for setting_key, cfg_key in (
             ("auto_push_cpa_url", "cpa_url"),
             ("auto_push_cpa_mgmt_key", "cpa_mgmt_key"),
@@ -1597,7 +1964,11 @@ def trash_workspace_candidates_by_email(
     *,
     respect_invalid_settings: bool = False,
 ) -> dict:
-    """将该邮箱在所有母号空间中的候选关系都移入垃圾箱。"""
+    """将该邮箱在所有母号空间中的候选关系都移入垃圾箱。
+
+    本函数只被自动化链路调用（停用收尾/失效回收），白名单账号直接跳过；
+    手动入箱走 ``trash_workspace_candidate`` 单条入口，不受白名单约束。
+    """
     key = str(email or "").strip().lower()
     if not key:
         return {"ok": False, "error": "email 不能为空"}
@@ -1606,6 +1977,9 @@ def trash_workspace_candidates_by_email(
     for row in rows:
         workspace_db_id = int(row.get("workspace_master_id") or 0)
         if not workspace_db_id:
+            continue
+        if int(row.get("trash_whitelist") or 0):
+            results.append({"workspace_db_id": workspace_db_id, "ok": True, "skipped": True, "whitelisted": True})
             continue
         if respect_invalid_settings and not db.get_workspace_settings(workspace_db_id).get(
             "trash_invalid_enabled", True,

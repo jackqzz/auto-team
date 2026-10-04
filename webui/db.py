@@ -203,6 +203,43 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_public_relogin_penalty_scope
             ON public_relogin_penalty(scope, subject);
+
+        -- 注册追溯：每个账号一行，独立于 registered 凭证表。
+        -- registered 承载「当前凭证」，INSERT OR REPLACE 会整行覆盖 created_at，
+        -- 且账号被删除后行就没了；追溯要的是首次注册时间 / 出口 IP / 失败
+        -- 累计这些【历史事实】，凭证行的生命周期不该影响它，所以单开一张表。
+        -- 失败计数也覆盖「注册失败、从未成功过」的账号（registered 里查不到）。
+        CREATE TABLE IF NOT EXISTS register_trace (
+            email              TEXT PRIMARY KEY,
+            register_ip        TEXT NOT NULL DEFAULT '',
+            register_region    TEXT NOT NULL DEFAULT '',
+            register_mode      TEXT NOT NULL DEFAULT '',
+            register_timezone  TEXT NOT NULL DEFAULT '',
+            register_language  TEXT NOT NULL DEFAULT '',
+            registered_at      REAL,
+                            -- 首次成功注册时间；只设一次，重跑不覆盖
+            last_success_at    REAL,
+            fail_count         INTEGER NOT NULL DEFAULT 0,
+            last_fail_at       REAL,
+            last_fail_error    TEXT NOT NULL DEFAULT '',
+            last_fail_category TEXT NOT NULL DEFAULT '',
+            last_run_id        TEXT NOT NULL DEFAULT '',
+            created_at         REAL NOT NULL,
+            updated_at         REAL NOT NULL
+        );
+
+        -- 个人空间（Free 账号池）：从 registered 划入的免费账号。
+        -- 与 workspace_candidates 对应但去掉所有 Team 语义——没有母号、
+        -- 没有席位、没有上游成员关系；凭证直接读 registered 的个人 token。
+        CREATE TABLE IF NOT EXISTS personal_candidates (
+            email           TEXT PRIMARY KEY,
+            trash_status    TEXT NOT NULL DEFAULT 'active',
+            trash_due_at    REAL NOT NULL DEFAULT 0,
+            trash_reason    TEXT NOT NULL DEFAULT '',
+            quota_json      TEXT,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL
+        );
     """)
     con.execute(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('proxy_usage_since', ?)",
@@ -239,6 +276,12 @@ def init_db():
         ("seat_cost", "TEXT NOT NULL DEFAULT ''"),
         ("renewal_date", "TEXT NOT NULL DEFAULT ''"),
         ("settings_json", "TEXT NOT NULL DEFAULT '{}'"),
+        # OpenAI 现在把会话绑定到登录时的设备指纹（oai-device-id/UA）：
+        # 指纹不匹配时 /api/auth/session 只会返回已失效会话的缓存 token，
+        # 管理请求拿到就是 401 token_invalidated。导入的 session JSON 自带
+        # statsigContext.deviceId/userAgent，落库后在管理请求里原样回放。
+        ("device_id", "TEXT NOT NULL DEFAULT ''"),
+        ("user_agent", "TEXT NOT NULL DEFAULT ''"),
     ):
         if col not in workspace_cols:
             con.execute(f"ALTER TABLE workspace_masters ADD COLUMN {col} {definition}")
@@ -265,6 +308,7 @@ def init_db():
         ("trash_status", "TEXT NOT NULL DEFAULT 'active'"),
         ("trash_due_at", "REAL"),
         ("trash_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("trash_whitelist", "INTEGER NOT NULL DEFAULT 0"),
         ("tag_status", "TEXT NOT NULL DEFAULT 'active'"),
         ("tags", "TEXT NOT NULL DEFAULT '[]'"),
     ):
@@ -470,6 +514,34 @@ def init_db():
     )
     con.commit()
 
+    # ── register_trace 历史回填 ──
+    # 老库里的 registered 行补上注册方式/指纹/注册时间（registered_at 用
+    # created_at 近似 —— 老数据没有更准的源）。两条语句幂等：每次都跑，
+    # 第二条用 MAX 收敛到「runs 里能数出来的失败次数」，不会重复累计。
+    con.execute(
+        """INSERT OR IGNORE INTO register_trace
+            (email, register_mode, register_timezone, register_language,
+             registered_at, last_success_at, created_at, updated_at)
+           SELECT email, register_mode, register_timezone, register_language,
+                  created_at, created_at, created_at, created_at
+             FROM registered WHERE email <> ''"""
+    )
+    # runs 表不区分注册 run 和仅登录 run，历史失败次数只能按 email 全量计入，
+    # 会把历史登录失败也算进来 —— 接受这点偏差换取老账号的失败历史不清零。
+    # 新失败一边自增 fail_count 一边落 runs 行，启动时 MAX 重算仍收敛一致。
+    con.execute(
+        """INSERT INTO register_trace
+            (email, fail_count, last_fail_at, created_at, updated_at)
+           SELECT email, COUNT(*), MAX(COALESCE(finished_at, started_at)),
+                  MIN(started_at), MAX(COALESCE(finished_at, started_at))
+             FROM runs WHERE status='failed' AND email <> '' GROUP BY email
+           ON CONFLICT(email) DO UPDATE SET
+              fail_count=MAX(register_trace.fail_count, excluded.fail_count),
+              last_fail_at=MAX(COALESCE(register_trace.last_fail_at, 0),
+                               excluded.last_fail_at)"""
+    )
+    con.commit()
+
 
 # ──────────────────────── Team 工作空间母号 ────────────────────────
 
@@ -579,9 +651,21 @@ def _workspace_import_rows(text: str, default_proxy: str = "") -> list[dict]:
             account = f"母号-{digest}"
         if "@" in account:
             account = account.lower()
+        # 会话 JSON（/api/auth/session 导出）的 statsigContext 记录了登录时
+        # 的设备指纹；也兼容顶层 device_id/userAgent 字段。
+        statsig = metadata.get("statsigContext") if isinstance(metadata.get("statsigContext"), dict) else {}
+        device_id = str(
+            metadata.get("device_id") or metadata.get("deviceId")
+            or metadata.get("oai_device_id") or statsig.get("deviceId") or ""
+        ).strip()
+        user_agent = str(
+            metadata.get("user_agent") or metadata.get("userAgent")
+            or statsig.get("userAgent") or ""
+        ).strip()
         rows.append({"account": account[:255], "email": account[:255],
                      "workspace_id": workspace_id[:255], "access_token": access_token,
-                     "session_token": session, "proxy_url": proxy})
+                     "session_token": session, "proxy_url": proxy,
+                     "device_id": device_id[:255], "user_agent": user_agent[:500]})
     if errors:
         raise ValueError("；".join(errors))
     if not rows:
@@ -597,16 +681,19 @@ def import_workspace_sessions(text: str, proxy: str = "") -> dict:
         con = _conn()
         for item in rows:
             old = con.execute(
-                "SELECT id, account, email, workspace_id, access_token, session_token, proxy_url FROM workspace_masters "
+                "SELECT id, account, email, workspace_id, access_token, session_token, proxy_url, device_id, user_agent FROM workspace_masters "
                 "WHERE account=? OR session_token=? ORDER BY account=? DESC LIMIT 1",
                 (item["account"], item["session_token"], item["account"]),
             ).fetchone()
+            # 旧格式导入不带指纹时保留已有指纹；新导入带了就更新。
+            item_device_id = item["device_id"] or (old["device_id"] if old else "")
+            item_user_agent = item["user_agent"] or (old["user_agent"] if old else "")
             if old is None:
                 con.execute(
                     "INSERT INTO workspace_masters"
-                    "(account, email, workspace_id, access_token, session_token, proxy_url, status, imported_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, 'imported', ?, ?)",
-                    (item["account"], item["email"], item["workspace_id"], item["access_token"], item["session_token"], item["proxy_url"], now, now),
+                    "(account, email, workspace_id, access_token, session_token, proxy_url, device_id, user_agent, status, imported_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?)",
+                    (item["account"], item["email"], item["workspace_id"], item["access_token"], item["session_token"], item["proxy_url"], item_device_id, item_user_agent, now, now),
                 )
                 inserted += 1
             elif (
@@ -616,13 +703,15 @@ def import_workspace_sessions(text: str, proxy: str = "") -> dict:
                 and old["access_token"] == item["access_token"]
                 and old["session_token"] == item["session_token"]
                 and old["proxy_url"] == item["proxy_url"]
+                and old["device_id"] == item_device_id
+                and old["user_agent"] == item_user_agent
             ):
                 skipped += 1
             else:
                 con.execute(
                     "UPDATE workspace_masters SET account=?, email=?, workspace_id=?, access_token=?, session_token=?, proxy_url=?, "
-                    "status='imported', updated_at=? WHERE id=?",
-                    (item["account"], item["email"], item["workspace_id"], item["access_token"], item["session_token"], item["proxy_url"], now, old["id"]),
+                    "device_id=?, user_agent=?, status='imported', updated_at=? WHERE id=?",
+                    (item["account"], item["email"], item["workspace_id"], item["access_token"], item["session_token"], item["proxy_url"], item_device_id, item_user_agent, now, old["id"]),
                 )
                 updated += 1
         con.commit()
@@ -637,7 +726,7 @@ def list_workspace_masters(limit: int = 20, offset: int = 0) -> list[dict]:
     rows = _conn().execute(
         "SELECT id, account, email, workspace_id, seats_in_use, seats_entitled, seats_default, seats_default_entitled, seats_usage_based, seats_prolite, seats_prolite_entitled, seats_default_available, seats_prolite_available, seats_default_held, seats_prolite_held, will_renew, is_delinquent, seat_cost, renewal_date, status, length(session_token) AS session_len, "
         "substr(session_token, 1, 8) AS session_head, "
-        "substr(session_token, -6) AS session_tail, proxy_url, imported_at, updated_at "
+        "substr(session_token, -6) AS session_tail, proxy_url, device_id, imported_at, updated_at "
         "FROM workspace_masters ORDER BY updated_at DESC LIMIT ? OFFSET ?",
         (max(1, min(int(limit), 200)), max(0, int(offset))),
     ).fetchall()
@@ -646,6 +735,7 @@ def list_workspace_masters(limit: int = 20, offset: int = 0) -> list[dict]:
         item = dict(row)
         item["session_preview"] = f'{item.pop("session_head")}…{item.pop("session_tail")}'
         item["proxy_preview"] = _mask_proxy(item.pop("proxy_url", ""))
+        item["has_device_fingerprint"] = bool((item.pop("device_id", "") or "").strip())
         out.append(item)
     return out
 
@@ -698,6 +788,8 @@ _WORKSPACE_SETTINGS_DEFAULTS = {
     # 空间专属的 CPA 推送配置；每项留空都跟随全局导出配置。
     "auto_push_cpa_url": "",
     "auto_push_cpa_mgmt_key": "",
+    # 推送进 CPA 的账号优先级（凭证 JSON 的 priority 字段），可为负数，默认 0。
+    "auto_push_cpa_priority": 0,
     # CPA 静态家宽代理池：默认关闭；启用后推送 CPA（含手动推送）时给凭证
     # JSON 写 proxy_url，按租用计数最少取用；与全局/空间候选人代理池完全独立。
     "cpa_static_proxy_enabled": False,
@@ -1143,6 +1235,7 @@ def list_workspace_candidates(workspace_master_id: int = 0) -> list[dict]:
                      COALESCE(c.trash_status, 'active') AS trash_status,
                      COALESCE(c.trash_due_at, 0) AS trash_due_at,
                      COALESCE(c.trash_reason, '') AS trash_reason,
+                     COALESCE(c.trash_whitelist, 0) AS trash_whitelist,
                      """ + join_status_expr + """ AS workspace_join_status,
                      c.created_at, c.updated_at,
                      r.password, r.access_token, r.session_token, r.refresh_token,
@@ -1297,6 +1390,7 @@ def list_workspace_candidate_options(
         COALESCE(c.trash_status, 'active') AS trash_status,
         COALESCE(c.trash_due_at, 0) AS trash_due_at,
         COALESCE(c.trash_reason, '') AS trash_reason,
+        COALESCE(c.trash_whitelist, 0) AS trash_whitelist,
         COALESCE(c.tag_status, 'active') AS tag_status,
         COALESCE(c.tags, '[]') AS tags,
         """ + join_status_expr + """ AS workspace_join_status,
@@ -1319,12 +1413,14 @@ def list_workspace_candidate_options(
         rc.code AS redeem_code,
         CASE WHEN rc.code IS NULL THEN 0 ELSE 1 END AS has_redeem_code,
         COALESCE(pl.proxy, '') AS cpa_proxy,
+        COALESCE(rt.registered_at, r.created_at) AS registered_at,
         1 AS assigned
         FROM registered r JOIN workspace_candidates c
           ON c.email=r.email
         LEFT JOIN workspace_credentials wc ON wc.email=r.email AND wc.workspace_master_id=?
         LEFT JOIN redeem_codes rc ON rc.workspace_master_id=c.workspace_master_id AND rc.email=c.email
         LEFT JOIN cpa_proxy_leases pl ON pl.workspace_master_id=c.workspace_master_id AND pl.email=c.email
+        LEFT JOIN register_trace rt ON rt.email=r.email
         WHERE """ + where.replace("c.workspace_master_id=?", "c.workspace_master_id=?") + " ORDER BY r.created_at DESC"
     # workspace id 同时用于 JOIN 左表和过滤条件。
     query_args = [int(workspace_master_id), *args]
@@ -1594,6 +1690,7 @@ def list_workspace_candidate_trash_due(now: float | None = None) -> list[dict]:
          WHERE c.trash_status='scheduled'
            AND COALESCE(c.trash_due_at, 0) > 0
            AND c.trash_due_at <= ?
+           AND COALESCE(c.trash_whitelist, 0) = 0
          ORDER BY c.trash_due_at ASC, c.updated_at ASC
         """,
         (now,),
@@ -1610,6 +1707,7 @@ def list_invalid_workspace_candidates_pending_trash(limit: int = 500) -> list[di
           JOIN workspace_masters m ON m.id=c.workspace_master_id
          WHERE r.account_status='permanently_invalid'
            AND COALESCE(c.trash_status, 'active')<>'trashed'
+           AND COALESCE(c.trash_whitelist, 0) = 0
          ORDER BY c.updated_at ASC
          LIMIT ?
         """,
@@ -1674,7 +1772,11 @@ def restore_workspace_candidates_from_trash(
     workspace_master_id: int,
     emails: list[str],
 ) -> int:
-    """Restore trashed candidate relationships without changing their seat or join state."""
+    """Restore trashed candidate relationships without changing their seat or join state.
+
+    手动移出垃圾箱的账号自动加入垃圾箱白名单：防止刚恢复就被下一轮
+    自动回收扫回去；白名单可在候选管理里手动关掉。
+    """
     cleaned = sorted({str(email or "").strip().lower() for email in emails if str(email or "").strip()})
     if not cleaned:
         return 0
@@ -1684,13 +1786,57 @@ def restore_workspace_candidates_from_trash(
         rc = con.execute(
             f"""
             UPDATE workspace_candidates
-               SET trash_status='active', trash_due_at=0, trash_reason='', updated_at=?
+               SET trash_status='active', trash_due_at=0, trash_reason='',
+                   trash_whitelist=1, updated_at=?
              WHERE workspace_master_id=?
                AND email IN ({marks})
                AND trash_status='trashed'
             """,
             [time.time(), int(workspace_master_id), *cleaned],
         )
+        con.commit()
+        return rc.rowcount
+
+
+def set_workspace_candidates_trash_whitelist(
+    workspace_master_id: int,
+    emails: list[str],
+    *,
+    enabled: bool,
+) -> int:
+    """设置垃圾箱白名单开关，返回实际更新的行数。
+
+    开启时顺带撤掉这些账号挂起的入箱排期（scheduled→active、due_at 清零）；
+    已入箱的行保持 trashed 不动——白名单防的是未来的自动回收，不替代恢复操作。
+    """
+    cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
+    if not cleaned or not int(workspace_master_id or 0):
+        return 0
+    marks = ",".join("?" * len(cleaned))
+    now = time.time()
+    with _lock:
+        con = _conn()
+        if enabled:
+            rc = con.execute(
+                f"""
+                UPDATE workspace_candidates
+                   SET trash_whitelist=1,
+                       trash_status=CASE WHEN trash_status='scheduled' THEN 'active' ELSE trash_status END,
+                       trash_due_at=CASE WHEN trash_status='scheduled' THEN 0 ELSE trash_due_at END,
+                       updated_at=?
+                 WHERE workspace_master_id=? AND email IN ({marks})
+                """,
+                [now, int(workspace_master_id), *cleaned],
+            )
+        else:
+            rc = con.execute(
+                f"""
+                UPDATE workspace_candidates
+                   SET trash_whitelist=0, updated_at=?
+                 WHERE workspace_master_id=? AND email IN ({marks})
+                """,
+                [now, int(workspace_master_id), *cleaned],
+            )
         con.commit()
         return rc.rowcount
 
@@ -2729,8 +2875,9 @@ def save_registered(d: dict) -> None:
                 totp_secret = existing_row["totp_secret"]
                 # factor_id 跟着 secret 走：本轮没绑就沿用旧的
                 totp_factor_id = totp_factor_id or (existing_row["totp_factor_id"] or "")
-            # 注册方式是账号的既定事实：本轮没带值不清空，带了就更新
-            # （同一邮箱换模式重跑时应如实刷新）。
+            # 注册方式是账号的既定事实：本轮没带值不清空，带了就更新。
+            # registrar 只在「真注册」run 里带值（仅登录/已有账号登录链都不带），
+            # 所以这里不会出现「协议登录把 camoufox 刷成 protocol」的覆盖。
             if not register_mode:
                 register_mode = (existing_row["register_mode"] or "")
             # 注册时区/语言同理：协议注册/仅登录本轮没有浏览器指纹，
@@ -2807,6 +2954,256 @@ def update_registered_oauth_tokens(
         )
         con.commit()
         return rc.rowcount > 0
+
+
+# ──────────────────────── 注册追溯 ────────────────────────
+
+
+def record_register_failure(
+    email: str,
+    run_id: str = "",
+    error: str = "",
+    category: str = "",
+) -> None:
+    """一次注册语义的 run 失败：累计 fail_count 并记下最近一次失败详情。
+
+    只在「注册」任务里调（仅登录/凭证获取不是注册事件，不计入）。
+    与 runs 表互补：runs 是一 run 一行的事件流，这里是按账号累计的持久计数，
+    且对「失败到从未成功、registered 里没行」的账号同样生效。
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    now = time.time()
+    with _lock:
+        con = _conn()
+        con.execute(
+            "INSERT INTO register_trace "
+            "(email, fail_count, last_fail_at, last_fail_error, last_fail_category, "
+            " last_run_id, created_at, updated_at) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET "
+            "fail_count=register_trace.fail_count+1, "
+            "last_fail_at=excluded.last_fail_at, "
+            "last_fail_error=excluded.last_fail_error, "
+            "last_fail_category=excluded.last_fail_category, "
+            "last_run_id=excluded.last_run_id, "
+            "updated_at=excluded.updated_at",
+            (email, now, (error or "")[:500], str(category or ""),
+             str(run_id or ""), now, now),
+        )
+        con.commit()
+
+
+def record_register_success(
+    email: str,
+    run_id: str = "",
+    mode: str = "",
+    ip: str = "",
+    region: str = "",
+    timezone: str = "",
+    language: str = "",
+    register_event: bool = True,
+) -> None:
+    """注册语义的 run 成功时写追溯行。
+
+    ``register_event=True`` 表示本轮真的执行了新注册（非仅登录、非服务端识别
+    为已有账号后走登录链）：出口 IP/地区/注册方式/时区/语言 与 registered_at
+    只在此时落值 —— 这些字段是「注册那一刻的事实」，登录性质的 run 提供的
+    值不算数。register_event=False 时只更新 last_success_at/last_run_id，
+    绝不覆盖已记录的注册事实（camoufox 注册的号跑协议登录不能刷成 protocol）。
+
+    各字段均为「非空才覆盖」语义：本轮没带值不清空历史值。
+    registered_at 只保留最早一次（COALESCE），重跑注册不刷新。
+    """
+    email = str(email or "").strip().lower()
+    if not email:
+        return
+    now = time.time()
+    ip = str(ip or "").strip()
+    region = str(region or "").strip()
+    mode = str(mode or "").strip().lower()
+    if mode not in {"protocol", "camoufox", "import"}:
+        mode = ""
+    timezone = str(timezone or "").strip()
+    language = str(language or "").strip()
+    with _lock:
+        con = _conn()
+        if register_event:
+            con.execute(
+                "INSERT INTO register_trace "
+                "(email, register_ip, register_region, register_mode, register_timezone, "
+                " register_language, registered_at, last_success_at, last_run_id, "
+                " created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(email) DO UPDATE SET "
+                "register_ip=CASE WHEN excluded.register_ip<>'' "
+                "  THEN excluded.register_ip ELSE register_trace.register_ip END, "
+                "register_region=CASE WHEN excluded.register_region<>'' "
+                "  THEN excluded.register_region ELSE register_trace.register_region END, "
+                "register_mode=CASE WHEN excluded.register_mode<>'' "
+                "  THEN excluded.register_mode ELSE register_trace.register_mode END, "
+                "register_timezone=CASE WHEN excluded.register_timezone<>'' "
+                "  THEN excluded.register_timezone ELSE register_trace.register_timezone END, "
+                "register_language=CASE WHEN excluded.register_language<>'' "
+                "  THEN excluded.register_language ELSE register_trace.register_language END, "
+                "registered_at=COALESCE(register_trace.registered_at, excluded.registered_at), "
+                "last_success_at=excluded.last_success_at, "
+                "last_run_id=excluded.last_run_id, "
+                "updated_at=excluded.updated_at",
+                (email, ip, region, mode, timezone, language,
+                 now, now, str(run_id or ""), now, now),
+            )
+        else:
+            con.execute(
+                "INSERT INTO register_trace "
+                "(email, last_success_at, last_run_id, created_at, updated_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(email) DO UPDATE SET "
+                "last_success_at=excluded.last_success_at, "
+                "last_run_id=excluded.last_run_id, "
+                "updated_at=excluded.updated_at",
+                (email, now, str(run_id or ""), now, now),
+            )
+        con.commit()
+
+
+def get_register_trace(email: str) -> Optional[dict]:
+    """按邮箱取注册追溯行；没有记录返回 None。"""
+    con = _conn()
+    row = con.execute(
+        "SELECT * FROM register_trace WHERE email=?",
+        ((email or "").strip().lower(),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+# 列表/批量/详情共用的追溯 SELECT：trace 全字段 + registered 概要
+# （分组/邮箱类型/账号状态/是否已有凭证行），不带任何凭证密文。
+_TRACE_LIST_SELECT = """
+    SELECT t.*,
+           COALESCE(r.group_name, '')    AS group_name,
+           COALESCE(r.mail_kind, '')     AS mail_kind,
+           COALESCE(r.account_status, '') AS account_status,
+           (r.email IS NOT NULL)          AS has_credentials
+      FROM register_trace t
+      LEFT JOIN registered r ON r.email = t.email
+"""
+
+
+def list_register_traces(
+    limit: int = 200,
+    offset: int = 0,
+    email: str = "",
+    only_failed: bool = False,
+) -> list[dict]:
+    """注册追溯列表（供外部程序查询）。
+
+    ``email`` 是子串过滤；``only_failed`` 只列出有过失败记录的账号。
+    """
+    conditions: list[str] = []
+    args: list = []
+    em = (email or "").strip().lower()
+    if em:
+        conditions.append("t.email LIKE ?")
+        args.append(f"%{em}%")
+    if only_failed:
+        conditions.append("t.fail_count > 0")
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    con = _conn()
+    cur = con.execute(
+        f"{_TRACE_LIST_SELECT} {where} "
+        f"ORDER BY COALESCE(t.registered_at, t.created_at) DESC "
+        f"LIMIT ? OFFSET ?",
+        [*args, limit, offset],
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def count_register_traces(email: str = "", only_failed: bool = False) -> int:
+    conditions: list[str] = []
+    args: list = []
+    em = (email or "").strip().lower()
+    if em:
+        conditions.append("t.email LIKE ?")
+        args.append(f"%{em}%")
+    if only_failed:
+        conditions.append("t.fail_count > 0")
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    con = _conn()
+    cur = con.execute(
+        f"SELECT COUNT(*) FROM register_trace t "
+        f"LEFT JOIN registered r ON r.email = t.email {where}",
+        args,
+    )
+    return cur.fetchone()[0]
+
+
+def get_register_trace_full(email: str) -> Optional[dict]:
+    """单账号追溯详情：trace 行 + registered 概要。
+
+    账号在册但没有 trace 行（理论上不会出现）时，从 registered 合成一条
+    兜底行，保证「账号存在」和「从没被系统见过」两种 404 语义分得开。
+    """
+    em = (email or "").strip().lower()
+    if not em:
+        return None
+    con = _conn()
+    row = con.execute(
+        f"{_TRACE_LIST_SELECT} WHERE t.email=?", (em,),
+    ).fetchone()
+    if row:
+        return dict(row)
+    r = con.execute(
+        "SELECT email, group_name, mail_kind, account_status, register_mode, "
+        "register_timezone, register_language, created_at "
+        "FROM registered WHERE email=?",
+        (em,),
+    ).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    return {
+        "email": em,
+        "register_ip": "",
+        "register_region": "",
+        "register_mode": d.get("register_mode") or "",
+        "register_timezone": d.get("register_timezone") or "",
+        "register_language": d.get("register_language") or "",
+        "registered_at": d.get("created_at"),
+        "last_success_at": None,
+        "fail_count": 0,
+        "last_fail_at": None,
+        "last_fail_error": "",
+        "last_fail_category": "",
+        "last_run_id": "",
+        "created_at": d.get("created_at"),
+        "updated_at": d.get("created_at"),
+        "group_name": d.get("group_name") or "",
+        "mail_kind": d.get("mail_kind") or "",
+        "account_status": d.get("account_status") or "",
+        "has_credentials": 1,
+    }
+
+
+def get_register_traces_by_emails(emails: list[str]) -> dict[str, dict]:
+    """批量按邮箱查追溯。返回 {email: 行}，查不到的 email 不进 map。"""
+    cleaned = sorted({str(e).strip().lower() for e in (emails or []) if str(e).strip()})
+    if not cleaned:
+        return {}
+    con = _conn()
+    out: dict[str, dict] = {}
+    CHUNK = 500
+    for i in range(0, len(cleaned), CHUNK):
+        part = cleaned[i:i + CHUNK]
+        marks = ",".join("?" * len(part))
+        cur = con.execute(
+            f"{_TRACE_LIST_SELECT} WHERE t.email IN ({marks})", part,
+        )
+        for row in cur.fetchall():
+            d = dict(row)
+            out[d["email"]] = d
+    return out
 
 
 def import_sub2api_registered(payload: object, group_name: str = "") -> dict:
@@ -2936,6 +3333,14 @@ def import_sub2api_registered(payload: object, group_name: str = "") -> dict:
                     (mailbox_email, mailbox_password, mailbox_client_id, mailbox_refresh, time.time()),
                 )
         con.commit()
+    # 导入也落一条追溯：真实注册时间不可得，以导入时刻近似；方式标 import。
+    # ⚠️ 不能放进上面的 _lock 块里：record_register_success 自己会再取锁，
+    #    _lock 非可重入，嵌套调用会死锁。
+    for item in prepared:
+        try:
+            record_register_success(item["email"], mode="import")
+        except Exception:
+            pass
     return {"imported": len(prepared), "skipped": 0}
 
 
@@ -3025,6 +3430,11 @@ def import_2fa_registered(text: str, group_name: str = "") -> dict:
             else:
                 imported += 1
         con.commit()
+    for item in prepared:
+        try:
+            record_register_success(item["email"], mode="import")
+        except Exception:
+            pass
     return {"imported": imported, "updated": updated, "total": len(prepared)}
 
 
@@ -3372,57 +3782,88 @@ def get_workspace_candidate_seat_type(workspace_master_id: int, email: str) -> s
     return str(row["seat_type"] or "") if row else ""
 
 
-def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[str, list]:
-    conditions: list[str] = []
-    args: list = []
-    banned_check = "(COALESCE(CASE WHEN json_valid(extra_json) THEN json_extract(extra_json, '$.plus_check.status') ELSE '' END, '')='banned')"
+def _registered_condition_clause(filt: str) -> str:
+    """单个筛选标签的 WHERE 片段。空串 = 该标签不加约束（all / 未知值）。"""
+    banned_check = "(COALESCE(CASE WHEN json_valid(r.extra_json) THEN json_extract(r.extra_json, '$.plus_check.status') ELSE '' END, '')='banned')"
     if filt == "has_at":
-        conditions.append(
-            f"COALESCE(account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
-            "AND length(COALESCE(access_token, '')) > 0"
+        return (
+            f"COALESCE(r.account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
+            "AND length(COALESCE(r.access_token, '')) > 0"
         )
-    elif filt == "no_at":
+    if filt == "no_at":
         # 只列还能补 AT 的号：永久失效/封号的号补不回来，全选后批量重登录会白跑。
-        conditions.append(
-            f"COALESCE(account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
-            "AND length(COALESCE(access_token, '')) = 0"
+        return (
+            f"COALESCE(r.account_status, 'active') <> 'permanently_invalid' AND NOT {banned_check} "
+            "AND length(COALESCE(r.access_token, '')) = 0"
         )
-    elif filt == "has_rt":
-        conditions.append("length(refresh_token) > 0")
-    elif filt == "no_rt":
-        conditions.append("coalesce(length(refresh_token),0) = 0")
-    elif filt == "unchecked":
-        conditions.append("(extra_json IS NULL OR extra_json NOT LIKE '%\"plus_check\"%')")
-    elif filt == "free":
-        conditions.append("extra_json LIKE '%\"free\"%'")
-    elif filt == "plus":
-        conditions.append("(extra_json LIKE '%\"plus_eligible\"%' OR extra_json LIKE '%\"plus_active\"%')")
-    elif filt == "plus_active":
-        conditions.append(
-            "json_valid(extra_json) AND json_extract(extra_json, '$.plus_check.status')='plus_active'"
+    if filt == "has_rt":
+        return "length(r.refresh_token) > 0"
+    if filt == "no_rt":
+        return "coalesce(length(r.refresh_token),0) = 0"
+    if filt == "unchecked":
+        return "(r.extra_json IS NULL OR r.extra_json NOT LIKE '%\"plus_check\"%')"
+    if filt == "free":
+        return "r.extra_json LIKE '%\"free\"%'"
+    if filt == "plus":
+        return "(r.extra_json LIKE '%\"plus_eligible\"%' OR r.extra_json LIKE '%\"plus_active\"%')"
+    if filt == "plus_active":
+        return (
+            "json_valid(r.extra_json) AND json_extract(r.extra_json, '$.plus_check.status')='plus_active'"
         )
-    elif filt == "plus_eligible":
-        conditions.append(
-            "json_valid(extra_json) AND json_extract(extra_json, '$.plus_check.status')='plus_eligible'"
+    if filt == "plus_eligible":
+        return (
+            "json_valid(r.extra_json) AND json_extract(r.extra_json, '$.plus_check.status')='plus_eligible'"
         )
-    elif filt == "banned":
+    if filt == "banned":
         # 兼容旧筛选值；封号与永久失效现在属于同一类型。
-        conditions.append(
-            f"(COALESCE(account_status, 'active')='permanently_invalid' OR {banned_check})"
+        return (
+            f"(COALESCE(r.account_status, 'active')='permanently_invalid' OR {banned_check})"
         )
-    elif filt == "permanently_invalid":
-        conditions.append(
-            f"(COALESCE(account_status, 'active')='permanently_invalid' OR {banned_check})"
+    if filt == "permanently_invalid":
+        return (
+            f"(COALESCE(r.account_status, 'active')='permanently_invalid' OR {banned_check})"
         )
-    elif filt == "token_invalid":
+    if filt == "token_invalid":
         # token_invalid 从 2026-08-10 起会写库，得能筛出来，否则等于埋了：
         # 它既不在 unchecked 里（已有结论），又不在 free/plus/banned 里。
-        conditions.append("extra_json LIKE '%\"token_invalid\"%'")
-    elif filt == "no_workspace":
+        return "r.extra_json LIKE '%\"token_invalid\"%'"
+    if filt == "no_workspace":
         # 还没划分进任何母号空间的注册结果。
-        conditions.append("email NOT IN (SELECT email FROM workspace_candidates)")
+        return "r.email NOT IN (SELECT email FROM workspace_candidates)"
+    return ""
+
+
+def _registered_filter_tokens(filt) -> list[str]:
+    """filter 参数规整：支持 str（逗号分隔）或 iterable；'all'/空值剔除。"""
+    if filt is None:
+        return []
+    if isinstance(filt, str):
+        raw = filt.split(",")
+    else:
+        raw = []
+        for item in filt:
+            raw.extend(str(item).split(","))
+    seen: list[str] = []
+    for tok in raw:
+        tok = str(tok).strip().lower()
+        if not tok or tok == "all" or tok in seen:
+            continue
+        seen.append(tok)
+    return seen
+
+
+def _registered_conditions(filt, group_name: str | None = None) -> tuple[str, list]:
+    # ⚠️ 所有列都要带 r. 前缀：list_registered 会 LEFT JOIN register_trace，
+    # 两表有同名列（email / created_at / register_mode 等），裸列名会报
+    # ambiguous column。count_registered 的 FROM 也用 registered r 别名对齐。
+    conditions: list[str] = []
+    args: list = []
+    for tok in _registered_filter_tokens(filt):
+        clause = _registered_condition_clause(tok)
+        if clause:
+            conditions.append(clause)
     if group_name is not None and group_name != "__all__":
-        conditions.append("group_name=?")
+        conditions.append("r.group_name=?")
         args.append(_normalize_group_name(group_name))
     return (("WHERE " + " AND ".join(conditions)) if conditions else "", args)
 
@@ -3430,7 +3871,7 @@ def _registered_conditions(filt: str, group_name: str | None = None) -> tuple[st
 def count_registered(filter_rt: str = "all", group_name: str | None = None) -> int:
     con = _conn()
     where, args = _registered_conditions(filter_rt, group_name)
-    cur = con.execute(f"SELECT COUNT(*) FROM registered {where}", args)
+    cur = con.execute(f"SELECT COUNT(*) FROM registered r {where}", args)
     return cur.fetchone()[0]
 
 
@@ -3440,17 +3881,23 @@ def list_registered(
 ) -> list[dict]:
     con = _conn()
     where, args = _registered_conditions(filter_rt, group_name)
-    invalid_check = "(COALESCE(account_status, 'active')='permanently_invalid' OR (COALESCE(CASE WHEN json_valid(extra_json) THEN json_extract(extra_json, '$.plus_check.status') ELSE '' END, '')='banned'))"
+    invalid_check = "(COALESCE(r.account_status, 'active')='permanently_invalid' OR (COALESCE(CASE WHEN json_valid(r.extra_json) THEN json_extract(r.extra_json, '$.plus_check.status') ELSE '' END, '')='banned'))"
     cur = con.execute(
-        f"SELECT email, group_name, "
-        f"CASE WHEN {invalid_check} THEN '' ELSE password END AS password, "
-        f"CASE WHEN {invalid_check} THEN '' ELSE totp_secret END AS totp_secret, "
-        f"CASE WHEN {invalid_check} THEN 'permanently_invalid' ELSE account_status END AS account_status, "
-        f"CASE WHEN {invalid_check} THEN 0 ELSE length(access_token) END AS at_len, "
-        f"CASE WHEN {invalid_check} THEN 0 ELSE length(session_token) END AS st_len, "
-        f"CASE WHEN {invalid_check} THEN 0 ELSE length(refresh_token) END AS rt_len, "
-        f"register_mode, register_timezone, register_language, extra_json, created_at FROM registered "
-        f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        f"SELECT r.email, r.group_name, "
+        f"CASE WHEN {invalid_check} THEN '' ELSE r.password END AS password, "
+        f"CASE WHEN {invalid_check} THEN '' ELSE r.totp_secret END AS totp_secret, "
+        f"CASE WHEN {invalid_check} THEN 'permanently_invalid' ELSE r.account_status END AS account_status, "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(r.access_token) END AS at_len, "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(r.session_token) END AS st_len, "
+        f"CASE WHEN {invalid_check} THEN 0 ELSE length(r.refresh_token) END AS rt_len, "
+        f"r.register_mode, r.register_timezone, r.register_language, r.extra_json, r.created_at, "
+        # 注册追溯：出口 IP/地区、首次注册时间、历史失败计数与最近一次失败详情。
+        f"COALESCE(t.register_ip, '') AS register_ip, "
+        f"COALESCE(t.register_region, '') AS register_region, t.registered_at, "
+        f"COALESCE(t.fail_count, 0) AS fail_count, "
+        f"t.last_fail_at, t.last_fail_error, t.last_fail_category "
+        f"FROM registered r LEFT JOIN register_trace t ON t.email = r.email "
+        f"{where} ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
         [*args, limit, offset],
     )
     rows = []
@@ -3680,7 +4127,16 @@ def list_registered_by_emails(emails: list[str]) -> list[dict]:
 
 def get_registered(email: str) -> Optional[dict]:
     con = _conn()
-    cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))
+    cur = con.execute(
+        "SELECT r.*, "
+        "COALESCE(t.register_ip, '') AS register_ip, "
+        "COALESCE(t.register_region, '') AS register_region, "
+        "t.registered_at, COALESCE(t.fail_count, 0) AS fail_count, "
+        "t.last_fail_at, t.last_fail_error, t.last_fail_category, t.last_success_at "
+        "FROM registered r LEFT JOIN register_trace t ON t.email = r.email "
+        "WHERE r.email=?",
+        (email.lower(),),
+    )
     row = cur.fetchone()
     if not row:
         return None
@@ -3849,6 +4305,207 @@ def list_runs(limit: int = 50) -> list[dict]:
         "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,),
     )
     return [dict(r) for r in cur.fetchall()]
+
+
+# ─── 个人空间（Free 账号池）─────────────────────────────────────────────
+
+
+_PERSONAL_SETTINGS_KEY = "personal_space_settings"
+
+
+def get_personal_settings() -> dict:
+    """个人空间（Free 账号池）的运行配置，单例 JSON。"""
+    try:
+        raw = json.loads(get_setting(_PERSONAL_SETTINGS_KEY, "{}") or "{}")
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def update_personal_settings(updates: dict) -> dict:
+    """合并写个人空间配置（传入 None 的键跳过），返回合并后的完整配置。"""
+    current = get_personal_settings()
+    for key, value in (updates or {}).items():
+        if value is None:
+            continue
+        current[key] = value
+    set_setting(_PERSONAL_SETTINGS_KEY, json.dumps(current, ensure_ascii=False))
+    return current
+
+
+# ─── 个人空间成员 ─────────────────────────────────────────────────────
+
+
+def assign_personal_candidates(emails: list[str]) -> int:
+    """把 registered 里的账号划入个人空间。返回本轮实际新增数。
+
+    已存在且未入箱的行不动；入箱过的行恢复成 active（重新启用）。
+    """
+    cleaned = sorted({str(e or "").strip().lower() for e in (emails or []) if str(e or "").strip()})
+    if not cleaned:
+        return 0
+    now = time.time()
+    changed = 0
+    with _lock:
+        con = _conn()
+        existing = {
+            r["email"]: r["trash_status"]
+            for r in con.execute(
+                f"SELECT email, trash_status FROM personal_candidates WHERE email IN ({','.join('?' * len(cleaned))})",
+                cleaned,
+            ).fetchall()
+        }
+        valid = {
+            r["email"]
+            for r in con.execute(
+                f"SELECT email FROM registered WHERE email IN ({','.join('?' * len(cleaned))})",
+                cleaned,
+            ).fetchall()
+        }
+        for email in cleaned:
+            if email not in valid:
+                continue  # 只收 registered 里真实存在的账号
+            if email not in existing:
+                con.execute(
+                    "INSERT INTO personal_candidates(email, trash_status, created_at, updated_at) "
+                    "VALUES (?, 'active', ?, ?)",
+                    (email, now, now),
+                )
+                changed += 1
+            elif existing[email] in {"trashed", "scheduled"}:
+                con.execute(
+                    "UPDATE personal_candidates SET trash_status='active', trash_due_at=0, "
+                    "trash_reason='', updated_at=? WHERE email=?",
+                    (now, email),
+                )
+                changed += 1
+        con.commit()
+    return changed
+
+
+def remove_personal_candidates(emails: list[str]) -> int:
+    cleaned = sorted({str(e or "").strip().lower() for e in (emails or []) if str(e or "").strip()})
+    if not cleaned:
+        return 0
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            f"DELETE FROM personal_candidates WHERE email IN ({','.join('?' * len(cleaned))})",
+            cleaned,
+        )
+        con.commit()
+        return cur.rowcount
+
+
+def list_personal_candidates(
+    trash_status: str = "",
+    keyword: str = "",
+    group_name: str = "",
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict]:
+    """个人空间成员列表：JOIN registered 带出账号态/凭证态。"""
+    clauses = ["1=1"]
+    args: list = []
+    if trash_status:
+        normalized = str(trash_status).strip().lower()
+        if normalized not in {"active", "scheduled", "trashed"}:
+            raise ValueError("trash_status 只能是 active / scheduled / trashed")
+        clauses.append("COALESCE(p.trash_status, 'active')=?")
+        args.append(normalized)
+    if group_name:
+        clauses.append("r.group_name=?")
+        args.append(str(group_name))
+    kw = str(keyword or "").strip()
+    if kw:
+        like = "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        clauses.append("(p.email LIKE ? ESCAPE '\\' OR r.group_name LIKE ? ESCAPE '\\')")
+        args.extend([like, like])
+    sql = f"""SELECT p.email, r.group_name, r.mail_kind,
+        COALESCE(r.account_status, 'active') AS account_status,
+        COALESCE(p.trash_status, 'active') AS trash_status,
+        COALESCE(p.trash_due_at, 0) AS trash_due_at,
+        COALESCE(p.trash_reason, '') AS trash_reason,
+        p.quota_json, p.created_at, p.updated_at,
+        CASE WHEN COALESCE(r.account_status, 'active') <> 'permanently_invalid'
+                  AND length(COALESCE(r.access_token,''))>0 THEN 1 ELSE 0 END AS has_access_token,
+        CASE WHEN length(COALESCE(r.refresh_token,''))>0 THEN 1 ELSE 0 END AS has_refresh_token,
+        CASE WHEN COALESCE(r.account_status, 'active')='permanently_invalid' THEN 'unavailable'
+             WHEN length(COALESCE(r.access_token,''))>0 THEN 'personal_credential'
+             ELSE 'none' END AS credential_status
+        FROM personal_candidates p
+        LEFT JOIN registered r ON r.email = p.email
+        WHERE {' AND '.join(clauses)}
+        ORDER BY p.created_at DESC"""
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        args.extend([max(1, int(limit)), max(0, int(offset))])
+    return [dict(r) for r in _conn().execute(sql, args).fetchall()]
+
+
+def count_personal_candidates(trash_status: str = "active") -> int:
+    row = _conn().execute(
+        "SELECT COUNT(*) AS n FROM personal_candidates WHERE COALESCE(trash_status, 'active')=?",
+        (str(trash_status or "active"),),
+    ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def update_personal_quota(email: str, payload: dict) -> None:
+    email = str(email or "").strip().lower()
+    if not email:
+        return
+    now = time.time()
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE personal_candidates SET quota_json=?, updated_at=? WHERE email=?",
+            (json.dumps(payload, ensure_ascii=False), now, email),
+        )
+        con.commit()
+
+
+def update_personal_candidate_trash(
+    email: str,
+    *,
+    status: str,
+    reason: str = "",
+    due_at: float = 0,
+) -> None:
+    """status: active / scheduled（排期入箱）/ trashed。"""
+    email = str(email or "").strip().lower()
+    normalized = str(status or "").strip().lower()
+    if not email or normalized not in {"active", "scheduled", "trashed"}:
+        return
+    now = time.time()
+    with _lock:
+        con = _conn()
+        con.execute(
+            "UPDATE personal_candidates SET trash_status=?, trash_reason=?, trash_due_at=?, updated_at=? WHERE email=?",
+            (normalized, str(reason or ""), float(due_at or 0), now, email),
+        )
+        con.commit()
+
+
+def get_personal_candidate(email: str) -> dict | None:
+    email = str(email or "").strip().lower()
+    if not email:
+        return None
+    row = _conn().execute(
+        "SELECT * FROM personal_candidates WHERE email=?", (email,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_due_personal_trash(now: float | None = None, limit: int = 50) -> list[str]:
+    """排期到点、待执行入箱的个人空间成员邮箱。"""
+    rows = _conn().execute(
+        "SELECT email FROM personal_candidates "
+        "WHERE trash_status='scheduled' AND trash_due_at>0 AND trash_due_at<=? "
+        "ORDER BY trash_due_at ASC LIMIT ?",
+        (float(now or time.time()), max(1, int(limit))),
+    ).fetchall()
+    return [r["email"] for r in rows]
 
 
 # ──────────────────────── settings (KV) ────────────────────────

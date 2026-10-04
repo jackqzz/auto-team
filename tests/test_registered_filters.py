@@ -154,6 +154,49 @@ class RegisteredFilterTests(unittest.TestCase):
         )
         self.assertEqual([row["email"] for row in eligible], ["eligible-plus@example.com"])
 
+    def test_combined_filters_and_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.db"
+            with patch.object(db, "DB_PATH", path):
+                db.init_db()
+                # a: 有 AT + 有 RT + 已入空间
+                db.save_registered({"email": "a@x.com", "access_token": "t", "refresh_token": "r"})
+                # b: 有 AT + 无 RT + 未入空间
+                db.save_registered({"email": "b@x.com", "access_token": "t", "refresh_token": ""})
+                # c: 无 AT + 未入空间
+                db.save_registered({"email": "c@x.com", "access_token": ""})
+                con = db._conn()
+                con.execute(
+                    "INSERT INTO workspace_masters (account, session_token, imported_at, updated_at)"
+                    " VALUES ('m@x.com', '', 0, 0)"
+                )
+                con.execute(
+                    "INSERT INTO workspace_candidates (workspace_master_id, email, created_at, updated_at)"
+                    " VALUES (1, 'a@x.com', 0, 0)"
+                )
+                con.commit()
+                con.close()
+
+                # 逗号分隔多标签 = AND
+                self.assertEqual(
+                    [r["email"] for r in db.list_registered(filter_rt="has_at,no_workspace")],
+                    ["b@x.com"],
+                )
+                self.assertEqual(db.count_registered(filter_rt="has_at,no_workspace"), 1)
+                # list 形式也行
+                self.assertEqual(
+                    [r["email"] for r in db.list_registered(filter_rt=["has_rt", "no_workspace"])],
+                    [],
+                )
+                self.assertEqual(
+                    [r["email"] for r in db.list_registered(filter_rt=["no_at", "no_workspace"])],
+                    ["c@x.com"],
+                )
+                # 互斥标签同时选 = 空集（前端会拦截，后端语义保持 AND）
+                self.assertEqual(db.count_registered(filter_rt="has_at,no_at"), 0)
+                # 'all' 混在列表里被忽略
+                self.assertEqual(db.count_registered(filter_rt="all,has_at"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1515,6 +1515,14 @@ class AutoLoopController:
                 category = registrar.classify_error(
                     str(e), "login_only" if self._options.get("login_only") else ""
                 )
+                # run 没能起来，registrar 内的失败记录不会触发 —— 这里补记。
+                if not self._options.get("login_only"):
+                    try:
+                        db.record_register_failure(
+                            str(account.get("email") or ""), "", f"启动失败: {e}", category,
+                        )
+                    except Exception:
+                        pass
                 queued = self._finish_with_optional_retry(
                     account, False, category, pooled=pooled,
                 )

@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +107,34 @@ class WorkspaceManualCpaPushTests(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(captured["cfg"]["cpa_url"], "http://space-cpa")
         self.assertEqual(captured["cfg"]["cpa_mgmt_key"], "space-key")
+
+    def test_workspace_priority_flows_into_push_cfg(self):
+        captured, _, _ = self._run({"auto_push_cpa_priority": 7})
+        self.assertEqual(captured["cfg"]["cpa_priority"], 7)
+
+    def test_priority_defaults_to_zero_when_unset(self):
+        captured, _, _ = self._run({})
+        self.assertEqual(captured["cfg"]["cpa_priority"], 0)
+
+    def test_bad_priority_falls_back_to_zero(self):
+        captured, _, _ = self._run({"auto_push_cpa_priority": "not-a-number"})
+        self.assertEqual(captured["cfg"]["cpa_priority"], 0)
+
+    def test_settings_save_accepts_negative_and_null_priority(self):
+        # el-input-number 输入过程可能发 None；负数必须原样保存。
+        for sent, expected in ((-1, -1), (None, 0), (5, 5)):
+            request = app.WorkspaceQuotaScheduleReq(
+                workspace_id=5, auto_push_cpa_priority=sent,
+            )
+            with (
+                patch.object(db, "get_workspace_settings", return_value={}),
+                patch.object(db, "update_workspace_settings") as update_settings,
+            ):
+                app.api_save_workspace_candidate_settings(request)
+            self.assertEqual(
+                update_settings.call_args.args[1]["auto_push_cpa_priority"],
+                expected,
+            )
 
     def test_blank_workspace_settings_fall_back_to_global(self):
         captured, _, _ = self._run({})
@@ -332,3 +361,54 @@ class WorkspaceManualSub2apiPushTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CpaPushPriorityUploadTests(unittest.TestCase):
+    """export_to_cpa 把 cfg 里的优先级写进上传的凭证 JSON。"""
+
+    def _upload(self, cfg_extra):
+        captured = {}
+
+        class FakeMime:
+            def addpart(self, name=None, data=None, filename=None, content_type=None):
+                if name == "file":
+                    captured["data"] = data
+
+        class FakeResp:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return {}
+
+        class FakeCffi:
+            def post(self, *args, **kwargs):
+                return FakeResp()
+
+        cfg = {"cpa_url": "http://cpa", "cpa_mgmt_key": "key", **cfg_extra}
+        with (
+            patch.object(exporter, "_import_cffi", return_value=FakeCffi()),
+            patch.object(exporter, "_import_cffi_mime", return_value=FakeMime),
+        ):
+            out = exporter.export_to_cpa(
+                {"email": "a@example.com", "access_token": "at", "refresh_token": "rt"},
+                cfg,
+            )
+        self.assertTrue(out["ok"])
+        return json.loads(captured["data"].decode("utf-8"))
+
+    def test_workspace_priority_written_into_token_json(self):
+        self.assertEqual(self._upload({"cpa_priority": 9})["priority"], 9)
+
+    def test_missing_priority_uploads_zero(self):
+        self.assertEqual(self._upload({})["priority"], 0)
+
+    def test_parser_accepts_negative_priority(self):
+        self.assertEqual(self._upload({"cpa_priority": -5})["priority"], -5)
+
+    def test_parser_clamps_bad_values(self):
+        self.assertEqual(exporter.cpa_push_priority(5), 5)
+        self.assertEqual(exporter.cpa_push_priority("8"), 8)
+        self.assertEqual(exporter.cpa_push_priority(-3), -3)
+        self.assertEqual(exporter.cpa_push_priority(None), 0)
+        self.assertEqual(exporter.cpa_push_priority("x"), 0)

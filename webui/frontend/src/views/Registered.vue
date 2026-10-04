@@ -36,8 +36,28 @@ const pageSize = ref(20)
 const rows = ref([])
 const total = ref(0)
 const page = ref(1)
-const filter = ref('all')
+const filters = ref([])
 const groupFilter = ref('__all__')
+// 互斥标签：点其中一个自动摘掉另一个（否则 AND 起来必为空）
+const FILTER_EXCLUSIVE = { has_at: 'no_at', no_at: 'has_at', has_rt: 'no_rt', no_rt: 'has_rt' }
+const filterParam = computed(() => (filters.value.length ? filters.value.join(',') : 'all'))
+function toggleFilter(value) {
+  if (value === 'all') {
+    filters.value = []
+    load(true)
+    return
+  }
+  const set = new Set(filters.value)
+  if (set.has(value)) {
+    set.delete(value)
+  } else {
+    set.add(value)
+    const opposite = FILTER_EXCLUSIVE[value]
+    if (opposite) set.delete(opposite)
+  }
+  filters.value = [...set]
+  load(true)
+}
 const groups = ref([])
 const groupManagerVisible = ref(false)
 const selected = ref([])
@@ -86,7 +106,7 @@ async function load(resetPage) {
   loading.value = true
   try {
     const { items, total: t, groups: groupItems } = await listRegistered({
-      limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filter.value,
+      limit: pageSize.value, offset: (page.value - 1) * pageSize.value, filter: filterParam.value,
       group_name: groupFilter.value,
     })
     // 筛选/分组切换可能同时发出多个请求；旧请求晚返回时不能覆盖最新结果。
@@ -112,7 +132,7 @@ function clearSelection() {
 async function selectAllFiltered() {
   try {
     const r = await listRegistered({
-      limit: SELECT_ALL_FETCH_LIMIT, offset: 0, filter: filter.value, group_name: groupFilter.value,
+      limit: SELECT_ALL_FETCH_LIMIT, offset: 0, filter: filterParam.value, group_name: groupFilter.value,
     })
     const all = r.items || []
     const table = registeredTableRef.value
@@ -264,10 +284,7 @@ async function deleteSelected() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteAll() {
-  if (!(await confirm('这会清空注册结果表里的所有凭证！邮箱列表不受影响，确定？'))) return
-  if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
-  try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); clearSelection(); load() }
-  catch (e) { ElMessage.error(e.message) }
+  ElMessage.warning('清空全部注册结果已禁用，请勾选后逐批删除')
 }
 
 async function afterGroupMutate() {
@@ -687,7 +704,7 @@ async function reloginSelected() {
 
 watch(page, () => load())
 watch(pageSize, () => { page.value = 1; clearSelection(); load() })
-watch([filter, groupFilter], () => { clearSelection() })
+watch([filters, groupFilter], () => { clearSelection() })
 watch(dataVersion, () => load())
 onActivated(() => load())
 </script>
@@ -764,8 +781,8 @@ onActivated(() => load())
           ]"
           :key="item.value"
           class="segment-tab-btn"
-          :class="{ active: filter === item.value }"
-          @click="filter = item.value; load(true)"
+          :class="{ active: item.value === 'all' ? !filters.length : filters.includes(item.value) }"
+          @click="toggleFilter(item.value)"
         >
           <Icon :icon="item.icon" class="tab-icon" />
           <span>{{ item.label }}</span>
@@ -952,15 +969,29 @@ onActivated(() => load())
           </template>
         </el-table-column>
 
-        <!-- 注册模式 + 注册时区/语言 -->
-        <el-table-column label="注册模式" width="150">
+        <!-- 注册追溯：注册方式 + 出口 IP/地区 + 首次注册时间 + 累计失败 -->
+        <el-table-column label="注册追溯" width="180">
           <template #default="{ row }">
             <el-tag v-if="row.register_mode === 'camoufox'" type="warning" size="small" effect="plain">Camoufox</el-tag>
             <el-tag v-else-if="row.register_mode === 'protocol'" type="info" size="small" effect="plain">协议</el-tag>
             <el-tag v-else-if="row.register_mode === 'import'" size="small" effect="plain">外部导入</el-tag>
             <span v-else class="sub-hint">—</span>
+            <el-tooltip v-if="row.fail_count" placement="top" :show-after="200">
+              <template #content>
+                最近失败：{{ row.last_fail_at ? fmtTime(row.last_fail_at) : '—' }}
+                <template v-if="row.last_fail_category">（{{ row.last_fail_category }}）</template>
+                <br />{{ row.last_fail_error || '无错误详情' }}
+              </template>
+              <span class="fail-hint">失败 {{ row.fail_count }} 次</span>
+            </el-tooltip>
+            <div v-if="row.register_ip || row.register_region" class="secondary-meta">
+              <span class="sub-hint mono-text">{{ row.register_ip || '—' }}<template v-if="row.register_region"> · {{ row.register_region }}</template></span>
+            </div>
             <div v-if="row.register_timezone || row.register_language" class="secondary-meta">
               <span class="sub-hint">{{ row.register_timezone || '—' }}<template v-if="row.register_language"> · {{ row.register_language }}</template></span>
+            </div>
+            <div v-if="row.registered_at" class="secondary-meta">
+              <span class="sub-hint">注册于 {{ fmtTime(row.registered_at) }}</span>
             </div>
           </template>
         </el-table-column>
@@ -1525,6 +1556,12 @@ onActivated(() => load())
 .time-hint, .sub-hint {
   font-size: 12px;
   color: var(--el-text-color-placeholder);
+}
+
+.fail-hint {
+  font-size: 12px;
+  color: var(--el-color-danger);
+  cursor: default;
 }
 
 .mini-copy-btn {
