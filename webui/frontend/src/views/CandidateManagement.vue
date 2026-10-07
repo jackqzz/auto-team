@@ -5,7 +5,7 @@ import { Icon } from "@iconify/vue";
 import { useRoute, useRouter } from "vue-router";
 import { storeToRefs } from "pinia";
 import { useProxyStore } from "@/stores/proxy";
-import { listWorkspaceMasters, syncWorkspace, syncWorkspaceMembers } from "@/api/workspaces";
+import { listWorkspaceMasters, syncWorkspace, syncWorkspaceMembers, getSeatExemptions } from "@/api/workspaces";
 import { listExportFormats, exportRegistered, pushRegisteredToCpa, pushRegisteredToSub2api } from "@/api/register";
 import { generateRedeemCodes } from "@/api/redeemCodes";
 import { getCpaExportTemplate, saveCpaExportTemplate } from "@/api/settings";
@@ -58,6 +58,9 @@ const selected = ref([]);
 const candidateTableRef = ref(null);
 const loading = ref(false);
 const seatType = ref("prolite");
+// 席位豁免额度/暂留预测（72h 滚动窗口，随统计一起刷新）
+const seatExemptions = ref(null);
+const exemptionVisible = ref(false);
 const { list: proxyList } = storeToRefs(useProxyStore());
 const route = useRoute();
 const router = useRouter();
@@ -493,18 +496,25 @@ const currentWorkspace = computed(() => spaces.value.find((x) => x.id === worksp
 // 不能当成 0 报警，所以两种情况要分开判。
 const standardSeatsFull = computed(() => currentWorkspace.value?.seats_default_available === 0);
 const proliteSeatsFull = computed(() => currentWorkspace.value?.seats_prolite_available === 0);
+const exemptionStandard = computed(() => seatExemptions.value?.tracks?.default || null);
+const exemptionProlite = computed(() => seatExemptions.value?.tracks?.prolite || null);
+
+// 豁免台账动作/池归属的中文标签
+const exemptionActionLabel = (a) => ({ kick: "踢出空间", leave: "主动退出", seat_change: "席位变更" }[a] || a || "—");
+const exemptionPoolLabel = (p) => ({ dedicated: "专属池", base: "共享底池", retained: "触发暂留" }[p] || p || "—");
+const exemptionPoolTag = (p) => ({ dedicated: "success", base: "primary", retained: "danger" }[p] || "info");
 
 function seatAvailableText(available) {
   return available === null || available === undefined ? "空位未同步" : `可分配 ${available} 席`;
 }
 
-// paid = 在用 + held + available，held 是已占住席位但还没落定的成员（待解决）。
+// paid = 在用 + held + available，held 是已占住席位但还没落定的成员（暂留）。
 // 只要同步过就显示，哪怕是 0——这是个需要盯的运营指标，藏起来会让人以为没做。
 // null/undefined 才是没数据，那时不显示。
 // 注意：候选人状态里另有"待处理申请"(pending_request)，是完全不同的东西，
-// 所以这里叫"待解决"，不要跟着改成"待处理"。
+// 所以这里叫"暂留"，不要跟着改成"待处理"。
 function seatHeldText(held) {
-  return held === null || held === undefined ? "" : ` · 待解决 ${held} 席`;
+  return held === null || held === undefined ? "" : ` · 暂留 ${held} 席`;
 }
 
 // 进度条分段宽度。已购为 0（或未同步）时不画任何段，避免除零后整条涂满。
@@ -956,6 +966,15 @@ async function syncCurrentWorkspaceMembers() {
   }
 }
 
+async function loadSeatExemptions() {
+  if (!workspaceId.value) return;
+  try {
+    seatExemptions.value = await getSeatExemptions(workspaceId.value);
+  } catch (_) {
+    // 豁免额度是非关键附加信息，失败不影响主面板
+  }
+}
+
 async function loadStats() {
   if (!workspaceId.value) return;
   try {
@@ -966,6 +985,7 @@ async function loadStats() {
   } catch (_) {
     // 忽略非关键统计错误
   }
+  loadSeatExemptions();
 }
 
 async function load({ silent = false } = {}) {
@@ -992,6 +1012,7 @@ async function load({ silent = false } = {}) {
     total.value = Number(a.total || 0);
     if (a.stats) {
       candidateStats.value = a.stats;
+      loadSeatExemptions();
     } else {
       loadStats();
     }
@@ -2858,13 +2879,13 @@ onBeforeUnmount(() => {
                 class="kpi-inline-tag"
                 title="已占住席位但尚未落定的成员，需要人工跟进"
               >
-                待解决 {{ currentWorkspace.seats_default_held }}
+                暂留 {{ currentWorkspace.seats_default_held }}
               </el-tag>
               <el-tag v-if="standardSeatsFull" size="small" type="danger" effect="plain" class="kpi-inline-tag">
                 无空位
               </el-tag>
             </div>
-            <!-- 已购席位分三段：在用 + 待解决(held) + 空闲。只画前两段，
+            <!-- 已购席位分三段：在用 + 暂留(held) + 空闲。只画前两段，
                  剩下的槽底色就是空闲，held 单列出来才解释得清"4/4 却无空位"。 -->
             <div class="kpi-bar-track">
               <div class="kpi-bar-fill fill-primary" :style="{ width: seatBarPct(currentWorkspace.seats_default, currentWorkspace.seats_default_entitled) }" />
@@ -2882,6 +2903,10 @@ onBeforeUnmount(() => {
             <span v-if="seatProtectEnabled" class="kpi-protect-badge" title="今日席位保护消耗 / 阈值">
               保护消耗: {{ seatProtectUsedCount }}/{{ seatProtectThreshold }}
             </span>
+          </div>
+          <div v-if="exemptionStandard" class="kpi-exemption" title="72h 滚动窗口内可安全释放（不触发暂留）的剩余次数，点击查看豁免明细" @click="exemptionVisible = true">
+            豁免可释放 <b>{{ exemptionStandard.safe_releases }}</b> 次
+            <span class="kpi-exemption-sub">专属剩 {{ exemptionStandard.dedicated_remaining }}/{{ exemptionStandard.entitled }} · 共享池 {{ seatExemptions.base_remaining }}/{{ seatExemptions.base_capacity }}</span>
           </div>
         </div>
 
@@ -2908,7 +2933,7 @@ onBeforeUnmount(() => {
                 class="kpi-inline-tag"
                 title="已占住席位但尚未落定的成员，需要人工跟进"
               >
-                待解决 {{ currentWorkspace.seats_prolite_held }}
+                暂留 {{ currentWorkspace.seats_prolite_held }}
               </el-tag>
               <el-tag v-if="proliteSeatsFull" size="small" type="danger" effect="plain" class="kpi-inline-tag">
                 无空位
@@ -2930,6 +2955,10 @@ onBeforeUnmount(() => {
             <span v-if="proliteSeatProtectEnabled" class="kpi-protect-badge" title="今日高级席位保护消耗 / 阈值">
               保护消耗: {{ proliteSeatProtectUsedCount }}/{{ proliteSeatProtectThreshold }}
             </span>
+          </div>
+          <div v-if="exemptionProlite" class="kpi-exemption" title="72h 滚动窗口内可安全释放（不触发暂留）的剩余次数，点击查看豁免明细" @click="exemptionVisible = true">
+            豁免可释放 <b>{{ exemptionProlite.safe_releases }}</b> 次
+            <span class="kpi-exemption-sub">专属剩 {{ exemptionProlite.dedicated_remaining }}/{{ exemptionProlite.entitled }} · 共享池 {{ seatExemptions.base_remaining }}/{{ seatExemptions.base_capacity }}</span>
           </div>
         </div>
 
@@ -3794,6 +3823,9 @@ onBeforeUnmount(() => {
               <div v-if="trashStatusHint(row)" class="trash-hint-text">
                 {{ trashStatusHint(row) }}
               </div>
+              <div v-if="row.trash_status === 'trashed' && row.trashed_at" class="trash-hint-text">
+                回收 {{ fmtTime(row.trashed_at) }}
+              </div>
             </div>
           </template>
         </el-table-column>
@@ -4416,6 +4448,91 @@ onBeforeUnmount(() => {
       </div>
     </el-drawer>
 
+    <!-- 席位豁免额度明细弹窗 -->
+    <el-dialog
+      v-model="exemptionVisible"
+      title="席位豁免额度 · 72h 滚动窗口"
+      width="720px"
+    >
+      <div v-if="seatExemptions" class="exemption-body">
+        <div class="exemption-note">
+          每释放一个付费席位消耗一次豁免；专属池优先、耗尽后竞争共享底池（固定 10），两池都耗尽时席位进入暂留锁定。每笔消耗独立 72h 后返还。台账仅统计本系统发起的释放；「实测暂留」为上游同步的真实 held 数，供比对校准。
+        </div>
+        <div class="exemption-base">
+          <span class="exemption-base-label">共享底池</span>
+          <el-progress
+            :percentage="Math.round((seatExemptions.base_used / (seatExemptions.base_capacity || 1)) * 100)"
+            :status="seatExemptions.base_remaining === 0 ? 'exception' : ''"
+            :stroke-width="14"
+            class="exemption-base-bar"
+          />
+          <span class="exemption-base-val">已用 {{ seatExemptions.base_used }}/{{ seatExemptions.base_capacity }} · 剩 {{ seatExemptions.base_remaining }}</span>
+        </div>
+        <el-table :data="[
+          { name: '标准席位', t: seatExemptions.tracks?.default },
+          { name: '高级席位 (ProLite)', t: seatExemptions.tracks?.prolite },
+        ]" size="small" class="exemption-table">
+          <el-table-column prop="name" label="席位轨" width="140" />
+          <el-table-column label="专属池 用/容" width="110">
+            <template #default="{ row }">{{ row.t?.dedicated_used ?? '—' }}/{{ row.t?.entitled ?? '—' }}</template>
+          </el-table-column>
+          <el-table-column label="可安全释放" width="110">
+            <template #default="{ row }">
+              <b>{{ row.t?.safe_releases ?? '—' }}</b> 次
+            </template>
+          </el-table-column>
+          <el-table-column label="预测暂留" width="90">
+            <template #default="{ row }">{{ row.t?.retained_count ?? 0 }}</template>
+          </el-table-column>
+          <el-table-column label="实测暂留" width="90">
+            <template #default="{ row }">{{ row.t?.observed_held ?? '—' }}</template>
+          </el-table-column>
+          <el-table-column label="下次返还" min-width="130">
+            <template #default="{ row }">{{ row.t?.next_release_at ? fmtTime(row.t.next_release_at) : '—' }}</template>
+          </el-table-column>
+        </el-table>
+
+        <div class="exemption-sub-title">滚动返还时间表</div>
+        <el-table :data="seatExemptions.releases || []" size="small" max-height="200" class="exemption-table" empty-text="窗口内没有待返还的消耗">
+          <el-table-column label="返还时间" width="160">
+            <template #default="{ row }">{{ fmtTime(row.at) }}</template>
+          </el-table-column>
+          <el-table-column label="池" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" :type="exemptionPoolTag(row.pool)" effect="plain">{{ exemptionPoolLabel(row.pool) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="席位轨" width="110">
+            <template #default="{ row }">{{ row.track === 'prolite' ? '高级席位' : '标准席位' }}</template>
+          </el-table-column>
+          <el-table-column prop="email" label="账号" min-width="180" show-overflow-tooltip />
+        </el-table>
+
+        <div class="exemption-sub-title">释放台账（窗口内 {{ (seatExemptions.events || []).length }} 条）</div>
+        <el-table :data="seatExemptions.events || []" size="small" max-height="240" class="exemption-table" empty-text="窗口内没有席位释放记录">
+          <el-table-column label="时间" width="160">
+            <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column prop="email" label="账号" min-width="180" show-overflow-tooltip />
+          <el-table-column label="动作" width="100">
+            <template #default="{ row }">{{ exemptionActionLabel(row.action) }}</template>
+          </el-table-column>
+          <el-table-column label="席位轨" width="90">
+            <template #default="{ row }">{{ row.track === 'prolite' ? '高级' : '标准' }}</template>
+          </el-table-column>
+          <el-table-column label="消耗池" width="100">
+            <template #default="{ row }">
+              <el-tag size="small" :type="exemptionPoolTag(row.pool)" effect="plain">{{ exemptionPoolLabel(row.pool) }}</el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <template #footer>
+        <el-button @click="exemptionVisible = false">关闭</el-button>
+        <el-button type="primary" @click="loadSeatExemptions">刷新</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 导出预览弹窗 -->
     <el-dialog
       v-model="exportVisible"
@@ -4782,6 +4899,68 @@ onBeforeUnmount(() => {
   background: var(--el-color-primary-light-9);
   padding: 1px 4px;
   border-radius: var(--app-radius-xs);
+}
+
+.kpi-exemption {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
+  border-top: 1px dashed var(--el-border-color-lighter);
+  padding-top: 6px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.kpi-exemption:hover {
+  color: var(--el-color-primary);
+}
+
+.kpi-exemption-sub {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.exemption-note {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.exemption-base {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.exemption-base-label {
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.exemption-base-bar {
+  flex: 1;
+}
+
+.exemption-base-val {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
+}
+
+.exemption-sub-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin: 14px 0 6px;
+}
+
+.exemption-table {
+  width: 100%;
 }
 
 .text-danger {

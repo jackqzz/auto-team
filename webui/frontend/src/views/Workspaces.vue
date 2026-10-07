@@ -6,7 +6,7 @@ import { Icon } from '@iconify/vue'
 import {
   listWorkspaceMasters, importWorkspaceSessions, getWorkspaceMaster,
   deleteWorkspaceMaster, bulkDeleteWorkspaceMasters, updateWorkspaceProxy, syncWorkspace,
-  syncWorkspaceMembers,
+  syncWorkspaceMembers, updateWorkspaceSession,
 } from '@/api/workspaces'
 import { copyText, fmtTime } from '@/api/request'
 import { isValidProxy } from '@/stores/proxy'
@@ -24,6 +24,11 @@ const importing = ref(false)
 const importVisible = ref(false)
 const importText = ref('')
 const importProxy = ref('')
+const sessionVisible = ref(false)
+const sessionRow = ref(null)
+const sessionText = ref('')
+const sessionProxy = ref('')
+const sessionSaving = ref(false)
 const searchKeyword = ref('')
 const router = useRouter()
 
@@ -203,6 +208,38 @@ async function editProxy(row) {
     await load()
   } catch (e) {
     if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  }
+}
+
+function openSessionUpdate(row) {
+  sessionRow.value = row
+  sessionText.value = ''
+  sessionProxy.value = ''
+  sessionVisible.value = true
+}
+
+async function submitSessionUpdate() {
+  const text = sessionText.value.trim()
+  if (!text) {
+    ElMessage.warning('请粘贴新 Session')
+    return
+  }
+  if (sessionProxy.value.trim() && !isValidProxy(sessionProxy.value)) {
+    ElMessage.warning('代理格式错误')
+    return
+  }
+  sessionSaving.value = true
+  try {
+    const r = await updateWorkspaceSession(
+      sessionRow.value.id, text, sessionProxy.value.trim() || undefined
+    )
+    ElMessage.success(r.message || 'Session 已更新')
+    sessionVisible.value = false
+    await load()
+  } catch (e) {
+    ElMessage.error(e.message || String(e))
+  } finally {
+    sessionSaving.value = false
   }
 }
 
@@ -573,6 +610,10 @@ onActivated(() => load())
                       <Icon icon="lucide:user-check" class="btn-icon" />
                       {{ syncingMembers[row.id] ? '同步中…' : '同步成员席位' }}
                     </el-dropdown-item>
+                    <el-dropdown-item @click="openSessionUpdate(row)">
+                      <Icon icon="lucide:key-round" class="btn-icon" />
+                      更新 Session
+                    </el-dropdown-item>
                     <el-dropdown-item @click="editProxy(row)">
                       <Icon icon="lucide:network" class="btn-icon" />
                       修改专属代理
@@ -658,6 +699,50 @@ onActivated(() => load())
         <el-button @click="importVisible = false">取消</el-button>
         <el-button type="primary" :loading="importing" @click="submitImport">
           确认导入
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 单个母号更新 Session 弹窗 -->
+    <el-dialog
+      v-model="sessionVisible"
+      :title="`更新 Session · ${sessionRow?.account || ''}`"
+      width="min(640px, 92vw)"
+      top="8vh"
+      class="modern-dialog"
+    >
+      <el-form label-position="top" class="import-form">
+        <el-form-item label="新 Session 凭证数据">
+          <el-input
+            v-model="sessionText"
+            type="textarea"
+            :rows="10"
+            class="mono"
+            placeholder="支持以下格式：&#10;1. 含 statsigContext 的完整 session JSON（推荐，自动录制设备指纹）&#10;2. 母号邮箱----session----专属代理&#10;3. session_token"
+          />
+        </el-form-item>
+
+        <el-form-item label="同时修改专属代理 (可选，留空保持当前代理)">
+          <el-input
+            v-model="sessionProxy"
+            class="mono"
+            placeholder="socks5://user:pass@host:port"
+          >
+            <template #prefix>
+              <Icon icon="lucide:network" />
+            </template>
+          </el-input>
+        </el-form-item>
+      </el-form>
+
+      <div class="dialog-footer-hint">
+        粘贴的 Session 邮箱/空间必须与母号一致；JSON 带 <code>statsigContext</code> 时会同步更新设备指纹。
+      </div>
+
+      <template #footer>
+        <el-button @click="sessionVisible = false">取消</el-button>
+        <el-button type="primary" :loading="sessionSaving" @click="submitSessionUpdate">
+          更新 Session
         </el-button>
       </template>
     </el-dialog>

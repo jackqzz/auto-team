@@ -1297,6 +1297,8 @@ def remove_member(workspace_db_id: int, email: str, member_id: str = "") -> dict
             except Exception:
                 data = {}
             logger.info("踢出空间成员 workspace_db_id=%s email=%s member_id=%s status=%s", workspace_db_id, key, member_id, response.status_code)
+            # 踢出确认即席位释放：记一笔豁免台账（track 从候选行解析）。
+            _record_seat_exemption_event(workspace_db_id, key, member_id, action="kick")
             return {"member_id": member_id, "kicked": True, "result": data}
         if response.status_code == 404 and attempt == 0 and key:
             fresh = str(fetch_candidate_seats(workspace_db_id, [key]).get(key, {}).get("member_id") or "").strip()
@@ -1385,6 +1387,7 @@ def member_leave_workspace(workspace_db_id: int, email: str, member_id: str = ""
             except Exception:
                 data = {}
             logger.info("成员主动退出空间 workspace_db_id=%s email=%s member_id=%s status=%s", workspace_db_id, key, member_id, response.status_code)
+            _record_seat_exemption_event(workspace_db_id, key, member_id, action="leave")
             return {"member_id": member_id, "left": True, "result": data}
         # 上游有在途席位变更（429 subscription update）时等它落地再删——
         # 这是前置动作失败最常见的原因，等 30s 重试通常就能过。
@@ -1641,6 +1644,127 @@ def resolve_candidate_seat_type(
     return ""
 
 
+# ---------- 席位豁免额度 / 暂留预测 ----------
+#
+# 上游规则（72h 滚动窗口）：管理员释放一个付费席位会消耗一次豁免额度，
+# 额度内席位秒释放；额度耗尽后释放的席位进入暂留(held)锁定。额度分三池：
+# 普通专属池=已购标准席位数、高级专属池=已购 ProLite 席位数、共享底池=10
+# 两轨竞争。专属池优先，专属耗尽走底池。每笔消耗独立 72h 后返还。
+# 台账只记本系统发起的释放（kick/leave/降级），空间外操作只能靠上游
+# seats_*_held 观测——预测值与观测值并列展示便于校准。
+
+SEAT_EXEMPTION_WINDOW_SECONDS = 72 * 3600
+SEAT_EXEMPTION_BASE_POOL = 10
+SEAT_EXEMPTION_TRACKS = ("default", "prolite")
+
+
+def _resolve_seat_release_track(workspace_db_id: int, email: str, track: str = "") -> str:
+    """释放事件归属哪条轨：行内席位优先，未知时按空间已购席位兜底。
+
+    返回 "" 表示不占豁免：成员本来就是 usage_based（释放的不是付费席位），
+    或空间根本没买过付费席位。席位未知且空间有付费席位时按已购轨兜底——
+    漏记比错记更糟，保守计入消耗。
+    """
+    canonical = _canonical_candidate_seat_type(track)
+    if canonical in SEAT_EXEMPTION_TRACKS:
+        return canonical
+    if canonical == "usage_based":
+        return ""
+    row = db.get_workspace_candidate(workspace_db_id, email) or {}
+    canonical = _canonical_candidate_seat_type(row.get("seat_type"))
+    if canonical in SEAT_EXEMPTION_TRACKS:
+        return canonical
+    if canonical == "usage_based":
+        return ""
+    master = db.get_workspace_master(workspace_db_id) or {}
+    if int(master.get("seats_default_entitled") or master.get("seats_default") or 0):
+        return "default"
+    if int(master.get("seats_prolite_entitled") or master.get("seats_prolite") or 0):
+        return "prolite"
+    return ""
+
+
+def _record_seat_exemption_event(
+    workspace_db_id: int,
+    email: str,
+    member_id: str = "",
+    track: str = "",
+    action: str = "kick",
+) -> None:
+    try:
+        if not db.get_workspace_master(workspace_db_id):
+            return  # 母号不存在（已删除/测试场景），不给台账写幻影事件
+        resolved = _resolve_seat_release_track(workspace_db_id, email, track)
+        if not resolved:
+            return  # 释放的不是付费席位，不占豁免
+        db.record_seat_exemption_event(workspace_db_id, email, member_id, resolved, action)
+    except Exception:
+        logger.exception(
+            "席位释放事件记账失败 workspace_db_id=%s email=%s", workspace_db_id, email,
+        )
+
+
+def seat_exemption_state(workspace_db_id: int, now: float | None = None) -> dict:
+    """豁免额度/暂留预测：按 72h 滚动窗口重放席位释放台账。
+
+    归属规则：每条轨先吃自己的专属池（容量=当前已购席位数），专属耗尽后
+    竞争共享底池(10)，底池也耗尽 → 该次释放的席位进入暂留。归属不在落库
+    时固化——容量随加购变化，每次读取按当前容量重放，口径始终一致。
+    """
+    now = float(now if now is not None else time.time())
+    window_start = now - SEAT_EXEMPTION_WINDOW_SECONDS
+    events = db.list_seat_exemption_events(workspace_db_id, since=window_start, limit=5000)
+    master = db.get_workspace_master(workspace_db_id) or {}
+    entitled = {
+        "default": int(master.get("seats_default_entitled") or master.get("seats_default") or 0),
+        "prolite": int(master.get("seats_prolite_entitled") or master.get("seats_prolite") or 0),
+    }
+    dedicated_used = {"default": 0, "prolite": 0}
+    base_used = 0
+    retained = {"default": 0, "prolite": 0}
+    releases = []
+    track_releases = {"default": [], "prolite": []}
+    for ev in events:  # 台账返回已按时间升序
+        track = ev.get("track") if ev.get("track") in SEAT_EXEMPTION_TRACKS else "default"
+        release_at = float(ev.get("created_at") or 0) + SEAT_EXEMPTION_WINDOW_SECONDS
+        if dedicated_used[track] < entitled[track]:
+            pool = "dedicated"
+            dedicated_used[track] += 1
+        elif base_used < SEAT_EXEMPTION_BASE_POOL:
+            pool = "base"
+            base_used += 1
+        else:
+            pool = "retained"
+            retained[track] += 1
+        ev["pool"] = pool
+        ev["release_at"] = release_at
+        releases.append({"at": release_at, "pool": pool, "track": track, "email": ev.get("email") or ""})
+        track_releases[track].append(release_at)
+    base_remaining = max(0, SEAT_EXEMPTION_BASE_POOL - base_used)
+    tracks = {}
+    for t in SEAT_EXEMPTION_TRACKS:
+        ded_remaining = max(0, entitled[t] - dedicated_used[t])
+        tracks[t] = {
+            "entitled": entitled[t],
+            "dedicated_used": dedicated_used[t],
+            "dedicated_remaining": ded_remaining,
+            "safe_releases": ded_remaining + base_remaining,
+            "retained_count": retained[t],
+            "observed_held": master.get(f"seats_{t}_held"),
+            "next_release_at": min(track_releases[t]) if track_releases[t] else None,
+        }
+    releases.sort(key=lambda x: x["at"])
+    return {
+        "window_hours": SEAT_EXEMPTION_WINDOW_SECONDS // 3600,
+        "base_capacity": SEAT_EXEMPTION_BASE_POOL,
+        "base_used": base_used,
+        "base_remaining": base_remaining,
+        "tracks": tracks,
+        "releases": releases[:50],
+        "events": sorted(events, key=lambda e: float(e.get("created_at") or 0), reverse=True)[:50],
+    }
+
+
 def _ensure_candidate_usage_based(workspace_db_id: int, email: str, row: dict | None = None, retries: int = 3) -> dict:
     """把候选人席位收敛到 usage_based，并在最后复查一次当前席位。"""
     email = str(email or "").strip().lower()
@@ -1661,10 +1785,13 @@ def _ensure_candidate_usage_based(workspace_db_id: int, email: str, row: dict | 
     if not member_id:
         logger.warning("垃圾箱席位复查失败：未找到 member_id workspace_db_id=%s email=%s", workspace_db_id, email)
         return info
+    released_paid_seat = seat_type in SEAT_EXEMPTION_TRACKS
+    downgraded = False
     last_error = None
     for attempt in range(max(1, int(retries))):
         try:
             update_member_seat_type(workspace_db_id, member_id, "usage_based")
+            downgraded = True
             last_error = None
             break
         except Exception as exc:  # noqa: BLE001
@@ -1679,6 +1806,9 @@ def _ensure_candidate_usage_based(workspace_db_id: int, email: str, row: dict | 
     for attempt in range(3):
         refreshed = _refresh_candidate_seat_snapshot(workspace_db_id, email)
         if _canonical_candidate_seat_type(refreshed.get("raw_seat_type") or refreshed.get("seat_type")) == "usage_based":
+            # 付费席位降级到 Codex 等于释放该席位：记一笔豁免台账。
+            if downgraded and released_paid_seat:
+                _record_seat_exemption_event(workspace_db_id, email, member_id, track=seat_type, action="seat_change")
             return refreshed
         if attempt < 2:
             time.sleep(5)
@@ -2145,7 +2275,7 @@ def sync_seat_info(workspace_db_id: int) -> dict:
                 available_by_type[seat_type] = int(item.get("available") or 0)
             except (TypeError, ValueError):
                 available_by_type[seat_type] = 0
-            # held 是已占住席位但还没落定的成员（页面上叫"待解决"）。它既不在
+            # held 是已占住席位但还没落定的成员（页面上叫"暂留"）。它既不在
             # seat_type_counts 的在用数里，也不算进 available，所以
             # paid = 在用 + held + available，不展示会对不上账。
             try:

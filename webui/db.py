@@ -311,9 +311,17 @@ def init_db():
         ("trash_whitelist", "INTEGER NOT NULL DEFAULT 0"),
         ("tag_status", "TEXT NOT NULL DEFAULT 'active'"),
         ("tags", "TEXT NOT NULL DEFAULT '[]'"),
+        # 入箱时刻：updated_at 会被席位/状态同步反复刷新，不能当回收时间用。
+        ("trashed_at", "REAL NOT NULL DEFAULT 0"),
     ):
         if col not in cand_cols:
             con.execute(f"ALTER TABLE workspace_candidates ADD COLUMN {col} {definition}")
+            if col == "trashed_at":
+                # 存量已入箱行回填 updated_at——最接近真实回收时间。
+                con.execute(
+                    "UPDATE workspace_candidates SET trashed_at=updated_at "
+                    "WHERE trash_status='trashed' AND trashed_at=0"
+                )
     if "workspace_join_status" not in cand_cols:
         con.execute("ALTER TABLE workspace_candidates ADD COLUMN workspace_join_status TEXT NOT NULL DEFAULT 'not_invited'")
         # 旧版本把空间加入状态和账号/额度状态混在 status 中；可识别的
@@ -324,6 +332,23 @@ def init_db():
                 ELSE 'not_invited'
             END""")
         con.commit()
+    # 席位释放台账：每次把成员从付费席位(default/prolite)上释放（踢出/退出/
+    # 降级到 usage_based）记一笔，用于 72h 滚动窗口内重放计算豁免池消耗与
+    # 暂留预测。池归属不写死在行里——容量(N/底池)随加购变化，读取时按
+    # 时间序重放归属，保证口径始终一致。
+    con.execute("""CREATE TABLE IF NOT EXISTS workspace_seat_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_db_id INTEGER NOT NULL,
+        email TEXT NOT NULL DEFAULT '',
+        member_id TEXT NOT NULL DEFAULT '',
+        track TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0
+    )""")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seat_events_ws ON "
+        "workspace_seat_events(workspace_db_id, created_at)"
+    )
     con.execute("""CREATE TABLE IF NOT EXISTS workspace_credentials (
         workspace_master_id INTEGER NOT NULL,
         email TEXT NOT NULL COLLATE NOCASE,
@@ -1207,6 +1232,32 @@ def update_workspace_master_auth(
         return rc.rowcount > 0
 
 
+def update_workspace_master_session(workspace_id: int, item: dict) -> bool:
+    """直接更新母号会话：session_token 必更，其余字段非空才覆盖。
+
+    ``item`` 结构与 ``_workspace_import_rows`` 输出一致；没带指纹/代理的
+    旧格式粘贴只换 session，不清空已录的指纹与专属代理。
+    """
+    session_token = str(item.get("session_token") or "").strip()
+    if not session_token:
+        return False
+    sets = ["session_token=?", "status='imported'", "updated_at=?"]
+    params: list = [session_token, time.time()]
+    for col in ("access_token", "workspace_id", "proxy_url", "device_id", "user_agent"):
+        value = str(item.get(col) or "").strip()
+        if value:
+            sets.append(f"{col}=?")
+            params.append(value)
+    params.append(int(workspace_id))
+    with _lock:
+        con = _conn()
+        rc = con.execute(
+            f"UPDATE workspace_masters SET {', '.join(sets)} WHERE id=?", params
+        )
+        con.commit()
+        return rc.rowcount > 0
+
+
 def delete_workspace_masters(ids: list[int]) -> int:
     cleaned = sorted({int(i) for i in (ids or []) if int(i) > 0})
     if not cleaned:
@@ -1390,6 +1441,7 @@ def list_workspace_candidate_options(
         COALESCE(c.trash_status, 'active') AS trash_status,
         COALESCE(c.trash_due_at, 0) AS trash_due_at,
         COALESCE(c.trash_reason, '') AS trash_reason,
+        COALESCE(c.trashed_at, 0) AS trashed_at,
         COALESCE(c.trash_whitelist, 0) AS trash_whitelist,
         COALESCE(c.tag_status, 'active') AS tag_status,
         COALESCE(c.tags, '[]') AS tags,
@@ -1749,10 +1801,15 @@ def update_workspace_candidate_trash(
         rc = con.execute(
             """
             UPDATE workspace_candidates
-               SET trash_status=?, trash_due_at=?, trash_reason=?, updated_at=?
+               SET trash_status=?, trash_due_at=?, trash_reason=?,
+                   trashed_at=CASE ? WHEN 'trashed' THEN ? WHEN 'active' THEN 0
+                                    ELSE trashed_at END,
+                   updated_at=?
              WHERE workspace_master_id=? AND email=?
             """,
-            (status, due_value, str(reason or "")[:500], now, int(workspace_master_id), key),
+            # 入箱记录回收时间；还原清零；排期保留原值（排期不等于已回收）。
+            (status, due_value, str(reason or "")[:500], status, now, now,
+             int(workspace_master_id), key),
         )
         con.commit()
         return rc.rowcount > 0
@@ -1787,7 +1844,7 @@ def restore_workspace_candidates_from_trash(
             f"""
             UPDATE workspace_candidates
                SET trash_status='active', trash_due_at=0, trash_reason='',
-                   trash_whitelist=1, updated_at=?
+                   trashed_at=0, trash_whitelist=1, updated_at=?
              WHERE workspace_master_id=?
                AND email IN ({marks})
                AND trash_status='trashed'
@@ -2177,6 +2234,54 @@ def mark_workspace_candidates_kicked(
         counts["credentials"] = rc.rowcount
         con.commit()
     return counts
+
+
+def record_seat_exemption_event(
+    workspace_master_id: int,
+    email: str,
+    member_id: str = "",
+    track: str = "",
+    action: str = "kick",
+    created_at: float | None = None,
+) -> int:
+    """席位释放事件落账。track=被释放的付费席位(default/prolite)；
+    action=kick/leave/seat_change，仅用于台账展示。"""
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            """INSERT INTO workspace_seat_events
+               (workspace_db_id, email, member_id, track, action, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (
+                int(workspace_master_id),
+                str(email or "").strip().lower(),
+                str(member_id or "").strip()[:200],
+                str(track or "").strip().lower()[:40],
+                str(action or "").strip()[:40],
+                float(created_at if created_at is not None else time.time()),
+            ),
+        )
+        con.commit()
+        return int(cur.lastrowid or 0)
+
+
+def list_seat_exemption_events(
+    workspace_master_id: int,
+    since: float = 0.0,
+    limit: int = 500,
+) -> list[dict]:
+    """席位释放台账，按时间升序（重放归属需要顺序）。limit 只截最近的一段。"""
+    rows = _conn().execute(
+        """SELECT id, workspace_db_id, email, member_id, track, action, created_at
+             FROM workspace_seat_events
+            WHERE workspace_db_id=? AND created_at>=?
+            ORDER BY created_at ASC, id ASC""",
+        (int(workspace_master_id), float(since or 0.0)),
+    ).fetchall()
+    items = [dict(r) for r in rows]
+    if limit and len(items) > int(limit):
+        items = items[-int(limit):]
+    return items
 
 
 def update_workspace_candidate_tag_status(workspace_master_id: int, emails: list[str], tag_status: str) -> int:

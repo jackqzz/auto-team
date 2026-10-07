@@ -231,6 +231,14 @@ class WorkspaceProxyReq(BaseModel):
     proxy: str = Field(..., description="母号专属代理")
 
 
+class WorkspaceSessionUpdateReq(BaseModel):
+    session: str = Field(
+        ...,
+        description="新 Session：支持母号----session----代理行格式，或含 statsigContext 的完整 session JSON",
+    )
+    proxy: Optional[str] = Field(None, description="同时覆盖专属代理；留空则保持原代理")
+
+
 class WorkspaceBulkDeleteReq(BaseModel):
     ids: list[int] = Field(..., min_length=1, description="要删除的母号记录 ID")
 
@@ -2079,9 +2087,9 @@ def _auto_seat_invite_room(
 ) -> int:
     """本轮还能向 ``seat_type`` 发出的直接邀请数。
 
-    邀请发出后到成员接受前，席位在上游计为 held（待解决）而不是在用数——
+    邀请发出后到成员接受前，席位在上游计为 held（暂留）而不是在用数——
     如果还按 ``目标 - 在用`` 判缺口，一轮里会对着已占住的席位继续发邀请。
-    所以额度按 ``目标 - 在用 - 待解决`` 计算，再叠加上游 available 上限；
+    所以额度按 ``目标 - 在用 - 暂留`` 计算，再叠加上游 available 上限；
     上游缺 held 字段（或未把刚发出的邀请计入）时用本地 pending_invite 记录
     兜底，宁可少发也不能超发。
     """
@@ -3345,6 +3353,67 @@ def api_update_workspace_proxy(workspace_id: int, req: WorkspaceProxyReq):
     return {"ok": True}
 
 
+@app.post("/api/workspaces/{workspace_id}/session")
+def api_update_workspace_session(workspace_id: int, req: WorkspaceSessionUpdateReq):
+    """单个母号直接换 Session——不用走批量导入。
+
+    粘贴内容与批量导入同一套解析：行格式或 session JSON。JSON 带
+    statsigContext 时同步更新设备指纹；粘贴里带 proxy 或用 proxy 字段
+    覆盖专属代理，都没有则保持原代理。
+    """
+    master = db.get_workspace_master(workspace_id)
+    if not master:
+        raise HTTPException(404, "母号不存在")
+    try:
+        items = db._workspace_import_rows(
+            req.session, default_proxy=str(master.get("proxy_url") or "")
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if len(items) != 1:
+        raise HTTPException(400, "每次只更新一个母号，请只粘贴一条 Session")
+    item = items[0]
+    item_email = str(item.get("email") or "").strip().lower()
+    master_email = str(master.get("email") or master.get("account") or "").strip().lower()
+    if item_email and master_email and item_email != master_email:
+        raise HTTPException(
+            400, f"Session 属于 {item_email}，与母号 {master_email} 不一致"
+        )
+    item_wid = str(item.get("workspace_id") or "").strip()
+    master_wid = str(master.get("workspace_id") or "").strip()
+    if item_wid and master_wid and item_wid != master_wid:
+        raise HTTPException(400, "Session 绑定的空间与母号 workspace_id 不一致")
+    override_proxy = str(req.proxy or "").strip()
+    if override_proxy:
+        try:
+            item["proxy_url"] = db.normalize_workspace_proxy(override_proxy)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if not db.update_workspace_master_session(workspace_id, item):
+        raise HTTPException(500, "Session 更新失败")
+    has_fingerprint = bool(str(item.get("device_id") or "").strip())
+    return {
+        "ok": True,
+        "has_device_fingerprint": has_fingerprint,
+        "message": "Session 已更新（含设备指纹）"
+        if has_fingerprint
+        else "Session 已更新；未携带设备指纹，若持续 401 请用含 statsigContext 的 session JSON",
+    }
+
+
+@app.get("/api/workspaces/{workspace_id}/seat-exemptions")
+def api_seat_exemptions(workspace_id: int):
+    """席位豁免额度/暂留预测：72h 滚动窗口重放本系统记录的席位释放台账。
+
+    返回每条轨的专属池用量、共享底池用量、还能安全释放（不触发暂留）的
+    次数、未来返还时间表和近期事件。台账只含本系统发起的释放；上游观测的
+    seats_*_held 并列在 tracks.*.observed_held，供比对校准。
+    """
+    if not db.get_workspace_master(workspace_id):
+        raise HTTPException(404, "母号不存在")
+    return workspace_membership.seat_exemption_state(workspace_id)
+
+
 def _workspace_candidate_index(workspace_id: int) -> dict[str, dict]:
     return {
         str(row.get("email") or "").strip().lower(): row
@@ -4496,6 +4565,11 @@ def api_update_candidate_seat(req: WorkspaceCandidatesReq):
                 prolite_reserved = bool(reservation.get("enabled"))
             result = workspace_membership.update_member_seat_type(req.workspace_id, row["member_id"], req.seat_type)
             db.update_workspace_candidate_member(req.workspace_id, email, row["member_id"], req.seat_type)
+            # 从付费席位切走（降级/换轨）= 释放原席位：记一笔豁免台账。
+            if current_seat in {"default", "prolite"} and current_seat != req.seat_type:
+                workspace_membership._record_seat_exemption_event(
+                    req.workspace_id, key, row["member_id"], track=current_seat, action="seat_change",
+                )
             if req.seat_type in {"default", "prolite"}:
                 try:
                     db.increment_workspace_fulfillment_counter(req.workspace_id, req.seat_type, 1)

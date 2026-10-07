@@ -8533,99 +8533,71 @@ class AuthFlow:
             logger.info("无真实密码：跳过 login_password 探测，使用 passwordless 登录入口")
 
         if prefer_login_screen_first:
-            try:
-                logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
-                login_step = self.authorize_continue(
-                    email=email,
-                    sentinel_token=sentinel,
-                    screen_hint="login",
-                    referer="https://auth.openai.com/log-in",
-                    trace_step="authorize_continue_login_protocol",
-                )
-                page_type = (self._extract_page_type(login_step) or "").lower()
-                continue_url = self._normalize_continue_url(
-                    self._extract_continue_url_from_step(login_step)
-                )
-                page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
-                payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
-                mode = (payload.get("email_verification_mode", "") or "").lower()
-                self._existing_page_type = page_type
-                self._existing_email_verification_mode = mode
-
-                if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
-                    logger.info("登录分支: login_password -> password/verify")
-                    # 命中已有账号 password 路径：标记之，让 kickoff_otp_delivery 走 resend
-                    # 分支（避免 send_passwordless_otp 把 state 弄坏 → wrong_email_otp_code）
-                    self._is_existing_account = True
-                    login_resp = self.login_password_verify(login_password)
-                    page_type = (self._extract_page_type(login_resp) or "").lower()
+            probe_attempt = 0
+            while probe_attempt < 2:
+                probe_attempt += 1
+                try:
+                    logger.info("已有账号协议登录：优先走 login screen_hint 探测 password/otp 分支")
+                    login_step = self.authorize_continue(
+                        email=email,
+                        sentinel_token=sentinel,
+                        screen_hint="login",
+                        referer="https://auth.openai.com/log-in",
+                        trace_step="authorize_continue_login_protocol",
+                    )
+                    page_type = (self._extract_page_type(login_step) or "").lower()
                     continue_url = self._normalize_continue_url(
-                        self._extract_continue_url_from_step(login_resp)
+                        self._extract_continue_url_from_step(login_step)
                     )
+                    page = (login_step.get("page") or {}) if isinstance(login_step, dict) else {}
+                    payload = (page.get("payload") or {}) if isinstance(page, dict) else {}
+                    mode = (payload.get("email_verification_mode", "") or "").lower()
+                    self._existing_page_type = page_type
+                    self._existing_email_verification_mode = mode
 
-                    # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
-                    if self._is_mfa_challenge_state(page_type, continue_url):
-                        totp_secret = (self.result.totp_secret or "").strip()
-                        if not totp_secret and self._account_callback:
-                            # 从数据库加载凭证
-                            try:
-                                cred = self._account_callback(email)
-                                if cred and cred.get("totp_secret"):
-                                    totp_secret = cred["totp_secret"]
-                                    self.result.totp_secret = totp_secret
-                                    logger.info("已从数据库加载 totp_secret")
-                            except Exception as e:
-                                logger.warning(f"account_callback 异常: {e}")
-                        if not totp_secret:
-                            raise _MissingTOTPSecretError(
-                                "账号已启用 2FA，但本地没有 totp_secret，无法完成登录；"
-                                "请从原始备份导入 2FA secret"
-                            )
-                        else:
-                            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
-                            if challenge_id:
-                                totp_code = _totp_now(totp_secret)
-                                logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
-                                mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
-                                page_type = (self._extract_page_type(mfa_resp) or "").lower()
-                                continue_url = self._normalize_continue_url(
-                                    self._extract_continue_url_from_step(mfa_resp)
-                                )
-                            else:
-                                logger.warning("无法从 continue_url 提取 challenge_id")
-
-                elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
-                    logger.info("登录分支: email_otp_verification")
-                    # 同上：authorize/continue 已 trigger 发码，kickoff_otp_delivery 必须只 resend。
-                    self._is_existing_account = True
-                else:
-                    logger.info(
-                        "login screen_hint 未直接命中已有账号完成态: page_type=%s continue_url=%s",
-                        page_type or "(empty)",
-                        (continue_url or "")[:180] or "(empty)",
+                    if page_type == "login_password" or "/log-in/password" in (continue_url or ""):
+                        logger.info("登录分支: login_password")
+                    elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
+                        logger.info("登录分支: email_otp_verification")
+                        # 同上：authorize/continue 已 trigger 发码，kickoff_otp_delivery 必须只 resend。
+                        self._is_existing_account = True
+                    else:
+                        logger.info(
+                            "login screen_hint 未直接命中已有账号完成态: page_type=%s continue_url=%s",
+                            page_type or "(empty)",
+                            (continue_url or "")[:180] or "(empty)",
+                        )
+                    break
+                except Exception as e:
+                    # 账号已停用/删除时，不能把 403 当成 login screen_hint 探测
+                    # 失败再回退 signup；这会对同一个永久失效账号重复发起登录。
+                    if _is_permanently_invalid_error(str(e)):
+                        logger.error(
+                            "登录返回账号已永久失效，跳过 signup 回退和后续重试: %s",
+                            e,
+                        )
+                        raise
+                    logger.warning(f"login screen_hint 探测失败: {e}")
+                    # 失败的探测可能把 authorization state 停在或失效于
+                    # login_password step。必须重新初始化 OAuth 才能继续；
+                    # 复用旧 state 会得到 invalid_auth_step / invalid_state。
+                    csrf_token = self.get_csrf_token()
+                    auth_url = self.get_auth_url(csrf_token, email=email)
+                    device_id = self.auth_oauth_init(auth_url)
+                    sentinel = self.get_sentinel_token(device_id)
+                    continue_url = ""
+                    page_type = ""
+                    mode = ""
+                    stale_state = (
+                        "invalid_state" in str(e)
+                        or "sign-in session" in str(e).lower()
+                        or "start over" in str(e).lower()
                     )
-            except _MissingTOTPSecretError:
-                raise
-            except Exception as e:
-                # 账号已停用/删除时，不能把 403 当成 login screen_hint 探测
-                # 失败再回退 signup；这会对同一个永久失效账号重复发起登录。
-                if _is_permanently_invalid_error(str(e)):
-                    logger.error(
-                        "登录返回账号已永久失效，跳过 signup 回退和后续重试: %s",
-                        e,
-                    )
-                    raise
-                logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
-                # password/verify 失败后，当前 authorization state 已停在或失效于
-                # login_password step。必须重新初始化 OAuth，signup hint 才能建立
-                # passwordless OTP challenge；复用旧 state 会得到 invalid_auth_step。
-                csrf_token = self.get_csrf_token()
-                auth_url = self.get_auth_url(csrf_token, email=email)
-                device_id = self.auth_oauth_init(auth_url)
-                sentinel = self.get_sentinel_token(device_id)
-                continue_url = ""
-                page_type = ""
-                mode = ""
+                    if stale_state and probe_attempt < 2:
+                        logger.info("服务端提示授权态失效（start over），已重建 OAuth 会话，重试 login 探测")
+                        continue
+                    logger.warning("回退 signup 探测")
+                    break
 
         if not continue_url and page_type not in ("login_password", "email_otp_verification"):
             is_new = self.signup(email, sentinel)
@@ -8641,6 +8613,89 @@ class AuthFlow:
         else:
             page_type = (page_type or self._existing_page_type or "").lower()
             mode = (mode or self._existing_email_verification_mode or "").lower()
+
+        # 落到 login_password 页（login 探测命中，或 signup 探测被已有账号弹回）：
+        # 该 state 上 resend/send_otp 只会得到 invalid_auth_step/invalid_state，
+        # 正确续法是 password/verify。协议层密码页没有「换邮箱验证码」入口，
+        # 无密码账号到此为止（要走 camoufox 的 "Try another method" 兜底）。
+        # verify 失败时重建授权态再让服务端重新路由一次：它可能给邮箱 OTP，
+        # 也可能仍弹密码页 —— 密码已拒过就不再重复提交。
+        pw_attempts = 0
+        while page_type == "login_password" or "/log-in/password" in (continue_url or ""):
+            if not login_password:
+                raise RuntimeError(
+                    f"OpenAI 要求 {email} 走密码登录，但本地无可用密码；"
+                    "协议登录在密码页无法切换邮箱验证码，请改用 camoufox 重登或补录密码"
+                )
+            if pw_attempts >= 1:
+                raise RuntimeError(
+                    f"账号 {email} 密码验证被拒且服务端未提供邮箱 OTP 入口，无法登录"
+                )
+            pw_attempts += 1
+            try:
+                logger.info("登录分支: login_password -> password/verify")
+                # 命中已有账号 password 路径：标记之，让 kickoff_otp_delivery 走 resend
+                # 分支（避免 send_passwordless_otp 把 state 弄坏 → wrong_email_otp_code）
+                self._is_existing_account = True
+                login_resp = self.login_password_verify(login_password)
+                page_type = (self._extract_page_type(login_resp) or "").lower()
+                continue_url = self._normalize_continue_url(
+                    self._extract_continue_url_from_step(login_resp)
+                )
+
+                # mfa-challenge 分支（密码验证后需要 TOTP 2FA）
+                if self._is_mfa_challenge_state(page_type, continue_url):
+                    totp_secret = (self.result.totp_secret or "").strip()
+                    if not totp_secret and self._account_callback:
+                        # 从数据库加载凭证
+                        try:
+                            cred = self._account_callback(email)
+                            if cred and cred.get("totp_secret"):
+                                totp_secret = cred["totp_secret"]
+                                self.result.totp_secret = totp_secret
+                                logger.info("已从数据库加载 totp_secret")
+                        except Exception as e:
+                            logger.warning(f"account_callback 异常: {e}")
+                    if not totp_secret:
+                        raise _MissingTOTPSecretError(
+                            "账号已启用 2FA，但本地没有 totp_secret，无法完成登录；"
+                            "请从原始备份导入 2FA secret"
+                        )
+                    challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+                    if challenge_id:
+                        totp_code = _totp_now(totp_secret)
+                        logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
+                        mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
+                        page_type = (self._extract_page_type(mfa_resp) or "").lower()
+                        continue_url = self._normalize_continue_url(
+                            self._extract_continue_url_from_step(mfa_resp)
+                        )
+                    else:
+                        logger.warning("无法从 continue_url 提取 challenge_id")
+                break
+            except _MissingTOTPSecretError:
+                raise
+            except Exception as e:
+                # 密码被拒/步骤失效：重建授权态，让服务端重新决定登录方式
+                if _is_permanently_invalid_error(str(e)):
+                    logger.error("登录返回账号已永久失效，跳过后续重试: %s", e)
+                    raise
+                logger.warning(f"password/verify 失败，重建授权态后重试探测: {e}")
+                csrf_token = self.get_csrf_token()
+                auth_url = self.get_auth_url(csrf_token, email=email)
+                device_id = self.auth_oauth_init(auth_url)
+                sentinel = self.get_sentinel_token(device_id)
+                continue_url = ""
+                page_type = ""
+                mode = ""
+                is_new = self.signup(email, sentinel)
+                if is_new:
+                    raise RuntimeError(
+                        f"仅登录失败：OpenAI 未识别 {email} 为已有账号，未执行注册"
+                    )
+                page_type = (self._existing_page_type or "").lower()
+                mode = (self._existing_email_verification_mode or "").lower()
+                continue
 
         if not continue_url or "/email-verification" in continue_url:
             # 仍需 OTP：优先 resend 获取新码

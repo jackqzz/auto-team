@@ -397,6 +397,92 @@ class ProtocolLoginTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "无法重新生成"):
             flow.run_protocol_login(provider, EMAIL)
 
+    def test_invalid_state_probe_rebuilds_oauth_and_retries(self):
+        """409 invalid_state 应按服务端提示重建授权态后重试 login 探测。"""
+        flow = _flow(password="real-password", totp_secret=TOTP_SECRET)
+        flow._resolve_login_password = Mock(return_value=("real-password", True))
+        flow._env_flag = Mock(
+            side_effect=lambda key, default="0": key == "LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"
+        )
+        flow.authorize_continue = Mock(
+            side_effect=[
+                RuntimeError(
+                    'authorize/continue 失败(screen_hint=login): HTTP 409 body='
+                    '{"error": {"code": "invalid_state", "message": '
+                    '"Your sign-in session is no longer valid. Please start over to continue."}}'
+                ),
+                _step("login_password", "https://auth.openai.com/log-in/password"),
+            ]
+        )
+        flow.login_password_verify.return_value = _step("external_url", CALLBACK_URL)
+        flow.signup = Mock()
+        provider = SimpleNamespace(wait_for_otp=Mock())
+
+        result = flow.run_protocol_login(provider, EMAIL)
+
+        self.assertEqual(result.access_token, "access")
+        self.assertEqual(flow.authorize_continue.call_count, 2)
+        # 初始 OAuth 一次 + invalid_state 后重建一次
+        self.assertEqual(flow.auth_oauth_init.call_count, 2)
+        self.assertEqual(flow.get_sentinel_token.call_count, 2)
+        flow.login_password_verify.assert_called_once_with("real-password")
+        flow.signup.assert_not_called()
+        flow.kickoff_otp_delivery.assert_not_called()
+        flow.send_otp.assert_not_called()
+
+    def test_signup_fallback_login_password_drives_password_verify(self):
+        """signup 兜底被弹回 login_password 页时必须走 password/verify，不能进 OTP 块。"""
+        flow = _flow(password="real-password", totp_secret=TOTP_SECRET)
+        flow._resolve_login_password = Mock(return_value=("real-password", True))
+        flow._env_flag = Mock(
+            side_effect=lambda key, default="0": key == "LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"
+        )
+        flow.authorize_continue = Mock(
+            side_effect=RuntimeError("authorize/continue 失败(screen_hint=login): HTTP 500")
+        )
+
+        def password_page_signup(_email, _sentinel):
+            flow._is_existing_account = True
+            flow._existing_page_type = "login_password"
+            flow._existing_email_verification_mode = ""
+            return False
+
+        flow.signup = Mock(side_effect=password_page_signup)
+        flow.login_password_verify.return_value = _step("external_url", CALLBACK_URL)
+        provider = SimpleNamespace(wait_for_otp=Mock())
+
+        result = flow.run_protocol_login(provider, EMAIL)
+
+        self.assertEqual(result.access_token, "access")
+        flow.signup.assert_called_once_with(EMAIL, "sentinel")
+        flow.login_password_verify.assert_called_once_with("real-password")
+        flow.kickoff_otp_delivery.assert_not_called()
+        flow.send_otp.assert_not_called()
+        provider.wait_for_otp.assert_not_called()
+
+    def test_permanent_invalid_probe_fails_without_retry_or_signup(self):
+        """账号永久失效错误必须直接抛出，不重建授权态也不回退 signup。"""
+        flow = _flow(password="real-password")
+        flow._resolve_login_password = Mock(return_value=("real-password", True))
+        flow._env_flag = Mock(
+            side_effect=lambda key, default="0": key == "LOCALAUTH_EXISTING_LOGIN_USE_LOGIN_HINT"
+        )
+        flow.authorize_continue = Mock(
+            side_effect=RuntimeError(
+                "authorize/continue 失败(screen_hint=login): HTTP 403 account_deactivated"
+            )
+        )
+        flow.signup = Mock()
+        provider = SimpleNamespace(wait_for_otp=Mock())
+
+        with self.assertRaisesRegex(RuntimeError, "account_deactivated"):
+            flow.run_protocol_login(provider, EMAIL)
+
+        self.assertEqual(flow.authorize_continue.call_count, 1)
+        self.assertEqual(flow.auth_oauth_init.call_count, 1)
+        flow.signup.assert_not_called()
+        flow.login_password_verify.assert_not_called()
+
     def test_codex_passwordless_login_never_submits_guessed_password(self):
         flow = _flow(totp_secret=TOTP_SECRET)
         flow._resolve_login_password = Mock(return_value=("guessed-password", False))
